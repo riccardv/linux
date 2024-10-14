@@ -572,15 +572,15 @@ static int call_crda(const char *alpha2)
 		 alpha2[0], alpha2[1]);
 
 	if (reg_crda_timeouts > REG_MAX_CRDA_TIMEOUTS) {
-		pr_debug("Exceeded CRDA call max attempts. Not calling CRDA\n");
+		pr_info("Exceeded CRDA call max attempts. Not calling CRDA\n");
 		return -EINVAL;
 	}
 
 	if (!is_world_regdom((char *) alpha2))
-		pr_debug("Calling CRDA for country: %c%c\n",
+		pr_info("Calling CRDA for country: %c%c\n",
 			 alpha2[0], alpha2[1]);
 	else
-		pr_debug("Calling CRDA to update world regulatory domain\n");
+		pr_info("Calling CRDA to update world regulatory domain\n");
 
 	ret = kobject_uevent_env(&reg_pdev->dev.kobj, KOBJ_CHANGE, env);
 	if (ret)
@@ -1313,8 +1313,15 @@ static enum nl80211_dfs_regions
 reg_intersect_dfs_region(const enum nl80211_dfs_regions dfs_region1,
 			 const enum nl80211_dfs_regions dfs_region2)
 {
-	if (dfs_region1 != dfs_region2)
+	if (dfs_region1 != dfs_region2) {
+		pr_info("intersect-dfs-region, region1: %d  region2: %d\n",
+			dfs_region1, dfs_region2);
+		if (dfs_region1 == NL80211_DFS_UNSET)
+			return dfs_region2;
+		if (dfs_region2 == NL80211_DFS_UNSET)
+			return dfs_region1;
 		return NL80211_DFS_UNSET;
+	}
 	return dfs_region1;
 }
 
@@ -1814,8 +1821,22 @@ static void handle_channel_single_rule(struct wiphy *wiphy,
 		return;
 	}
 
-	chan->dfs_state = NL80211_DFS_USABLE;
-	chan->dfs_state_entered = jiffies;
+	/* HACK:  Work around problem where you have AP on DFS channel and then
+	 * STA on different radio connects on same channel.  That causes regdom to change
+	 * (or the code isn't smart enough to realize it didn't really change),
+	 * because STA gets regdom from its AP, causing CAC to restart,
+	 * which kills the AP interface before CAC can ever be finished.
+	 * This is the one path that hits in my system, there are other places that may
+	 * need latching too, and/or there is probably a better way to fix this.
+	 * --Ben
+	 */
+	if (chan->dfs_state != NL80211_DFS_AVAILABLE) {
+		chan->dfs_state = NL80211_DFS_USABLE;
+		chan->dfs_state_entered = jiffies;
+	} else {
+		pr_info("wiphy %s %pM: freq %d.%03d MHz: NOT setting DFS state back to baseline in single_rule, leave it latched at DFS_AVAILABLE.\n",
+			dev_name(&wiphy->dev), wiphy->perm_addr, chan->center_freq, chan->freq_offset);
+	}
 
 	chan->beacon_found = false;
 	chan->flags = flags | bw_flags | map_regdom_flags(reg_rule->flags);
@@ -2037,13 +2058,13 @@ disable_chan:
 		if (lr->initiator == NL80211_REGDOM_SET_BY_DRIVER &&
 		    request_wiphy && request_wiphy == wiphy &&
 		    request_wiphy->regulatory_flags & REGULATORY_STRICT_REG) {
-			pr_debug("Disabling freq %d.%03d MHz for good\n",
-				 chan->center_freq, chan->freq_offset);
+			pr_info("wiphy %pM: Disabling freq %d.%03d MHz for good (strict-REG)\n",
+				wiphy->perm_addr, chan->center_freq, chan->freq_offset);
 			chan->orig_flags |= IEEE80211_CHAN_DISABLED;
 			chan->flags = chan->orig_flags;
 		} else {
-			pr_debug("Disabling freq %d.%03d MHz\n",
-				 chan->center_freq, chan->freq_offset);
+			pr_info("wiphy %pM: Disabling freq %d.%03d MHz\n",
+				wiphy->perm_addr, chan->center_freq, chan->freq_offset);
 			chan->flags |= IEEE80211_CHAN_DISABLED;
 		}
 		return;
@@ -2503,6 +2524,8 @@ static void wiphy_update_regulatory(struct wiphy *wiphy,
 	struct regulatory_request *lr = get_last_request();
 
 	if (ignore_reg_update(wiphy, initiator)) {
+		pr_info("update-regulatory, ignore-reg-update is set, initiator: %d  flags: 0x%x\n",
+			initiator, wiphy->regulatory_flags);
 		/*
 		 * Regulatory updates set by CORE are ignored for custom
 		 * regulatory cards. Let us notify the changes to the driver,
@@ -2515,6 +2538,15 @@ static void wiphy_update_regulatory(struct wiphy *wiphy,
 			reg_call_notifier(wiphy, lr);
 		return;
 	}
+
+	pr_info("Setting DFS Master region in update_regulatory, was: %c%c %s, new: %c%c %s  lr: %p  regdom: %p\n",
+		lr->alpha2[0],
+		lr->alpha2[1],
+		reg_dfs_region_str(lr->dfs_region),
+		get_cfg80211_regdom()->alpha2[0],
+		get_cfg80211_regdom()->alpha2[1],
+		reg_dfs_region_str(get_cfg80211_regdom()->dfs_region),
+		lr, get_cfg80211_regdom());
 
 	lr->dfs_region = get_cfg80211_regdom()->dfs_region;
 
@@ -2559,8 +2591,8 @@ static void handle_channel_custom(struct wiphy *wiphy,
 	}
 
 	if (IS_ERR_OR_NULL(reg_rule)) {
-		pr_debug("Disabling freq %d.%03d MHz as custom regd has no rule that fits it\n",
-			 chan->center_freq, chan->freq_offset);
+		// pr_info("%pM: Disabling freq %d.%03d MHz as custom regd has no rule that fits it\n",
+		// 	wiphy->perm_addr, chan->center_freq, chan->freq_offset);
 		if (wiphy->regulatory_flags & REGULATORY_WIPHY_SELF_MANAGED) {
 			chan->flags |= IEEE80211_CHAN_DISABLED;
 		} else {
@@ -3690,11 +3722,12 @@ void regulatory_hint_found_beacon(struct wiphy *wiphy,
 	if (!reg_beacon)
 		return;
 
-	pr_debug("Found new beacon on frequency: %d.%03d MHz (Ch %d) on %s\n",
-		 beacon_chan->center_freq, beacon_chan->freq_offset,
-		 ieee80211_freq_khz_to_channel(
-			 ieee80211_channel_to_khz(beacon_chan)),
-		 wiphy_name(wiphy));
+	if (printk_ratelimit())
+		pr_debug("Found new beacon on frequency: %d.%03d MHz (Ch %d) on %s\n",
+			 beacon_chan->center_freq, beacon_chan->freq_offset,
+			 ieee80211_freq_khz_to_channel(
+				 ieee80211_channel_to_khz(beacon_chan)),
+			 wiphy_name(wiphy));
 
 	memcpy(&reg_beacon->chan, beacon_chan,
 	       sizeof(struct ieee80211_channel));

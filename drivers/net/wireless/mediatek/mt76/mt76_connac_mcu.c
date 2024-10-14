@@ -2157,7 +2157,7 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
 			sar_power = mt76_get_sar_power(phy, &chan, reg_power);
 
 			mt76_get_rate_power_limits(phy, &chan, limits,
-						   sar_power);
+						   NULL, sar_power);
 
 			tx_power_tlv.last_msg = ch_list[idx] == last_ch;
 			sku_tlbv.channel = ch_list[idx];
@@ -2853,21 +2853,23 @@ EXPORT_SYMBOL_GPL(mt76_connac_mcu_restart);
 int mt76_connac_mcu_rdd_cmd(struct mt76_dev *dev, int cmd, u8 index,
 			    u8 rx_sel, u8 val)
 {
-	struct {
-		u8 ctrl;
-		u8 rdd_idx;
-		u8 rdd_rx_sel;
-		u8 val;
-		u8 rsv[4];
-	} __packed req = {
+	int rv;
+	struct rdd_cmd_msg req = {
 		.ctrl = cmd,
 		.rdd_idx = index,
 		.rdd_rx_sel = rx_sel,
 		.val = val,
 	};
 
-	return mt76_mcu_send_msg(dev, MCU_EXT_CMD(SET_RDD_CTRL), &req,
-				 sizeof(req), true);
+	rv = mt76_mcu_send_msg(dev, MCU_EXT_CMD(SET_RDD_CTRL), &req,
+			       sizeof(req), true);
+
+	if (!WARN_ON_ONCE(index > 2)) {
+		memcpy(&(dev->debug_mcu_rdd_cmd[index]), &req, sizeof(req));
+		dev->debug_mcu_rdd_cmd_rv[index] = rv;
+	}
+
+	return rv;
 }
 EXPORT_SYMBOL_GPL(mt76_connac_mcu_rdd_cmd);
 
@@ -2942,6 +2944,8 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
 	hdr = (const void *)(fw->data + fw->size - sizeof(*hdr));
 	dev_info(dev->dev, "WM Firmware Version: %.10s, Build Time: %.15s\n",
 		 hdr->fw_ver, hdr->build_date);
+	strncpy(dev->fw.wm_fw_ver, hdr->fw_ver, 10);
+	strncpy(dev->fw.wm_build_date, hdr->build_date, 15);
 
 	ret = mt76_connac_mcu_send_ram_firmware(dev, hdr, fw->data, false);
 	if (ret) {
@@ -2971,6 +2975,8 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
 	hdr = (const void *)(fw->data + fw->size - sizeof(*hdr));
 	dev_info(dev->dev, "WA Firmware Version: %.10s, Build Time: %.15s\n",
 		 hdr->fw_ver, hdr->build_date);
+	strncpy(dev->fw.wa_fw_ver, hdr->fw_ver, 10);
+	strncpy(dev->fw.wa_build_date, hdr->build_date, 15);
 
 	ret = mt76_connac_mcu_send_ram_firmware(dev, hdr, fw->data, true);
 	if (ret) {
@@ -3030,7 +3036,7 @@ int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name)
 	case PATCH_NOT_DL_SEM_SUCCESS:
 		break;
 	default:
-		dev_err(dev->dev, "Failed to get patch semaphore\n");
+		dev_err(dev->dev, "Failed to get patch semaphore: %d\n", sem);
 		return -EAGAIN;
 	}
 
@@ -3047,6 +3053,8 @@ int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name)
 	hdr = (const void *)fw->data;
 	dev_info(dev->dev, "HW/SW Version: 0x%x, Build Time: %.16s\n",
 		 be32_to_cpu(hdr->hw_sw_ver), hdr->build_date);
+	dev->fw.hw_sw_ver = be32_to_cpu(hdr->hw_sw_ver);
+	strncpy(dev->fw.build_date, hdr->build_date, 15);
 
 	for (i = 0; i < be32_to_cpu(hdr->desc.n_region); i++) {
 		struct mt76_connac2_patch_sec *sec;

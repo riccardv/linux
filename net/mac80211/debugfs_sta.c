@@ -103,6 +103,145 @@ static ssize_t sta_flags_read(struct file *file, char __user *userbuf,
 }
 STA_OPS(flags);
 
+static ssize_t sta_stats_read(struct file *file, char __user *userbuf,
+			      size_t count, loff_t *ppos)
+{
+	struct sta_info *sta = file->private_data;
+	unsigned int len = 0;
+	const int buf_len = 12000;
+	char *buf = kzalloc(buf_len, GFP_KERNEL);
+	unsigned long sum;
+	char tmp[60];
+	int i;
+	struct ieee80211_sta_rx_stats rx_stats = {0};
+
+	if (!buf)
+		return -ENOMEM;
+
+	sta_accum_rx_stats(sta, &rx_stats);
+
+#define PRINT_MY_STATS(a, b) do {					\
+		len += scnprintf(buf + len, buf_len - len, "%30s %18lu\n", a, (unsigned long)(b)); \
+		if (len >= buf_len) {					\
+			goto done;					\
+		}							\
+	} while (0)
+
+#define PRINT_MY_STATS_S(a, b) do {					\
+		len += scnprintf(buf + len, buf_len - len, "%30s %18ld\n", a, (long)(b)); \
+		if (len >= buf_len) {					\
+			goto done;					\
+		}							\
+	} while (0)
+
+	PRINT_MY_STATS("rx-packets", rx_stats.packets);
+	PRINT_MY_STATS("rx-bytes", rx_stats.bytes);
+	PRINT_MY_STATS("rx-dup", rx_stats.num_duplicates);
+	PRINT_MY_STATS("rx-fragments", rx_stats.fragments);
+	PRINT_MY_STATS("rx-dropped", rx_stats.dropped);
+	PRINT_MY_STATS_S("rx-last-signal", rx_stats.last_signal);
+
+	for (i = 0; i<IEEE80211_MAX_CHAINS; i++) {
+		if (rx_stats.chains & (1<<i)) {
+			sprintf(tmp, "rx-last-signal-chain[%i]", i);
+			PRINT_MY_STATS_S(tmp, rx_stats.chain_signal_last[i]);
+		}
+	}
+	PRINT_MY_STATS("rx-last-rate-encoded", rx_stats.last_rate);
+
+	len += scnprintf(buf + len, buf_len - len, "\n");
+
+	sum = sta->deflink.tx_stats.packets[0] + sta->deflink.tx_stats.packets[1]
+		+ sta->deflink.tx_stats.packets[2] + sta->deflink.tx_stats.packets[3];
+	PRINT_MY_STATS("tx-packets", sum);
+
+		sum = sta->deflink.tx_stats.bytes[0] + sta->deflink.tx_stats.bytes[1]
+		+ sta->deflink.tx_stats.bytes[2] + sta->deflink.tx_stats.bytes[3];
+	PRINT_MY_STATS("tx-bytes", sum);
+
+	/* per txq stats */
+	PRINT_MY_STATS("tx-packets-acs[VO]", sta->deflink.tx_stats.packets[IEEE80211_AC_VO]);
+	PRINT_MY_STATS("tx-packets-acs[VI]", sta->deflink.tx_stats.packets[IEEE80211_AC_VI]);
+	PRINT_MY_STATS("tx-packets-acs[BE]", sta->deflink.tx_stats.packets[IEEE80211_AC_BE]);
+	PRINT_MY_STATS("tx-packets-acs[BK]", sta->deflink.tx_stats.packets[IEEE80211_AC_BK]);
+
+	PRINT_MY_STATS("tx-bytes-acs[VO]", sta->deflink.tx_stats.bytes[IEEE80211_AC_VO]);
+	PRINT_MY_STATS("tx-bytes-acs[VI]", sta->deflink.tx_stats.bytes[IEEE80211_AC_VI]);
+	PRINT_MY_STATS("tx-bytes-acs[BE]", sta->deflink.tx_stats.bytes[IEEE80211_AC_BE]);
+	PRINT_MY_STATS("tx-bytes-acs[BK]", sta->deflink.tx_stats.bytes[IEEE80211_AC_BK]);
+
+	len += scnprintf(buf + len, buf_len - len, "\n");
+	for (i = 0; i<=IEEE80211_NUM_TIDS; i++) {
+		sprintf(tmp, "tx-msdu-tid[%2i]", i);
+		PRINT_MY_STATS(tmp, sta->deflink.tx_stats.msdu[i]);
+	}
+
+	len += scnprintf(buf + len, buf_len - len, "\n");
+	for (i = 0; i<=IEEE80211_NUM_TIDS; i++) {
+		sprintf(tmp, "rx-msdu-tid[%2i]", i);
+		PRINT_MY_STATS(tmp, rx_stats.msdu[i]);
+	}
+
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+	PRINT_MY_STATS("rx-bw-20", rx_stats.msdu_20);
+	PRINT_MY_STATS("rx-bw-40", rx_stats.msdu_40);
+	PRINT_MY_STATS("rx-bw-80", rx_stats.msdu_80);
+	PRINT_MY_STATS("rx-bw-160", rx_stats.msdu_160);
+	PRINT_MY_STATS("rx-bw-he-ru", rx_stats.msdu_he_ru);
+
+	PRINT_MY_STATS("rx-he-total", rx_stats.msdu_he_tot);
+	PRINT_MY_STATS("rx-vht", rx_stats.msdu_vht);
+	PRINT_MY_STATS("rx-ht", rx_stats.msdu_ht);
+	PRINT_MY_STATS("rx-legacy", rx_stats.msdu_legacy);
+
+	PRINT_MY_STATS("rx-he-ru-alloc[   26]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_26]);
+	PRINT_MY_STATS("rx-he-ru-alloc[   52]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_52]);
+	PRINT_MY_STATS("rx-he-ru-alloc[  106]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_106]);
+	PRINT_MY_STATS("rx-he-ru-alloc[  242]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_242]);
+	PRINT_MY_STATS("rx-he-ru-alloc[  484]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_484]);
+	PRINT_MY_STATS("rx-he-ru-alloc[  996]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_996]);
+	PRINT_MY_STATS("rx-he-ru-alloc[2x996]", rx_stats.msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_2x996]);
+
+	for (i = 0; i < ARRAY_SIZE(rx_stats.msdu_nss); i++) {
+		sprintf(tmp, "rx-msdu-nss[%i]", i);
+		PRINT_MY_STATS(tmp, rx_stats.msdu_nss[i]);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(rx_stats.msdu_rate_idx); i++) {
+		sprintf(tmp, "rx-rate-idx[%3i]", i);
+		PRINT_MY_STATS(tmp, rx_stats.msdu_rate_idx[i]);
+	}
+
+	len += scnprintf(buf + len, buf_len - len, "\n");
+	PRINT_MY_STATS("tx-bw-20", sta->deflink.tx_stats.msdu_20);
+	PRINT_MY_STATS("tx-bw-40", sta->deflink.tx_stats.msdu_40);
+	PRINT_MY_STATS("tx-bw-80", sta->deflink.tx_stats.msdu_80);
+	PRINT_MY_STATS("tx-bw-160", sta->deflink.tx_stats.msdu_160);
+	PRINT_MY_STATS("tx-bw-he", sta->deflink.tx_stats.msdu_he);
+
+	PRINT_MY_STATS("tx-vht", sta->deflink.tx_stats.msdu_vht);
+	PRINT_MY_STATS("tx-ht", sta->deflink.tx_stats.msdu_ht);
+	PRINT_MY_STATS("tx-legacy", sta->deflink.tx_stats.msdu_legacy);
+
+	for (i = 0; i < ARRAY_SIZE(sta->deflink.tx_stats.msdu_nss); i++) {
+		sprintf(tmp, "tx-msdu-nss[%i]", i);
+		PRINT_MY_STATS(tmp, sta->deflink.tx_stats.msdu_nss[i]);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sta->deflink.tx_stats.msdu_rate_idx); i++) {
+		sprintf(tmp, "tx-rate-idx[%3i]", i);
+		PRINT_MY_STATS(tmp, sta->deflink.tx_stats.msdu_rate_idx[i]);
+	}
+#endif
+
+#undef PRINT_MY_STATS
+done:
+	i = simple_read_from_buffer(userbuf, count, ppos, buf, strlen(buf));
+	kfree(buf);
+	return i;
+}
+STA_OPS(stats);
+
 static ssize_t sta_num_ps_buf_frames_read(struct file *file,
 					  char __user *userbuf,
 					  size_t count, loff_t *ppos)
@@ -560,22 +699,109 @@ static ssize_t link_sta_ht_capa_read(struct file *file, char __user *userbuf,
 }
 LINK_STA_OPS(ht_capa);
 
-static ssize_t link_sta_vht_capa_read(struct file *file, char __user *userbuf,
-				      size_t count, loff_t *ppos)
+static ssize_t link_sta_vht_capa_do_read(struct wiphy *wiphy, struct file *file,
+                                         char *buf, size_t bufsz, void *data)
 {
-	char *buf, *p;
-	struct link_sta_info *link_sta = file->private_data;
+	struct link_sta_info *link_sta = data;
 	struct ieee80211_sta_vht_cap *vhtc = &link_sta->pub->vht_cap;
-	ssize_t ret;
-	ssize_t bufsz = 512;
-
-	buf = kzalloc(bufsz, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	struct cfg80211_chan_def *chandef = &link_sta->sta->sdata->vif.bss_conf.chanreq.oper;
+	struct ieee80211_sub_if_data *sdata = link_sta->sta->sdata;
+	struct ieee80211_link_data *link;
+	char *p;
 	p = buf;
 
-	p += scnprintf(p, bufsz + buf - p, "VHT %ssupported\n",
+	link = wiphy_dereference(wiphy, sdata->link[link_sta->link_id]);
+
+	if (link && link->conf)
+		chandef = &link->conf->chanreq.oper;
+
+	p += scnprintf(p, bufsz + buf - p, "VHT %ssupported\nSta-Cur-Max-Bandwidth:\t",
 			vhtc->vht_supported ? "" : "not ");
+	switch (link_sta->cur_max_bandwidth) {
+	case IEEE80211_STA_RX_BW_20:
+		p += scnprintf(p, bufsz + buf - p, "20Mhz\n");
+		break;
+	case IEEE80211_STA_RX_BW_40:
+		p += scnprintf(p, bufsz + buf - p, "40Mhz\n");
+		break;
+	case IEEE80211_STA_RX_BW_80:
+		p += scnprintf(p, bufsz + buf - p, "80Mhz\n");
+		break;
+	case IEEE80211_STA_RX_BW_160:
+		p += scnprintf(p, bufsz + buf - p, "160Mhz\n");
+		break;
+	case IEEE80211_STA_RX_BW_320:
+		p += scnprintf(p, bufsz + buf - p, "320Mhz\n");
+		break;
+	}
+
+	p += scnprintf(p, bufsz + buf - p, "Chandef-Bandwidth:\t");
+	switch (chandef->width) {
+	case NL80211_CHAN_WIDTH_20_NOHT:
+		p += scnprintf(p, bufsz + buf - p, "20Mhz-NOHT");
+		break;
+	case NL80211_CHAN_WIDTH_20:
+		p += scnprintf(p, bufsz + buf - p, "20Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_40:
+		p += scnprintf(p, bufsz + buf - p, "40Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_80:
+		p += scnprintf(p, bufsz + buf - p, "80Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_80P80:
+		p += scnprintf(p, bufsz + buf - p, "80p80Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		p += scnprintf(p, bufsz + buf - p, "160Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_320:
+		p += scnprintf(p, bufsz + buf - p, "320Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_1:
+		p += scnprintf(p, bufsz + buf - p, "1Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_2:
+		p += scnprintf(p, bufsz + buf - p, "2Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_4:
+		p += scnprintf(p, bufsz + buf - p, "4Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_5:
+		p += scnprintf(p, bufsz + buf - p, "5Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_8:
+		p += scnprintf(p, bufsz + buf - p, "8Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_10:
+		p += scnprintf(p, bufsz + buf - p, "10Mhz");
+		break;
+	case NL80211_CHAN_WIDTH_16:
+		p += scnprintf(p, bufsz + buf - p, "16Mhz");
+		break;
+	}
+
+	p += scnprintf(p, bufsz + buf - p, "\nPeer-Rx-Bandwidth:\t");
+	switch (link_sta->pub->bandwidth) {
+	case IEEE80211_STA_RX_BW_20:
+		p += scnprintf(p, bufsz + buf - p, "20Mhz");
+		break;
+	case IEEE80211_STA_RX_BW_40:
+		p += scnprintf(p, bufsz + buf - p, "40Mhz");
+		break;
+	case IEEE80211_STA_RX_BW_80:
+		p += scnprintf(p, bufsz + buf - p, "80Mhz");
+		break;
+	case IEEE80211_STA_RX_BW_160:
+		p += scnprintf(p, bufsz + buf - p, "160Mhz");
+		break;
+	case IEEE80211_STA_RX_BW_320:
+		p += scnprintf(p, bufsz + buf - p, "320Mhz");
+		break;
+	}
+	p += scnprintf(p, bufsz + buf - p, "\nPeer-Rx-NSS:\t%d\n",
+		       link_sta->pub->rx_nss);
+
 	if (vhtc->vht_supported) {
 		p += scnprintf(p, bufsz + buf - p, "cap: %#.8x\n",
 			       vhtc->cap);
@@ -668,8 +894,27 @@ static ssize_t link_sta_vht_capa_read(struct file *file, char __user *userbuf,
 #undef PFLAG
 	}
 
-	ret = simple_read_from_buffer(userbuf, count, ppos, buf, p - buf);
+	return p - buf;
+}
+
+static ssize_t link_sta_vht_capa_read(struct file *file, char __user *userbuf,
+				      size_t count, loff_t *ppos)
+{
+	struct link_sta_info *link_sta = file->private_data;
+	struct wiphy *wiphy = link_sta->sta->local->hw.wiphy;
+	char *buf;
+	ssize_t ret;
+	ssize_t bufsz = 512;
+
+	buf = kzalloc(bufsz, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = wiphy_locked_debugfs_read(wiphy, file, buf, bufsz, userbuf, count, ppos,
+	                                link_sta_vht_capa_do_read, link_sta);
+
 	kfree(buf);
+
 	return ret;
 }
 LINK_STA_OPS(vht_capa);
@@ -1056,6 +1301,7 @@ static ssize_t link_sta_eht_capa_read(struct file *file, char __user *userbuf,
 	struct ieee80211_sta_eht_cap *bec = &link_sta->pub->eht_cap;
 	struct ieee80211_eht_cap_elem_fixed *fixed = &bec->eht_cap_elem;
 	struct ieee80211_eht_mcs_nss_supp *nss = &bec->eht_mcs_nss_supp;
+	struct ieee80211_eht_mcs_nss_supp *nss_sta = &link_sta->pub->sta_eht_cap.eht_mcs_nss_supp;
 	u8 *cap;
 	int i;
 	ssize_t ret;
@@ -1188,30 +1434,46 @@ static ssize_t link_sta_eht_capa_read(struct file *file, char __user *userbuf,
 	if (!(link_sta->pub->he_cap.he_cap_elem.phy_cap_info[0] &
 	      IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_MASK_ALL)) {
 		u8 *mcs_vals = (u8 *)(&nss->only_20mhz);
+		u8 *mcs_vals_sta = (u8 *)(&nss_sta->only_20mhz);
 
-		for (i = 0; i < 4; i++)
+		for (i = 0; i < 4; i++) {
 			PRINT("EHT bw=20 MHz, max NSS for MCS %s: Rx=%u, Tx=%u",
 			      mcs_desc[i],
 			      mcs_vals[i] & 0xf, mcs_vals[i] >> 4);
+			PRINT("               local link: Rx=%u, Tx=%u",
+			      mcs_vals_sta[i] & 0xf, mcs_vals_sta[i] >> 4);
+		}
 	} else {
 		u8 *mcs_vals = (u8 *)(&nss->bw._80);
+		u8 *mcs_vals_sta = (u8 *)(&nss_sta->bw._80);
 
-		for (i = 0; i < 3; i++)
+		for (i = 0; i < 3; i++) {
 			PRINT("EHT bw <= 80 MHz, max NSS for MCS %s: Rx=%u, Tx=%u",
 			      mcs_desc[i + 1],
 			      mcs_vals[i] & 0xf, mcs_vals[i] >> 4);
+			PRINT("                  local link: Rx=%u, Tx=%u",
+			      mcs_vals_sta[i] & 0xf, mcs_vals_sta[i] >> 4);
+		}
 
 		mcs_vals = (u8 *)(&nss->bw._160);
-		for (i = 0; i < 3; i++)
+		mcs_vals_sta = (u8 *)(&nss_sta->bw._160);
+		for (i = 0; i < 3; i++) {
 			PRINT("EHT bw <= 160 MHz, max NSS for MCS %s: Rx=%u, Tx=%u",
 			      mcs_desc[i + 1],
 			      mcs_vals[i] & 0xf, mcs_vals[i] >> 4);
+			PRINT("                   local link: Rx=%u, Tx=%u",
+			      mcs_vals_sta[i] & 0xf, mcs_vals_sta[i] >> 4);
+		}
 
 		mcs_vals = (u8 *)(&nss->bw._320);
-		for (i = 0; i < 3; i++)
+		mcs_vals_sta = (u8 *)(&nss_sta->bw._320);
+		for (i = 0; i < 3; i++) {
 			PRINT("EHT bw <= 320 MHz, max NSS for MCS %s: Rx=%u, Tx=%u",
 			      mcs_desc[i + 1],
 			      mcs_vals[i] & 0xf, mcs_vals[i] >> 4);
+			PRINT("                   local link: Rx=%u, Tx=%u",
+			      mcs_vals_sta[i] & 0xf, mcs_vals_sta[i] >> 4);
+		}
 	}
 
 	if (cap[5] & IEEE80211_EHT_PHY_CAP5_PPE_THRESHOLD_PRESENT) {
@@ -1262,6 +1524,7 @@ void ieee80211_sta_debugfs_add(struct sta_info *sta)
 	sta->debugfs_dir = debugfs_create_dir(mac, stations_dir);
 
 	DEBUGFS_ADD(flags);
+	DEBUGFS_ADD(stats);
 	DEBUGFS_ADD(aid);
 	DEBUGFS_ADD(num_ps_buf_frames);
 	DEBUGFS_ADD(last_seq_ctrl);
@@ -1284,6 +1547,10 @@ void ieee80211_sta_debugfs_add(struct sta_info *sta)
 
 void ieee80211_sta_debugfs_remove(struct sta_info *sta)
 {
+	if (WARN_ON_ONCE(!sta))
+		return;
+	if (WARN_ON_ONCE(!sta->debugfs_dir))
+		return;
 	debugfs_remove_recursive(sta->debugfs_dir);
 	sta->debugfs_dir = NULL;
 }

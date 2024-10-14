@@ -67,6 +67,7 @@ mt76_tx_status_unlock(struct mt76_dev *dev, struct sk_buff_head *list)
 		wcid = rcu_dereference(dev->wcid[cb->wcid]);
 		if (wcid) {
 			status.sta = wcid_to_sta(wcid);
+			rs.try_count = 1;
 			if (status.sta && (wcid->rate.flags || wcid->rate.legacy)) {
 				rs.rate_idx = wcid->rate;
 				status.rates = &rs;
@@ -92,6 +93,8 @@ __mt76_tx_status_skb_done(struct mt76_dev *dev, struct sk_buff *skb, u8 flags,
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
 	u8 done = MT_TX_CB_DMA_DONE | MT_TX_CB_TXS_DONE;
+
+	mtk_dbg(dev, TX, "%s: flags=0x%x, cb->flags=0x%x", __func__, flags, cb->flags);
 
 	flags |= cb->flags;
 	cb->flags = flags;
@@ -126,6 +129,9 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
 	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
 	int pid;
 
+	mtk_dbg(dev, TXV, "mt76-tx-status-skb-add, skb: %p  wcid->idx: %d\n",
+		skb, wcid->idx);
+
 	memset(cb, 0, sizeof(*cb));
 
 	if (!wcid || !rcu_access_pointer(dev->wcid[wcid->idx]))
@@ -143,6 +149,8 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
 
 		return MT_PACKET_ID_NO_SKB;
 	}
+
+	/* REQ_TX_STATUS is true logic */
 
 	spin_lock_bh(&dev->status_lock);
 
@@ -166,41 +174,63 @@ out:
 }
 EXPORT_SYMBOL_GPL(mt76_tx_status_skb_add);
 
+/* pktid of -1 means flush all */
 struct sk_buff *
 mt76_tx_status_skb_get(struct mt76_dev *dev, struct mt76_wcid *wcid, int pktid,
 		       struct sk_buff_head *list)
 {
 	struct sk_buff *skb;
-	int id;
+	struct sk_buff *skb2;
+	int id = -1;
+
+	mtk_dbg(dev, TXV, "mt76-tx-status-skb-get, pktid: %d  wcid->idx: %d\n",
+		pktid, wcid->idx);
 
 	lockdep_assert_held(&dev->status_lock);
 
-	skb = idr_remove(&wcid->pktid, pktid);
-	if (skb)
-		goto out;
+	if (pktid >= 0) {
+		skb = idr_remove(&wcid->pktid, pktid);
+		if (skb)
+			goto out;
+
+		/* If we have not checked for stale entries recently,
+		 * then do that check now.
+		 */
+		if (time_is_after_jiffies(wcid->last_idr_check_at +
+					  dev->stale_skb_status_check))
+			goto out;
+	}
 
 	/* look for stale entries in the wcid idr queue */
-	idr_for_each_entry(&wcid->pktid, skb, id) {
-		struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
+	idr_for_each_entry(&wcid->pktid, skb2, id) {
+		struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb2);
 
 		if (pktid >= 0) {
 			if (!(cb->flags & MT_TX_CB_DMA_DONE))
 				continue;
 
 			if (time_is_after_jiffies(cb->jiffies +
-						   MT_TX_STATUS_SKB_TIMEOUT))
+						  dev->stale_skb_status_timeout))
 				continue;
 		}
 
+		WARN_ON(cb->pktid != id);
 		/* It has been too long since DMA_DONE, time out this packet
 		 * and stop waiting for TXS callback.
 		 */
 		idr_remove(&wcid->pktid, cb->pktid);
-		__mt76_tx_status_skb_done(dev, skb, MT_TX_CB_TXS_FAILED |
-						    MT_TX_CB_TXS_DONE, list);
+		__mt76_tx_status_skb_done(dev, skb2, MT_TX_CB_TXS_FAILED |
+					  MT_TX_CB_TXS_DONE, list);
 	}
+	wcid->last_idr_check_at = jiffies;
 
 out:
+	if (pktid < 0 && WARN_ON(!idr_is_empty(&wcid->pktid))) {
+		idr_for_each_entry(&wcid->pktid, skb, id)
+			printk("wcid %d slot %d pktid: %d was not cleared\n",
+			       wcid->idx, id, pktid);
+	}
+
 	if (idr_is_empty(&wcid->pktid))
 		list_del_init(&wcid->list);
 
@@ -243,15 +273,27 @@ void __mt76_tx_complete_skb(struct mt76_dev *dev, u16 wcid_idx, struct sk_buff *
 	struct ieee80211_tx_status status = {
 		.skb = skb,
 		.free_list = free_list,
+		.info = IEEE80211_SKB_CB(skb),
 	};
 	struct mt76_wcid *wcid = NULL;
 	struct ieee80211_hw *hw;
 	struct sk_buff_head list;
+	struct ieee80211_rate_status status_rate = { 0 };
 
+	mtk_dbg(dev, TXV, "mt76-tx-complete-skb, wcid_idx: %d skb: %p\n",
+		wcid_idx, skb);
 	rcu_read_lock();
 
-	if (wcid_idx < ARRAY_SIZE(dev->wcid))
+	if (wcid_idx < ARRAY_SIZE(dev->wcid)) {
 		wcid = rcu_dereference(dev->wcid[wcid_idx]);
+		if (wcid) {
+			status.rates = &status_rate;
+			status.n_rates = 1;
+			status_rate.rate_idx = wcid->rate;
+			status_rate.try_count = 1;
+               }
+       }
+
 
 	mt76_tx_check_non_aql(dev, wcid, skb);
 
@@ -309,6 +351,10 @@ __mt76_tx_queue_skb(struct mt76_phy *phy, int qid, struct sk_buff *skb,
 
 	non_aql = !info->tx_time_est;
 	idx = dev->queue_ops->tx_queue_skb(phy, q, qid, skb, wcid, sta);
+
+	mtk_dbg(dev, TXV, "mt76-tx-queue-skb, idx: %d sta: %p skb: %p\n",
+		idx, sta, skb);
+
 	if (idx < 0 || !sta)
 		return idx;
 
@@ -330,6 +376,9 @@ mt76_tx(struct mt76_phy *phy, struct ieee80211_sta *sta,
 	struct mt76_wcid *wcid, struct sk_buff *skb)
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+
+	mtk_dbg(phy->dev, TXV, "mt76-tx, testmode enabled: %d, sta: %p sta->addr: %pM wcid->idx: %d skb: %p skb-len: %d\n",
+		mt76_testmode_enabled(phy), sta, sta ? sta->addr : NULL, wcid ? wcid->idx : -1, skb, skb->len);
 
 	if (mt76_testmode_enabled(phy)) {
 		ieee80211_free_txskb(phy->hw, skb);
@@ -366,8 +415,11 @@ mt76_txq_dequeue(struct mt76_phy *phy, struct mt76_txq *mtxq)
 	struct sk_buff *skb;
 
 	skb = ieee80211_tx_dequeue(phy->hw, txq);
-	if (!skb)
+	if (!skb) {
+		mtk_dbg(phy->dev, TXV, "mt76-txq-dequeue, ieee80211_tx_dequeue returned NULL, txq: %p  mtxq: %p\n",
+			txq, mtxq);
 		return NULL;
+	}
 
 	info = IEEE80211_SKB_CB(skb);
 	info->hw_queue |= FIELD_PREP(MT_TX_HW_QUEUE_PHY, phy->band_idx);
@@ -456,15 +508,22 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
 	bool stop = false;
 	int idx;
 
-	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+		mtk_dbg(dev, TXV, "mt76-txq-send-burst, in PS, return 0\n");
 		return 0;
+	}
 
-	if (atomic_read(&wcid->non_aql_packets) >= MT_MAX_NON_AQL_PKT)
+	if (atomic_read(&wcid->non_aql_packets) >= MT_MAX_NON_AQL_PKT) {
+		mtk_dbg(dev, TXV, "mt76-txq-send-burst, non-aql-pkts too large: %d, return 0\n",
+			atomic_read(&wcid->non_aql_packets));
 		return 0;
+	}
 
 	skb = mt76_txq_dequeue(phy, mtxq);
-	if (!skb)
+	if (!skb) {
+		mtk_dbg(dev, TXV, "mt76-txq-send-burst, txq-dequeue returned NULL skb, return 0\n");
 		return 0;
+	}
 
 	info = IEEE80211_SKB_CB(skb);
 	if (!(wcid->tx_info & MT_WCID_TX_INFO_SET))
@@ -474,19 +533,28 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
 	spin_lock(&q->lock);
 	idx = __mt76_tx_queue_skb(phy, qid, skb, wcid, txq->sta, &stop);
 	spin_unlock(&q->lock);
-	if (idx < 0)
+	if (idx < 0) {
+		mtk_dbg(dev, TXV, "mt76-txq-send-burst, __mt76_tx_queue returned bad idx: %d\n", idx);
 		return idx;
+	}
 
 	do {
-		if (test_bit(MT76_RESET, &phy->state))
+		if (test_bit(MT76_RESET, &phy->state)) {
+			mtk_dbg(dev, TXV, "mt76-txq-send-burst, in PS, return 0\n");
 			return -EBUSY;
+		}
 
-		if (stop || mt76_txq_stopped(q))
+		if (stop || mt76_txq_stopped(q)) {
+			mtk_dbg(dev, TXV, "mt76-txq-send-burst, stop: %d or txq-stopped\n",
+				stop);
 			break;
+		}
 
 		skb = mt76_txq_dequeue(phy, mtxq);
-		if (!skb)
+		if (!skb) {
+			mtk_dbg(dev, TXV, "mt76-txq-send-burst, txq-dequeue returned NULL skb, break out of loop\n");
 			break;
+		}
 
 		info = IEEE80211_SKB_CB(skb);
 		if (!(wcid->tx_info & MT_WCID_TX_INFO_SET))
@@ -496,8 +564,11 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
 		spin_lock(&q->lock);
 		idx = __mt76_tx_queue_skb(phy, qid, skb, wcid, txq->sta, &stop);
 		spin_unlock(&q->lock);
-		if (idx < 0)
+		if (idx < 0) {
+			mtk_dbg(dev, TXV, "mt76-txq-send-burst, __mt76_tx_queue_skb returned bad idx: %d in loop, break\n",
+				idx);
 			break;
+		}
 
 		n_frames++;
 	} while (1);
@@ -522,22 +593,32 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
 	while (1) {
 		int n_frames = 0;
 
-		if (test_bit(MT76_RESET, &phy->state))
+		if (test_bit(MT76_RESET, &phy->state)) {
+			mtk_dbg(dev, TXV, "mt76-txq-schedule-list, EBUSY\n");
 			return -EBUSY;
+		}
 
+		mtk_dbg(dev, TXV, "mt76-txq-schedule-list, q->queued: %d q-stopped: %d qid: %d q->ndesc: %d\n",
+			q->queued, mt76_txq_stopped(q), qid, q->ndesc);
 		if (dev->queue_ops->tx_cleanup &&
 		    q->queued + 2 * MT_TXQ_FREE_THR >= q->ndesc) {
 			dev->queue_ops->tx_cleanup(dev, q, false);
 		}
 
 		txq = ieee80211_next_txq(phy->hw, qid);
-		if (!txq)
+		if (!txq) {
+			mtk_dbg(dev, TXV, "mt76-txq-schedule-list, no ieee next txq, qid: %d, ret: %d\n",
+				qid, ret);
 			break;
+		}
 
 		mtxq = (struct mt76_txq *)txq->drv_priv;
 		wcid = rcu_dereference(dev->wcid[mtxq->wcid]);
-		if (!wcid || test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+		if (!wcid || test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+			mtk_dbg(dev, TXV, "mt76-txq-schedule-list, NULL wcid: %p or PS\n",
+				wcid);
 			continue;
+		}
 
 		if (mtxq->send_bar && mtxq->aggr) {
 			struct ieee80211_txq *txq = mtxq_to_txq(mtxq);
@@ -546,12 +627,16 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
 			u16 agg_ssn = mtxq->agg_ssn;
 			u8 tid = txq->tid;
 
+			mtk_dbg(dev, TXV, "mt76-txq-schedule-list, calling send_bar\n");
 			mtxq->send_bar = false;
 			ieee80211_send_bar(vif, sta->addr, tid, agg_ssn);
 		}
 
-		if (!mt76_txq_stopped(q))
+		if (!mt76_txq_stopped(q)) {
 			n_frames = mt76_txq_send_burst(phy, q, mtxq, wcid);
+			mtk_dbg(dev, TXV, "mt76-txq-schedule-list, send-burst, n_frames: %d\n",
+				n_frames);
+		}
 
 		ieee80211_return_txq(phy->hw, txq, false);
 
@@ -568,8 +653,11 @@ void mt76_txq_schedule(struct mt76_phy *phy, enum mt76_txq_id qid)
 {
 	int len;
 
-	if (qid >= 4)
+	if (qid >= 4) {
+		mtk_dbg(phy->dev, TXV, "%mt76-txq-schedule, qid OOR: %d\n",
+			qid);
 		return;
+	}
 
 	local_bh_disable();
 	rcu_read_lock();
@@ -594,6 +682,9 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid)
 	struct sk_buff *skb;
 	int ret = 0;
 
+	mtk_dbg(phy->dev, TXV, "mt76-txq-sched-pending-wcid, wcid->idx: %d\n",
+		wcid->idx);
+
 	spin_lock(&wcid->tx_pending.lock);
 	while ((skb = skb_peek(&wcid->tx_pending)) != NULL) {
 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
@@ -608,6 +699,8 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid)
 
 		q = phy->q_tx[qid];
 		if (mt76_txq_stopped(q)) {
+			mtk_dbg(phy->dev, TXV, "mt76-txq-sched-pending-wcid, wcid->idx: %d queue-stopped, qid: %d\n",
+				wcid->idx, qid);
 			ret = -1;
 			break;
 		}
@@ -630,6 +723,9 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid)
 
 static void mt76_txq_schedule_pending(struct mt76_phy *phy)
 {
+	mtk_dbg(phy->dev, TXV, "mt76-txq-sched-pending, tx-list empty: %d\n",
+		list_empty(&phy->tx_list));
+
 	if (list_empty(&phy->tx_list))
 		return;
 
@@ -730,9 +826,12 @@ void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
 	struct mt76_phy *phy = hw->priv;
 	struct mt76_dev *dev = phy->dev;
 
-	if (!test_bit(MT76_STATE_RUNNING, &phy->state))
+	if (!test_bit(MT76_STATE_RUNNING, &phy->state)) {
+		mtk_dbg(dev, TXV, "wake-tx-queue, not phy state running");
 		return;
+	}
 
+	mtk_dbg(dev, TXV, "wake txworker, method-ptr: %p", &dev->tx_worker);
 	mt76_worker_schedule(&dev->tx_worker);
 }
 EXPORT_SYMBOL_GPL(mt76_wake_tx_queue);
@@ -781,6 +880,8 @@ EXPORT_SYMBOL_GPL(mt76_skb_adjust_pad);
 void mt76_queue_tx_complete(struct mt76_dev *dev, struct mt76_queue *q,
 			    struct mt76_queue_entry *e)
 {
+	mtk_dbg(dev, TXV, "mt76-queue-tx-complete, q: %p skb: %p\n",
+		q, e->skb);
 	if (e->skb)
 		dev->drv->tx_complete_skb(dev, e);
 

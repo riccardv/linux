@@ -28,6 +28,9 @@ void iwl_mvm_rx_rx_phy_cmd(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 	memcpy(&mvm->last_phy_info, pkt->data, sizeof(mvm->last_phy_info));
 	mvm->ampdu_ref++;
 
+	/* Add to histogram for last ampdu count */
+	iwl_mvm_count_rx_histogram(mvm);
+
 #ifdef CONFIG_IWLWIFI_DEBUGFS
 	if (mvm->last_phy_info.phy_flags & cpu_to_le16(RX_RES_PHY_FLAGS_AGG)) {
 		spin_lock(&mvm->drv_stats_lock);
@@ -114,7 +117,9 @@ static void iwl_mvm_get_signal_strength(struct iwl_mvm *mvm,
 	energy_b = (val & IWL_RX_INFO_ENERGY_ANT_B_MSK) >>
 						IWL_RX_INFO_ENERGY_ANT_B_POS;
 	energy_b = energy_b ? -energy_b : S8_MIN;
-	max_energy = max(energy_a, energy_b);
+
+	/* use DB summing to get better RSSI reporting */
+	max_energy = iwl_mvm_sum_sigs_2(energy_a, energy_b);
 
 	IWL_DEBUG_STATS(mvm, "energy In A %d B %d  , and max %d\n",
 			energy_a, energy_b, max_energy);
@@ -194,6 +199,48 @@ static u32 iwl_mvm_set_mac80211_rx_flag(struct iwl_mvm *mvm,
 	}
 
 	return 0;
+}
+
+void iwl_mvm_count_rx_histogram(struct iwl_mvm *mvm)
+{
+	u32 count = mvm->rx_this_ampdu_count;
+
+	if (count == 0)
+		return;
+
+	/* rx-ampdu-len histogram, buckets match what mtk7915 supports. */
+	if (count <= 1)
+		mvm->ethtool_stats.rx_ampdu_len[0]++;
+	else if (count <= 10)
+		mvm->ethtool_stats.rx_ampdu_len[1]++;
+	else if (count <= 19)
+		mvm->ethtool_stats.rx_ampdu_len[2]++;
+	else if (count <= 28)
+		mvm->ethtool_stats.rx_ampdu_len[3]++;
+	else if (count <= 37)
+		mvm->ethtool_stats.rx_ampdu_len[4]++;
+	else if (count <= 46)
+		mvm->ethtool_stats.rx_ampdu_len[5]++;
+	else if (count <= 55)
+		mvm->ethtool_stats.rx_ampdu_len[6]++;
+	else if (count <= 79)
+		mvm->ethtool_stats.rx_ampdu_len[7]++;
+	else if (count <= 103)
+		mvm->ethtool_stats.rx_ampdu_len[8]++;
+	else if (count <= 127)
+		mvm->ethtool_stats.rx_ampdu_len[9]++;
+	else if (count <= 151)
+		mvm->ethtool_stats.rx_ampdu_len[10]++;
+	else if (count <= 175)
+		mvm->ethtool_stats.rx_ampdu_len[11]++;
+	else if (count <= 199)
+		mvm->ethtool_stats.rx_ampdu_len[12]++;
+	else if (count <= 223)
+		mvm->ethtool_stats.rx_ampdu_len[13]++;
+	else
+		mvm->ethtool_stats.rx_ampdu_len[14]++;
+
+	mvm->rx_this_ampdu_count = 0;
 }
 
 static void iwl_mvm_rx_handle_tcm(struct iwl_mvm *mvm,
@@ -299,6 +346,7 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 	u32 rate_n_flags;
 	u32 rx_pkt_status;
 	u8 crypt_len = 0;
+	bool bad_pkt = false;
 
 	if (unlikely(pkt_len < sizeof(*rx_res))) {
 		IWL_DEBUG_DROP(mvm, "Bad REPLY_RX_MPDU_CMD size\n");
@@ -337,6 +385,11 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 	    !(rx_pkt_status & RX_MPDU_RES_STATUS_OVERRUN_OK)) {
 		IWL_DEBUG_RX(mvm, "Bad CRC or FIFO: 0x%08X.\n", rx_pkt_status);
 		rx_status->flag |= RX_FLAG_FAILED_FCS_CRC;
+		if (!(rx_pkt_status & RX_MPDU_RES_STATUS_CRC_OK))
+			mvm->ethtool_stats.rx_crc_err++;
+		else
+			mvm->ethtool_stats.rx_fifo_underrun++;
+		bad_pkt = true;
 	}
 
 	/* This will be used in several places later */
@@ -405,6 +458,7 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 					 &crypt_len)) {
 		IWL_DEBUG_DROP(mvm, "Bad decryption results 0x%08x\n",
 			       rx_pkt_status);
+		mvm->ethtool_stats.rx_failed_decrypt++;
 		kfree_skb(skb);
 		rcu_read_unlock();
 		return;
@@ -471,22 +525,31 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 		 */
 		rx_status->flag |= RX_FLAG_AMPDU_DETAILS;
 		rx_status->ampdu_reference = mvm->ampdu_ref;
+		mvm->rx_this_ampdu_count++;
+	} else {
+		/* Add to histogram for last ampdu count */
+		iwl_mvm_count_rx_histogram(mvm);
 	}
 
 	/* Set up the HT phy flags */
 	switch (rate_n_flags & RATE_MCS_CHAN_WIDTH_MSK_V1) {
 	case RATE_MCS_CHAN_WIDTH_20:
+		mvm->ethtool_stats.rx_bw[0]++;
 		break;
 	case RATE_MCS_CHAN_WIDTH_40:
 		rx_status->bw = RATE_INFO_BW_40;
+		mvm->ethtool_stats.rx_bw[1]++;
 		break;
 	case RATE_MCS_CHAN_WIDTH_80:
 		rx_status->bw = RATE_INFO_BW_80;
+		mvm->ethtool_stats.rx_bw[2]++;
 		break;
 	case RATE_MCS_CHAN_WIDTH_160:
 		rx_status->bw = RATE_INFO_BW_160;
+		mvm->ethtool_stats.rx_bw[3]++;
 		break;
 	}
+
 	if (!(rate_n_flags & RATE_MCS_CCK_MSK_V1) &&
 	    rate_n_flags & RATE_MCS_SGI_MSK_V1)
 		rx_status->enc_flags |= RX_ENC_FLAG_SHORT_GI;
@@ -500,6 +563,9 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 		rx_status->encoding = RX_ENC_HT;
 		rx_status->rate_idx = rate_n_flags & RATE_HT_MCS_INDEX_MSK_V1;
 		rx_status->enc_flags |= stbc << RX_ENC_FLAG_STBC_SHIFT;
+		mvm->ethtool_stats.rx_mode[2]++;
+		mvm->ethtool_stats.rx_nss[(rx_status->rate_idx / 8)]++;
+		mvm->ethtool_stats.rx_mcs[rx_status->rate_idx % 8]++;
 	} else if (rate_n_flags & RATE_MCS_VHT_MSK_V1) {
 		u8 stbc = (rate_n_flags & RATE_MCS_STBC_MSK) >>
 				RATE_MCS_STBC_POS;
@@ -510,6 +576,9 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 		rx_status->enc_flags |= stbc << RX_ENC_FLAG_STBC_SHIFT;
 		if (rate_n_flags & RATE_MCS_BF_MSK)
 			rx_status->enc_flags |= RX_ENC_FLAG_BF;
+		mvm->ethtool_stats.rx_mode[3]++;
+		mvm->ethtool_stats.rx_nss[rx_status->nss - 1]++;
+		mvm->ethtool_stats.rx_mcs[rx_status->rate_idx]++;
 	} else {
 		int rate = iwl_mvm_legacy_rate_to_mac80211_idx(rate_n_flags,
 							       rx_status->band);
@@ -521,12 +590,20 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 			return;
 		}
 		rx_status->rate_idx = rate;
+		if (rate_n_flags & RATE_MCS_CCK_MSK_V1)
+			mvm->ethtool_stats.rx_mode[0]++;
+		else
+			mvm->ethtool_stats.rx_mode[1]++;
 	}
 
 #ifdef CONFIG_IWLWIFI_DEBUGFS
 	iwl_mvm_update_frame_stats(mvm, rate_n_flags,
 				   rx_status->flag & RX_FLAG_AMPDU_DETAILS);
 #endif
+	if (!bad_pkt) {
+		mvm->ethtool_stats.rx_pkts++;
+		mvm->ethtool_stats.rx_bytes_nic += len;
+	}
 
 	if (unlikely((ieee80211_is_beacon(hdr->frame_control) ||
 		      ieee80211_is_probe_resp(hdr->frame_control)) &&
@@ -536,6 +613,11 @@ void iwl_mvm_rx_rx_mpdu(struct iwl_mvm *mvm, struct napi_struct *napi,
 	if (unlikely(ieee80211_is_beacon(hdr->frame_control) ||
 		     ieee80211_is_probe_resp(hdr->frame_control)))
 		rx_status->boottime_ns = ktime_get_boottime_ns();
+
+	if (unlikely(mvm->block_traffic & IWL_MVM_BLOCK_RX)) {
+		dev_kfree_skb(skb);
+		return;
+	}
 
 	iwl_mvm_pass_packet_to_mac80211(mvm, sta, napi, skb, hdr, len,
 					crypt_len, rxb);
@@ -738,8 +820,8 @@ static void iwl_mvm_stats_energy_iter(void *_data,
 	u8 *energy = _data;
 	u32 sta_id = mvmsta->deflink.sta_id;
 
-	if (WARN_ONCE(sta_id >= IWL_MVM_STATION_COUNT_MAX, "sta_id %d >= %d",
-		      sta_id, IWL_MVM_STATION_COUNT_MAX))
+	if (WARN_ONCE(sta_id >= IWL_STATION_COUNT_MAX, "sta_id %d >= %d",
+		      sta_id, IWL_STATION_COUNT_MAX))
 		return;
 
 	if (energy[sta_id])
@@ -953,6 +1035,8 @@ iwl_mvm_stat_iterator_all_links(struct iwl_mvm *mvm,
 #define SEC_LINK_MIN_PERC 10
 #define SEC_LINK_MIN_TX 3000
 #define SEC_LINK_MIN_RX 400
+/* Compare tput over this interval to determine in/out of ESR mode */
+#define MVM_ESR_TPT_INTERVAL (5 * HZ)
 
 static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 {
@@ -979,6 +1063,10 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 	if (!mvmsta->mpdu_counters)
 		return;
 
+	if (!time_after(jiffies, mvm->esr_tpt_ts + MVM_ESR_TPT_INTERVAL))
+		return; /* check back later */
+	mvm->esr_tpt_ts = jiffies;
+
 	/* Get the FW ID of the secondary link */
 	sec_link = iwl_mvm_get_other_link(bss_vif,
 					  iwl_mvm_get_primary_link(bss_vif));
@@ -991,7 +1079,7 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 		spin_lock_bh(&mvmsta->mpdu_counters[q].lock);
 
 		/* The link IDs that doesn't exist will contain 0 */
-		for (int link = 0; link < IWL_MVM_FW_MAX_LINK_ID; link++) {
+		for (int link = 0; link < IWL_FW_MAX_LINK_ID; link++) {
 			total_tx += mvmsta->mpdu_counters[q].per_link[link].tx;
 			total_rx += mvmsta->mpdu_counters[q].per_link[link].rx;
 		}
@@ -1002,6 +1090,8 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 		/*
 		 * In EMLSR we have statistics every 5 seconds, so we can reset
 		 * the counters upon every statistics notification.
+		 * NOTE:  This is not actually correct, I see this method called
+		 * often.  Thus the back-off timer 'esr_tpt_ts' above. --Ben
 		 */
 		memset(mvmsta->mpdu_counters[q].per_link, 0,
 		       sizeof(mvmsta->mpdu_counters[q].per_link));
@@ -1009,8 +1099,8 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 		spin_unlock_bh(&mvmsta->mpdu_counters[q].lock);
 	}
 
-	IWL_DEBUG_STATS(mvm, "total Tx MPDUs: %ld. total Rx MPDUs: %ld\n",
-			total_tx, total_rx);
+	IWL_DEBUG_INFO(mvm, "EMLSR: total Tx MPDUs: %ld. Rx: %ld sec-link tx: %ld  rx: %ld mvm-tput-thresh: %d\n",
+		       total_tx, total_rx, sec_link_tx, sec_link_rx, IWL_MVM_ENTER_ESR_TPT_THRESH);
 
 	/* If we don't have enough MPDUs - exit EMLSR */
 	if (total_tx < IWL_MVM_ENTER_ESR_TPT_THRESH &&
@@ -1019,6 +1109,9 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 				  iwl_mvm_get_primary_link(bss_vif));
 		return;
 	}
+
+	IWL_DEBUG_INFO(mvm, "Secondary Link %d: Tx MPDUs: %ld. Rx MPDUs: %ld\n",
+		       sec_link, sec_link_tx, sec_link_rx);
 
 	/* Calculate the percentage of the secondary link TX/RX */
 	sec_link_tx_perc = total_tx ? sec_link_tx * 100 / total_tx : 0;
@@ -1039,7 +1132,7 @@ static void iwl_mvm_update_esr_mode_tpt(struct iwl_mvm *mvm)
 void iwl_mvm_handle_rx_system_oper_stats(struct iwl_mvm *mvm,
 					 struct iwl_rx_cmd_buffer *rxb)
 {
-	u8 average_energy[IWL_MVM_STATION_COUNT_MAX];
+	u8 average_energy[IWL_STATION_COUNT_MAX];
 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
 	struct iwl_system_statistics_notif_oper *stats;
 	int i;
@@ -1098,7 +1191,7 @@ static void
 iwl_mvm_handle_rx_statistics_tlv(struct iwl_mvm *mvm,
 				 struct iwl_rx_packet *pkt)
 {
-	u8 average_energy[IWL_MVM_STATION_COUNT_MAX];
+	u8 average_energy[IWL_STATION_COUNT_MAX];
 	__le32 air_time[MAC_INDEX_AUX];
 	__le32 rx_bytes[MAC_INDEX_AUX];
 	__le32 flags = 0;

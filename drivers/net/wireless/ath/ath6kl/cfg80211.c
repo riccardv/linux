@@ -3371,7 +3371,8 @@ static int ath6kl_cfg80211_set_bitrate(struct wiphy *wiphy,
 				       struct net_device *dev,
 				       unsigned int link_id,
 				       const u8 *addr,
-				       const struct cfg80211_bitrate_mask *mask)
+				       const struct cfg80211_bitrate_mask *mask,
+				       const struct cfg80211_probe_req_config *pr_conf)
 {
 	struct ath6kl *ar = ath6kl_priv(dev);
 	struct ath6kl_vif *vif = netdev_priv(dev);

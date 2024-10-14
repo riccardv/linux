@@ -135,8 +135,10 @@ static int iwl_mvm_create_skb(struct iwl_mvm *mvm, struct sk_buff *skb,
 	 */
 	hdrlen += crypt_len;
 
-	if (unlikely(headlen < hdrlen))
+	if (unlikely(headlen < hdrlen)) {
+		mvm->ethtool_stats.rx_bad_header_len++;
 		return -EINVAL;
+	}
 
 	/* Since data doesn't move data while putting data on skb and that is
 	 * the only way we use, data + len is the next place that hdr would be put
@@ -238,7 +240,8 @@ static void iwl_mvm_pass_packet_to_mac80211(struct iwl_mvm *mvm,
 					    struct sk_buff *skb, int queue,
 					    struct ieee80211_sta *sta)
 {
-	if (unlikely(iwl_mvm_check_pn(mvm, skb, queue, sta))) {
+	if (unlikely(iwl_mvm_check_pn(mvm, skb, queue, sta) ||
+	    mvm->block_traffic & IWL_MVM_BLOCK_RX)) {
 		kfree_skb(skb);
 		return;
 	}
@@ -249,23 +252,60 @@ static void iwl_mvm_pass_packet_to_mac80211(struct iwl_mvm *mvm,
 static void iwl_mvm_get_signal_strength(struct iwl_mvm *mvm,
 					struct ieee80211_rx_status *rx_status,
 					u32 rate_n_flags, int energy_a,
-					int energy_b)
+					int energy_b, struct ieee80211_sta *sta,
+					bool is_beacon, bool my_beacon)
 {
 	int max_energy;
 	u32 rate_flags = rate_n_flags;
+	struct iwl_mvm_sta *mvmsta = NULL;
+
+	rx_status->chains =
+		(rate_flags & RATE_MCS_ANT_AB_MSK) >> RATE_MCS_ANT_POS;
+
+	if (sta && !(is_beacon && !my_beacon)) {
+		mvmsta = iwl_mvm_sta_from_mac80211(sta);
+		/* In cases of OFDM encodings (and maybe other cases), energy is
+		 * reported for each chain, but we do not want to average the weak
+		 * chain since it will average in a false weak reading.
+		 */
+		if (rx_status->nss >= 2) {
+			if (energy_a)
+				ewma_signal_add(&mvmsta->rx_avg_chain_signal[0], energy_a);
+			if (energy_b)
+				ewma_signal_add(&mvmsta->rx_avg_chain_signal[1], energy_b);
+		} else {
+			/* Here, energy_x is log(reference/signal), and so is the inverse
+			 * of what we typically expect when reading RSSI, hence this
+			 * comparison is done in an unexpected direction.
+			 */
+			if (energy_a && energy_a <= energy_b)
+				ewma_signal_add(&mvmsta->rx_avg_chain_signal[0], energy_a);
+			else if (energy_b)
+				ewma_signal_add(&mvmsta->rx_avg_chain_signal[1], energy_b);
+		}
+	}
 
 	energy_a = energy_a ? -energy_a : S8_MIN;
 	energy_b = energy_b ? -energy_b : S8_MIN;
-	max_energy = max(energy_a, energy_b);
+
+	/* use DB summing to get better RSSI reporting */
+	max_energy = iwl_mvm_sum_sigs_2(energy_a, energy_b);
 
 	IWL_DEBUG_STATS(mvm, "energy In A %d B %d, and max %d\n",
 			energy_a, energy_b, max_energy);
 
 	rx_status->signal = max_energy;
-	rx_status->chains =
-		(rate_flags & RATE_MCS_ANT_AB_MSK) >> RATE_MCS_ANT_POS;
 	rx_status->chain_signal[0] = energy_a;
 	rx_status->chain_signal[1] = energy_b;
+
+	if (mvmsta) {
+		if (is_beacon) {
+			if (my_beacon)
+				ewma_signal_add(&mvmsta->rx_avg_beacon_signal, -max_energy);
+		} else {
+			ewma_signal_add(&mvmsta->rx_avg_signal, -max_energy);
+		}
+	}
 }
 
 static int iwl_mvm_rx_mgmt_prot(struct ieee80211_sta *sta,
@@ -729,8 +769,6 @@ static bool iwl_mvm_reorder(struct iwl_mvm *mvm,
 	bool last_subframe =
 		desc->amsdu_info & IWL_RX_MPDU_AMSDU_LAST_SUBFRAME;
 	u8 tid = ieee80211_get_tid(hdr);
-	u8 sub_frame_idx = desc->amsdu_info &
-			   IWL_RX_MPDU_AMSDU_SUBFRAME_IDX_MASK;
 	struct iwl_mvm_reorder_buf_entry *entries;
 	u32 sta_mask;
 	int index;
@@ -843,10 +881,8 @@ static bool iwl_mvm_reorder(struct iwl_mvm *mvm,
 	__skb_queue_tail(&entries[index].frames, skb);
 	buffer->num_stored++;
 
-	if (amsdu) {
+	if (amsdu)
 		buffer->last_amsdu = sn;
-		buffer->last_sub_index = sub_frame_idx;
-	}
 
 	/*
 	 * We cannot trust NSSN for AMSDU sub-frames that are not the last.
@@ -1620,6 +1656,8 @@ static void iwl_mvm_rx_eht(struct iwl_mvm *mvm, struct sk_buff *skb,
 
 	/* specific handling for 320MHz */
 	bw = FIELD_GET(RATE_MCS_CHAN_WIDTH_MSK, rate_n_flags);
+	mvm->ethtool_stats.rx_bw[bw]++;
+	mvm->ethtool_stats.rx_he_type[he_type >> RATE_MCS_HE_TYPE_POS]++;
 	if (bw == RATE_MCS_CHAN_WIDTH_320_VAL)
 		bw += FIELD_GET(IWL_RX_PHY_DATA0_EHT_BW320_SLOT,
 				le32_to_cpu(phy_data->d0));
@@ -1777,6 +1815,7 @@ static void iwl_mvm_rx_he(struct iwl_mvm *mvm, struct sk_buff *skb,
 			rx_status->flag |= RX_FLAG_AMPDU_EOF_BIT;
 	}
 
+	/* This is only enabled in pure monitor mode. */
 	if (phy_info & IWL_RX_MPDU_PHY_TSF_OVERLOAD)
 		iwl_mvm_decode_he_phy_data(mvm, phy_data, he, he_mu, rx_status,
 					   queue);
@@ -1793,7 +1832,23 @@ static void iwl_mvm_rx_he(struct iwl_mvm *mvm, struct sk_buff *skb,
 	    rate_n_flags & RATE_MCS_HE_106T_MSK) {
 		rx_status->bw = RATE_INFO_BW_HE_RU;
 		rx_status->he_ru = NL80211_RATE_INFO_HE_RU_ALLOC_106;
+		mvm->ethtool_stats.rx_bw_he_ru++;
+	} else {
+		switch (rx_status->bw) {
+		case RATE_INFO_BW_40:
+			mvm->ethtool_stats.rx_bw[1]++;
+			break;
+		case RATE_INFO_BW_80:
+			mvm->ethtool_stats.rx_bw[2]++;
+			break;
+		case RATE_INFO_BW_160:
+			mvm->ethtool_stats.rx_bw[3]++;
+			break;
+		default:
+			mvm->ethtool_stats.rx_bw[0]++;
+		}
 	}
+	mvm->ethtool_stats.rx_he_type[he_type >> RATE_MCS_HE_TYPE_POS]++;
 
 	/* actually data is filled in mac80211 */
 	if (he_type == RATE_MCS_HE_TYPE_SU ||
@@ -1814,6 +1869,9 @@ static void iwl_mvm_rx_he(struct iwl_mvm *mvm, struct sk_buff *skb,
 
 	if (rate_n_flags & RATE_MCS_BF_MSK)
 		he->data5 |= cpu_to_le16(IEEE80211_RADIOTAP_HE_DATA5_TXBF);
+
+	//printk("he_type: %d  trig: %d  mu: %d  su: %d  he->data1: 0x%x he: %p\n",
+	//       he_type, RATE_MCS_HE_TYPE_TRIG, RATE_MCS_HE_TYPE_MU, RATE_MCS_HE_TYPE_SU, he->data1, he);
 
 	switch ((rate_n_flags & RATE_MCS_HE_GI_LTF_MSK) >>
 		RATE_MCS_HE_GI_LTF_POS) {
@@ -1914,13 +1972,16 @@ static void iwl_mvm_rx_get_sta_block_tx(void *data, struct ieee80211_sta *sta)
 static void iwl_mvm_rx_fill_status(struct iwl_mvm *mvm,
 				   struct sk_buff *skb,
 				   struct iwl_mvm_rx_phy_data *phy_data,
-				   int queue)
+				   int queue, struct ieee80211_hdr *hdr,
+				   struct ieee80211_sta *sta)
 {
 	struct ieee80211_rx_status *rx_status = IEEE80211_SKB_RXCB(skb);
 	u32 rate_n_flags = phy_data->rate_n_flags;
 	u8 stbc = u32_get_bits(rate_n_flags, RATE_MCS_STBC_MSK);
 	u32 format = rate_n_flags & RATE_MCS_MOD_TYPE_MSK;
 	bool is_sgi;
+	bool is_beacon;
+	bool my_beacon = false;
 
 	phy_data->info_type = IWL_RX_PHY_INFO_TYPE_NONE;
 
@@ -1966,8 +2027,13 @@ static void iwl_mvm_rx_fill_status(struct iwl_mvm *mvm,
 
 	rx_status->freq = ieee80211_channel_to_frequency(phy_data->channel,
 							 rx_status->band);
-	iwl_mvm_get_signal_strength(mvm, rx_status, rate_n_flags,
-				    phy_data->energy_a, phy_data->energy_b);
+
+	is_beacon = hdr && (ieee80211_is_beacon(hdr->frame_control));
+	if (is_beacon && sta) {
+		/* see if it is beacon destined for us */
+		if (memcmp(sta->addr, hdr->addr2, ETH_ALEN) == 0)
+			my_beacon = true;
+	}
 
 	/* using TLV format and must be after all fixed len fields */
 	if (format == RATE_MCS_EHT_MSK)
@@ -1986,9 +2052,35 @@ static void iwl_mvm_rx_fill_status(struct iwl_mvm *mvm,
 	if (rate_n_flags & RATE_MCS_LDPC_MSK)
 		rx_status->enc_flags |= RX_ENC_FLAG_LDPC;
 
+	u8 bw_idx = 0;
+
+	switch (rx_status->bw) {
+	case RATE_INFO_BW_20:
+		bw_idx = RATE_MCS_CHAN_WIDTH_20_VAL;
+		break;
+	case RATE_INFO_BW_40:
+		bw_idx = RATE_MCS_CHAN_WIDTH_40_VAL;
+		break;
+	case RATE_INFO_BW_80:
+		bw_idx = RATE_MCS_CHAN_WIDTH_80_VAL;
+		break;
+	case RATE_INFO_BW_160:
+		bw_idx = RATE_MCS_CHAN_WIDTH_160_VAL;
+		break;
+	case RATE_INFO_BW_320:
+		bw_idx = RATE_MCS_CHAN_WIDTH_320_VAL;
+		break;
+	default:
+		bw_idx = 0;
+		break;
+	}
+
 	switch (format) {
 	case RATE_MCS_VHT_MSK:
 		rx_status->encoding = RX_ENC_VHT;
+		/* HE and EHT account for rx_bw in their own decode,
+		 * so we just set VHT and HT in this method. */
+		mvm->ethtool_stats.rx_bw[bw_idx]++;
 		break;
 	case RATE_MCS_HE_MSK:
 		rx_status->encoding = RX_ENC_HE;
@@ -2004,7 +2096,9 @@ static void iwl_mvm_rx_fill_status(struct iwl_mvm *mvm,
 	case RATE_MCS_HT_MSK:
 		rx_status->encoding = RX_ENC_HT;
 		rx_status->rate_idx = RATE_HT_MCS_INDEX(rate_n_flags);
+		rx_status->nss = rx_status->rate_idx / 8 + 1;
 		rx_status->enc_flags |= stbc << RX_ENC_FLAG_STBC_SHIFT;
+		mvm->ethtool_stats.rx_bw[bw_idx]++;
 		break;
 	case RATE_MCS_VHT_MSK:
 	case RATE_MCS_HE_MSK:
@@ -2027,9 +2121,21 @@ static void iwl_mvm_rx_fill_status(struct iwl_mvm *mvm,
 					rate_n_flags, rx_status->band);
 		}
 
+		rx_status->nss = 1;
+		mvm->ethtool_stats.rx_bw[0]++;
 		break;
 		}
 	}
+
+	iwl_mvm_get_signal_strength(mvm, rx_status, rate_n_flags, phy_data->energy_a,
+				    phy_data->energy_b, sta, is_beacon, my_beacon);
+
+	mvm->ethtool_stats.rx_mode[format >> RATE_MCS_MOD_TYPE_POS]++;
+	mvm->ethtool_stats.rx_nss[rx_status->nss - 1]++;
+	if (format == RATE_MCS_HT_MSK)
+		mvm->ethtool_stats.rx_mcs[rx_status->rate_idx % 8]++;
+	else
+		mvm->ethtool_stats.rx_mcs[rx_status->rate_idx]++;
 }
 
 void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
@@ -2048,6 +2154,7 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 	size_t desc_size;
 	struct iwl_mvm_rx_phy_data phy_data = {};
 	u32 format;
+	bool bad_pkt = false;
 
 	if (unlikely(test_bit(IWL_MVM_STATUS_IN_HW_RESTART, &mvm->status)))
 		return;
@@ -2139,6 +2246,11 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 		IWL_DEBUG_RX(mvm, "Bad CRC or FIFO: 0x%08X.\n",
 			     le32_to_cpu(desc->status));
 		rx_status->flag |= RX_FLAG_FAILED_FCS_CRC;
+		if (!(desc->status & cpu_to_le32(IWL_RX_MPDU_STATUS_CRC_OK)))
+			mvm->ethtool_stats.rx_crc_err++;
+		else
+			mvm->ethtool_stats.rx_fifo_underrun++;
+		bad_pkt = true;
 	}
 
 	/* set the preamble flag if appropriate */
@@ -2170,11 +2282,11 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 	}
 
 	/* update aggregation data for monitor sake on default queue */
-	if (!queue && (phy_data.phy_info & IWL_RX_MPDU_PHY_AMPDU)) {
+	if (phy_data.phy_info & IWL_RX_MPDU_PHY_AMPDU) {
 		bool toggle_bit;
 
 		toggle_bit = phy_data.phy_info & IWL_RX_MPDU_PHY_AMPDU_TOGGLE;
-		rx_status->flag |= RX_FLAG_AMPDU_DETAILS;
+
 		/*
 		 * Toggle is switched whenever new aggregation starts. Make
 		 * sure ampdu_reference is never 0 so we can later use it to
@@ -2186,8 +2298,16 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 				mvm->ampdu_ref++;
 			mvm->ampdu_toggle = toggle_bit;
 			phy_data.first_subframe = true;
+			iwl_mvm_count_rx_histogram(mvm);
+			mvm->rx_this_ampdu_count = 1;
+		} else {
+			mvm->rx_this_ampdu_count++;
 		}
+		if (!queue)
+			rx_status->flag |= RX_FLAG_AMPDU_DETAILS;
 		rx_status->ampdu_reference = mvm->ampdu_ref;
+	} else {
+		iwl_mvm_count_rx_histogram(mvm);
 	}
 
 	rcu_read_lock();
@@ -2218,10 +2338,11 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 			      le32_to_cpu(pkt->len_n_flags), queue,
 			      &crypt_len)) {
 		kfree_skb(skb);
+		mvm->ethtool_stats.rx_failed_decrypt++;
 		goto out;
 	}
 
-	iwl_mvm_rx_fill_status(mvm, skb, &phy_data, queue);
+	iwl_mvm_rx_fill_status(mvm, skb, &phy_data, queue, hdr, sta);
 
 	if (sta) {
 		struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
@@ -2292,6 +2413,7 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 			IWL_DEBUG_DROP(mvm, "Dropping duplicate packet 0x%x\n",
 				       le16_to_cpu(hdr->seq_ctrl));
 			kfree_skb(skb);
+			mvm->ethtool_stats.rx_dup++;
 			goto out;
 		}
 
@@ -2350,6 +2472,15 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
 		goto out;
 	}
 
+	if (!bad_pkt) {
+		mvm->ethtool_stats.rx_pkts++;
+		mvm->ethtool_stats.rx_bytes_nic += len;
+	}
+
+	/* NOTE:  These methods below must (and will) consume the skb if the 'else'
+	 * clause of the if statement will happen.  So should not leak mem
+	 * even though it looks problematic at first glance.
+	 */
 	if (!iwl_mvm_reorder(mvm, napi, queue, sta, skb, desc) &&
 	    likely(!iwl_mvm_time_sync_frame(mvm, skb, hdr->addr2)) &&
 	    likely(!iwl_mvm_mei_filter_scan(mvm, skb))) {
@@ -2458,7 +2589,7 @@ void iwl_mvm_rx_monitor_no_data(struct iwl_mvm *mvm, struct napi_struct *napi,
 	rx_status->band = phy_data.channel > 14 ? NL80211_BAND_5GHZ :
 		NL80211_BAND_2GHZ;
 
-	iwl_mvm_rx_fill_status(mvm, skb, &phy_data, queue);
+	iwl_mvm_rx_fill_status(mvm, skb, &phy_data, queue, NULL, sta);
 
 	/* no more radio tap info should be put after this point.
 	 *
@@ -2542,7 +2673,7 @@ void iwl_mvm_rx_bar_frame_release(struct iwl_mvm *mvm, struct napi_struct *napi,
 		goto out;
 	}
 
-	if (WARN(tid != baid_data->tid || sta_id > IWL_MVM_STATION_COUNT_MAX ||
+	if (WARN(tid != baid_data->tid || sta_id > IWL_STATION_COUNT_MAX ||
 		 !(baid_data->sta_mask & BIT(sta_id)),
 		 "baid 0x%x is mapped to sta_mask:0x%x tid:%d, but BAR release received for sta:%d tid:%d\n",
 		 baid, baid_data->sta_mask, baid_data->tid, sta_id,

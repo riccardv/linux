@@ -103,6 +103,75 @@ u8 *ieee80211_get_bssid(struct ieee80211_hdr *hdr, size_t len,
 }
 EXPORT_SYMBOL(ieee80211_get_bssid);
 
+unsigned long IEEE80211_MAX_QUEUE_MAP[3] = { -1L, -1L, -1L };
+EXPORT_SYMBOL(IEEE80211_MAX_QUEUE_MAP);
+
+/**
+ * ieee80211_check_all_rates_disabled: Calculate which rate-sets are disabled
+ *    in all bands.
+ * @disable_ht_cfg  Holds array of enable/disable values for each band.
+ * @disable_vht_cfg  Holds array of enable/disable values for each band.
+ * @disable_ht  Return value:  is HT disabled for all bands.
+ * @disable_vht  Return value:  is VHT disabled for all bands.
+ */
+void ieee80211_check_all_rates_disabled(u8 bands_used,
+					bool *disable_ht_cfg,
+					bool *disable_vht_cfg,
+					bool *disable_ht,
+					bool *disable_vht)
+{
+	int i;
+
+	*disable_ht = true;
+	*disable_vht = true;
+	for (i = 0; i < NUM_NL80211_BANDS; i++) {
+		if (bands_used & (1 << i)) {
+			if (!disable_ht_cfg[i])
+				*disable_ht = false;
+			if (!disable_vht_cfg[i])
+				*disable_vht = false;
+		}
+	}
+}
+
+/**
+ * ieee80211_check_disabled_rates: Calculate which bands have zero rates
+ *  configured for HT and VHT.
+ * @disable_ht  Holds return value, array of length IEEE80211_NUM_BANDS.
+ * @disable_vht  Holds return value, array of length IEEE80211_NUM_BANDS.
+ */
+void ieee80211_check_disabled_rates(struct ieee80211_sub_if_data *sdata,
+				    bool *disable_ht,
+				    bool *disable_vht)
+{
+	int i;
+	int j;
+
+	/* Disable HT, VHT where we have no rates set. */
+	for (i = 0; i < NUM_NL80211_BANDS; i++) {
+		disable_ht[i] = false;
+		disable_vht[i] = false;
+		if (!sdata->cfg_advert_bitrate_mask_set)
+			continue;
+
+		disable_ht[i] = true;
+		disable_vht[i] = true;
+		for (j = 0; j < IEEE80211_HT_MCS_MASK_LEN; j++) {
+			if (sdata->cfg_advert_bitrate_mask.control[i].ht_mcs[j]) {
+				disable_ht[i] = false;
+				break;
+			}
+		}
+
+		for (j = 0; j < NL80211_VHT_NSS_MAX; j++) {
+			if (sdata->cfg_advert_bitrate_mask.control[i].vht_mcs[j]) {
+				disable_vht[i] = false;
+				break;
+			}
+		}
+	}
+}
+
 void ieee80211_tx_set_protected(struct ieee80211_tx_data *tx)
 {
 	struct sk_buff *skb;
@@ -439,8 +508,11 @@ static void __ieee80211_wake_queue(struct ieee80211_hw *hw, int queue,
 
 	trace_wake_queue(local, queue, reason);
 
-	if (WARN_ON(queue >= hw->queues))
+	if (WARN_ON_ONCE(queue >= hw->queues)) {
+		pr_err("wake-queue, queue: %d > hw->queues: %d\n",
+		       queue, hw->queues);
 		return;
+	}
 
 	if (!test_bit(reason, &local->queue_stop_reasons[queue]))
 		return;
@@ -591,7 +663,7 @@ void ieee80211_add_pending_skbs(struct ieee80211_local *local,
 }
 
 void ieee80211_stop_queues_by_reason(struct ieee80211_hw *hw,
-				     unsigned long queues,
+				     unsigned long *queues,
 				     enum queue_stop_reason reason,
 				     bool refcounted)
 {
@@ -601,7 +673,7 @@ void ieee80211_stop_queues_by_reason(struct ieee80211_hw *hw,
 
 	spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
 
-	for_each_set_bit(i, &queues, hw->queues)
+	for_each_set_bit(i, queues, hw->queues)
 		__ieee80211_stop_queue(hw, i, reason, refcounted);
 
 	spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
@@ -633,7 +705,7 @@ int ieee80211_queue_stopped(struct ieee80211_hw *hw, int queue)
 EXPORT_SYMBOL(ieee80211_queue_stopped);
 
 void ieee80211_wake_queues_by_reason(struct ieee80211_hw *hw,
-				     unsigned long queues,
+				     unsigned long *queues,
 				     enum queue_stop_reason reason,
 				     bool refcounted)
 {
@@ -643,7 +715,7 @@ void ieee80211_wake_queues_by_reason(struct ieee80211_hw *hw,
 
 	spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
 
-	for_each_set_bit(i, &queues, hw->queues)
+	for_each_set_bit(i, queues, hw->queues)
 		__ieee80211_wake_queue(hw, i, reason, refcounted, &flags);
 
 	spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
@@ -657,42 +729,63 @@ void ieee80211_wake_queues(struct ieee80211_hw *hw)
 }
 EXPORT_SYMBOL(ieee80211_wake_queues);
 
-static unsigned int
+void
 ieee80211_get_vif_queues(struct ieee80211_local *local,
-			 struct ieee80211_sub_if_data *sdata)
+			 struct ieee80211_sub_if_data *sdata,
+			 unsigned long *queues)
 {
-	unsigned int queues;
+	int idx;
 
+	memset(queues, 0, sizeof(IEEE80211_MAX_QUEUE_MAP));
 	if (sdata && ieee80211_hw_check(&local->hw, QUEUE_CONTROL)) {
 		int ac;
 
-		queues = 0;
-
-		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
-			queues |= BIT(sdata->vif.hw_queue[ac]);
-		if (sdata->vif.cab_queue != IEEE80211_INVAL_HW_QUEUE)
-			queues |= BIT(sdata->vif.cab_queue);
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			idx = sdata->vif.hw_queue[ac] / BITS_PER_LONG;
+			queues[idx] |= (1L << (sdata->vif.hw_queue[ac] - idx * BITS_PER_LONG));
+		}
+		if (sdata->vif.cab_queue != IEEE80211_INVAL_HW_QUEUE) {
+			idx = sdata->vif.cab_queue / BITS_PER_LONG;
+			queues[idx] |= (1L << (sdata->vif.cab_queue - idx * BITS_PER_LONG));
+		}
 	} else {
 		/* all queues */
-		queues = BIT(local->hw.queues) - 1;
-	}
+		int i;
 
-	return queues;
+		for (i = 0; i<local->hw.queues; i++) {
+			idx = i / BITS_PER_LONG;
+			queues[idx] |= (1L << (i - idx * BITS_PER_LONG));
+		}
+	}
 }
 
 void __ieee80211_flush_queues(struct ieee80211_local *local,
 			      struct ieee80211_sub_if_data *sdata,
-			      unsigned int queues, bool drop)
+			      unsigned long *_queues, bool drop)
 {
+	unsigned long queues[IEEE80211_MAX_QUEUE_MAP_CNT] = { 0, 0, 0 };
+	bool empty = true;
+	int i;
+
 	if (!local->ops->flush)
 		return;
+
+	if (_queues)
+		memcpy(queues, _queues, sizeof(queues));
+
+	for (i = 0; i<IEEE80211_MAX_QUEUE_MAP_CNT; i++) {
+		if (queues[i]) {
+			empty = false;
+			break;
+		}
+	}
 
 	/*
 	 * If no queue was set, or if the HW doesn't support
 	 * IEEE80211_HW_QUEUE_CONTROL - flush all queues
 	 */
-	if (!queues || !ieee80211_hw_check(&local->hw, QUEUE_CONTROL))
-		queues = ieee80211_get_vif_queues(local, sdata);
+	if (empty || !ieee80211_hw_check(&local->hw, QUEUE_CONTROL))
+		ieee80211_get_vif_queues(local, sdata, queues);
 
 	ieee80211_stop_queues_by_reason(&local->hw, queues,
 					IEEE80211_QUEUE_STOP_REASON_FLUSH,
@@ -728,8 +821,11 @@ void ieee80211_stop_vif_queues(struct ieee80211_local *local,
 			       struct ieee80211_sub_if_data *sdata,
 			       enum queue_stop_reason reason)
 {
+	unsigned long queues[IEEE80211_MAX_QUEUE_MAP_CNT];
+
+	ieee80211_get_vif_queues(local, sdata, queues);
 	ieee80211_stop_queues_by_reason(&local->hw,
-					ieee80211_get_vif_queues(local, sdata),
+					queues,
 					reason, true);
 }
 
@@ -737,8 +833,11 @@ void ieee80211_wake_vif_queues(struct ieee80211_local *local,
 			       struct ieee80211_sub_if_data *sdata,
 			       enum queue_stop_reason reason)
 {
+	unsigned long queues[IEEE80211_MAX_QUEUE_MAP_CNT];
+
+	ieee80211_get_vif_queues(local, sdata, queues);
 	ieee80211_wake_queues_by_reason(&local->hw,
-					ieee80211_get_vif_queues(local, sdata),
+					queues,
 					reason, true);
 }
 
@@ -843,6 +942,23 @@ static void __iterate_stations(struct ieee80211_local *local,
 	}
 }
 
+static void __iterate_stations_safe(struct ieee80211_local *local,
+				    void (*iterator)(void *data,
+						     struct ieee80211_sta *sta),
+				    void *data)
+{
+	struct sta_info *sta, *sta_temp;
+
+	lockdep_assert_wiphy(local->hw.wiphy);
+
+	list_for_each_entry_safe(sta, sta_temp, &local->sta_list, list) {
+		if (!sta->uploaded)
+			continue;
+
+		iterator(data, &sta->sta);
+	}
+}
+
 void ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw,
 			void (*iterator)(void *data,
 					 struct ieee80211_sta *sta),
@@ -855,6 +971,19 @@ void ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw,
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(ieee80211_iterate_stations_atomic);
+
+void ieee80211_iterate_stations_mtx(struct ieee80211_hw *hw,
+				    void (*iterator)(void *data,
+						     struct ieee80211_sta *sta),
+				    void *data)
+{
+	struct ieee80211_local *local = hw_to_local(hw);
+
+	lockdep_assert_wiphy(local->hw.wiphy);
+
+	__iterate_stations_safe(local, iterator, data);
+}
+EXPORT_SYMBOL_GPL(ieee80211_iterate_stations_mtx);
 
 struct ieee80211_vif *wdev_to_ieee80211_vif(struct wireless_dev *wdev)
 {
@@ -1201,10 +1330,9 @@ static int ieee80211_put_preq_ies_band(struct sk_buff *skb,
 {
 	struct ieee80211_local *local = sdata->local;
 	struct ieee80211_supported_band *sband;
-	int i, err;
+	int err;
 	size_t noffset;
 	u32 rate_flags;
-	bool have_80mhz = false;
 
 	*offset = 0;
 
@@ -1276,7 +1404,8 @@ static int ieee80211_put_preq_ies_band(struct sk_buff *skb,
 		*offset = noffset;
 	}
 
-	if (sband->ht_cap.ht_supported) {
+	if (sband->ht_cap.ht_supported &&
+	    !(flags & IEEE80211_PROBE_FLAG_DISABLE_HT)) {
 		u8 *pos;
 
 		if (skb_tailroom(skb) < 2 + sizeof(struct ieee80211_ht_cap))
@@ -1311,17 +1440,8 @@ static int ieee80211_put_preq_ies_band(struct sk_buff *skb,
 		*offset = noffset;
 	}
 
-	/* Check if any channel in this sband supports at least 80 MHz */
-	for (i = 0; i < sband->n_channels; i++) {
-		if (sband->channels[i].flags & (IEEE80211_CHAN_DISABLED |
-						IEEE80211_CHAN_NO_80MHZ))
-			continue;
-
-		have_80mhz = true;
-		break;
-	}
-
-	if (sband->vht_cap.vht_supported && have_80mhz) {
+	if (sband->vht_cap.vht_supported &&
+	    !(flags & IEEE80211_PROBE_FLAG_DISABLE_VHT)) {
 		u8 *pos;
 
 		if (skb_tailroom(skb) < 2 + sizeof(struct ieee80211_vht_cap))
@@ -1353,7 +1473,8 @@ static int ieee80211_put_preq_ies_band(struct sk_buff *skb,
 	}
 
 	if (cfg80211_any_usable_channels(local->hw.wiphy, BIT(sband->band),
-					 IEEE80211_CHAN_NO_HE)) {
+					 IEEE80211_CHAN_NO_HE) &&
+	    !(flags & IEEE80211_PROBE_FLAG_DISABLE_HE)) {
 		err = ieee80211_put_he_cap(skb, sdata, sband, NULL);
 		if (err)
 			return err;
@@ -1361,15 +1482,18 @@ static int ieee80211_put_preq_ies_band(struct sk_buff *skb,
 
 	if (cfg80211_any_usable_channels(local->hw.wiphy, BIT(sband->band),
 					 IEEE80211_CHAN_NO_HE |
-					 IEEE80211_CHAN_NO_EHT)) {
+					 IEEE80211_CHAN_NO_EHT) &&
+	    !(flags & IEEE80211_PROBE_FLAG_DISABLE_EHT)) {
 		err = ieee80211_put_eht_cap(skb, sdata, sband, NULL);
 		if (err)
 			return err;
 	}
 
-	err = ieee80211_put_he_6ghz_cap(skb, sdata, IEEE80211_SMPS_OFF);
-	if (err)
-		return err;
+	if (!(flags & IEEE80211_PROBE_FLAG_DISABLE_HE)) {
+		err = ieee80211_put_he_6ghz_cap(skb, sdata, IEEE80211_SMPS_OFF);
+		if (err)
+			return err;
+	}
 
 	/*
 	 * If adding more here, adjust code in main.c
@@ -1824,10 +1948,19 @@ int ieee80211_reconfig(struct ieee80211_local *local)
 	 */
 	res = drv_start(local);
 	if (res) {
-		if (suspended)
+		if (suspended) {
 			WARN(1, "Hardware became unavailable upon resume. This could be a software issue prior to suspend or a hardware issue.\n");
-		else
+		} else {
 			WARN(1, "Hardware became unavailable during restart.\n");
+
+			/* Requires driver reload and/or reboot to recover at this point.  Need
+			 * to notify user-space or set debugfs flag to WDT can be kicked in non-attended
+			 * devices such as APs...
+			 */
+#ifdef CONFIG_MAC80211_DEBUGFS
+			local->is_dead = 1;
+#endif
+		}
 		ieee80211_handle_reconfig_failure(local);
 		return res;
 	}
@@ -2372,6 +2505,7 @@ u8 *ieee80211_ie_build_ht_cap(u8 *pos, struct ieee80211_sta_ht_cap *ht_cap,
 			IEEE80211_HT_AMPDU_PARM_DENSITY_SHIFT);
 
 	/* MCS set */
+	/* TODO:  Allow over-riding the mcs set (probe requests) */
 	memcpy(pos, &ht_cap->mcs, sizeof(ht_cap->mcs));
 	pos += sizeof(ht_cap->mcs);
 
@@ -2477,6 +2611,30 @@ ieee80211_get_adjusted_he_cap(const struct ieee80211_conn_settings *conn,
 			~(IEEE80211_HE_PHY_CAP7_STBC_TX_ABOVE_80MHZ |
 			  IEEE80211_HE_PHY_CAP7_STBC_RX_ABOVE_80MHZ);
 	}
+
+	if (conn->conn_flags & IEEE80211_CONN_DISABLE_OFDMA) {
+		pr_info("adjust-he-cap, disabling OFDMA.");
+		elem->mac_cap_info[3] &= ~IEEE80211_HE_MAC_CAP3_OMI_CONTROL;
+		elem->mac_cap_info[3] &= ~IEEE80211_HE_MAC_CAP3_OFDMA_RA;
+		elem->mac_cap_info[5] &= ~IEEE80211_HE_MAC_CAP5_HT_VHT_TRIG_FRAME_RX;
+		elem->phy_cap_info[0] &= ~IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_2G;
+		elem->phy_cap_info[0] &= ~IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_5G;
+		elem->phy_cap_info[3] &= ~IEEE80211_HE_PHY_CAP3_RX_PARTIAL_BW_SU_IN_20MHZ_MU;
+		elem->phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_TRIG_SU_BEAMFORMING_FB;
+		elem->phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_TRIG_MU_BEAMFORMING_PARTIAL_BW_FB;
+		elem->phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_TRIG_CQI_FB;
+		elem->phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE;
+		elem->phy_cap_info[9] &= ~IEEE80211_HE_PHY_CAP9_LONGER_THAN_16_SIGB_OFDM_SYM;
+		elem->phy_cap_info[9] &= ~IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU;
+		elem->phy_cap_info[9] &= ~IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU;
+		elem->phy_cap_info[9] &= ~IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_COMP_SIGB;
+		elem->phy_cap_info[9] &= ~IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_NON_COMP_SIGB;
+
+
+		/* Disable MU related OFDMA stuff too */
+		elem->phy_cap_info[6] &= ~IEEE80211_HE_PHY_CAP6_PARTIAL_BANDWIDTH_DL_MUMIMO;
+		elem->phy_cap_info[2] &= ~IEEE80211_HE_PHY_CAP2_UL_MU_PARTIAL_MU_MIMO;
+	}
 }
 
 int ieee80211_put_he_cap(struct sk_buff *skb,
@@ -2499,6 +2657,12 @@ int ieee80211_put_he_cap(struct sk_buff *skb,
 
 	/* modify on stack first to calculate 'n' and 'ie_len' correctly */
 	ieee80211_get_adjusted_he_cap(conn, he_cap, &elem);
+
+	/* Apply overrides as needed. */
+	if (conn->conn_flags & IEEE80211_CONN_DISABLE_TWT) {
+		elem.mac_cap_info[0] &= ~(IEEE80211_HE_MAC_CAP0_TWT_REQ);
+		elem.mac_cap_info[0] &= ~(IEEE80211_HE_MAC_CAP0_TWT_RES);
+	}
 
 	n = ieee80211_he_mcs_nss_size(&elem);
 	ie_len = 2 + 1 +
@@ -2738,7 +2902,8 @@ u8 *ieee80211_ie_build_vht_oper(u8 *pos, struct ieee80211_sta_vht_cap *vht_cap,
 	return pos + sizeof(struct ieee80211_vht_operation);
 }
 
-u8 *ieee80211_ie_build_he_oper(u8 *pos, struct cfg80211_chan_def *chandef)
+u8 *ieee80211_ie_build_he_oper(struct ieee80211_sub_if_data *sdata,
+			       u8 *pos, struct cfg80211_chan_def *chandef)
 {
 	struct ieee80211_he_operation *he_oper;
 	struct ieee80211_he_6ghz_oper *he_6ghz_op;
@@ -4031,18 +4196,27 @@ int ieee80211_check_combinations(struct ieee80211_sub_if_data *sdata,
 		.radio_idx = radio_idx,
 	};
 	int total;
+	int ret;
 
 	lockdep_assert_wiphy(local->hw.wiphy);
 
-	if (WARN_ON(hweight32(radar_detect) > 1))
+	if (WARN_ON(hweight32(radar_detect) > 1)) {
+		sdata_info(sdata, "comb-check: failed radar-detect: %d\n",
+			   (int)(radar_detect));
 		return -EINVAL;
+	}
 
 	if (WARN_ON(chandef && chanmode == IEEE80211_CHANCTX_SHARED &&
-		    !chandef->chan))
+		    !chandef->chan)) {
+		sdata_info(sdata, "comb-check: failed chantx-shared check\n");
 		return -EINVAL;
+	}
 
-	if (WARN_ON(iftype >= NUM_NL80211_IFTYPES))
+	if (WARN_ON(iftype >= NUM_NL80211_IFTYPES)) {
+		sdata_info(sdata, "comb-check: failed iftype check: %d\n",
+			   iftype);
 		return -EINVAL;
+	}
 
 	if (sdata->vif.type == NL80211_IFTYPE_AP ||
 	    sdata->vif.type == NL80211_IFTYPE_MESH_POINT) {
@@ -4056,8 +4230,10 @@ int ieee80211_check_combinations(struct ieee80211_sub_if_data *sdata,
 
 	/* Always allow software iftypes */
 	if (cfg80211_iftype_allowed(local->hw.wiphy, iftype, 0, 1)) {
-		if (radar_detect)
+		if (radar_detect) {
+			sdata_info(sdata, "comb-check: failed software-type + radar-detect\n");
 			return -EINVAL;
+		}
 		return 0;
 	}
 
@@ -4073,7 +4249,10 @@ int ieee80211_check_combinations(struct ieee80211_sub_if_data *sdata,
 	if (total == 1 && !params.radar_detect)
 		return 0;
 
-	return cfg80211_check_combinations(local->hw.wiphy, &params);
+	ret = cfg80211_check_combinations(local->hw.wiphy, &params);
+	if (ret < 0)
+		sdata_info(sdata, "ieee80211_check_combinations:  cfg80211-check-combinations failed: %d\n", ret);
+	return ret;
 }
 
 static void
@@ -4315,6 +4494,15 @@ int ieee80211_put_eht_cap(struct sk_buff *skb,
 	mcs_nss_len = ieee80211_eht_mcs_nss_size(&he, &fixed, for_ap);
 	ppet_len = ieee80211_eht_ppe_size(eht_cap->eht_ppe_thres[0],
 					  fixed.phy_cap_info);
+
+	if (conn->conn_flags & IEEE80211_CONN_DISABLE_OFDMA) {
+		pr_info("adjust-eht-cap, disabling OFDMA.");
+		fixed.phy_cap_info[7] &= ~IEEE80211_EHT_PHY_CAP7_NON_OFDMA_UL_MU_MIMO_80MHZ;
+		fixed.phy_cap_info[7] &= ~IEEE80211_EHT_PHY_CAP7_NON_OFDMA_UL_MU_MIMO_160MHZ;
+		fixed.phy_cap_info[7] &= ~IEEE80211_EHT_PHY_CAP7_NON_OFDMA_UL_MU_MIMO_320MHZ;
+		fixed.phy_cap_info[8] &= ~IEEE80211_EHT_PHY_CAP8_RX_1024QAM_WIDER_BW_DL_OFDMA;
+		fixed.phy_cap_info[8] &= ~IEEE80211_EHT_PHY_CAP8_RX_4096QAM_WIDER_BW_DL_OFDMA;
+	}
 
 	ie_len = 2 + 1 + sizeof(eht_cap->eht_cap_elem) + mcs_nss_len + ppet_len;
 	if (skb_tailroom(skb) < ie_len)

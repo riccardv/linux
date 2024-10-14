@@ -7,6 +7,24 @@
 #include "mcu.h"
 #include "mac.h"
 
+u32 debug_lvl = MTK_DEBUG_FATAL | MTK_DEBUG_WRN;
+module_param(debug_lvl, uint, 0644);
+MODULE_PARM_DESC(debug_lvl,
+		 "Enable debugging messages\n"
+		 "0x00001	tx path\n"
+		 "0x00002	tx path verbose\n"
+		 "0x00004	fatal/very-important messages\n"
+		 "0x00008	warning messages\n"
+		 "0x00010	Info about messages to/from firmware\n"
+		 "0x00020	Configuration logs.\n"
+		 "0xffffffff	any/all\n"
+	);
+
+static void __mt7996_configure_filter(struct ieee80211_hw *hw,
+				      unsigned int changed_flags,
+				      unsigned int *total_flags,
+				      u64 multicast);
+
 static bool mt7996_dev_running(struct mt7996_dev *dev)
 {
 	struct mt7996_phy *phy;
@@ -21,6 +39,18 @@ static bool mt7996_dev_running(struct mt7996_dev *dev)
 	phy = mt7996_phy3(dev);
 
 	return phy && test_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+}
+
+static void mt7996_testmode_disable_all(struct mt7996_dev *dev)
+{
+	struct mt7996_phy *phy;
+	int i;
+
+	for (i = 0; i < __MT_MAX_BAND; i++) {
+		phy = __mt7996_phy(dev, i);
+		if (phy)
+			mt76_testmode_set_state(phy->mt76, MT76_TM_STATE_OFF);
+	}
 }
 
 int mt7996_run(struct ieee80211_hw *hw)
@@ -45,6 +75,14 @@ int mt7996_run(struct ieee80211_hw *hw)
 		}
 	}
 
+	phy->sr_enable = true;
+	phy->enhanced_sr_enable = true;
+
+	/* needed to re-apply power tables after SER */
+	ret = mt7996_mcu_set_txpower_sku(phy);
+
+	mt7996_testmode_disable_all(dev);
+
 	mt7996_mac_enable_nf(dev, phy->mt76->band_idx);
 
 	ret = mt7996_mcu_set_rts_thresh(phy, 0x92b);
@@ -67,6 +105,22 @@ int mt7996_run(struct ieee80211_hw *hw)
 	if (ret)
 		goto out;
 
+
+#ifdef CONFIG_MTK_DEBUG
+	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_SKU_POWER_LIMIT_CTRL,
+						dev->dbg.sku_disable ? 0 : phy->sku_limit_en);
+
+	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL,
+						dev->dbg.sku_disable ? 0 : phy->sku_path_en);
+#else
+	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_SKU_POWER_LIMIT_CTRL,
+						phy->sku_limit_en);
+	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL,
+						phy->sku_path_en);
+#endif
+	if (ret)
+		goto out;
+
 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
 
 	ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
@@ -83,6 +137,8 @@ static int mt7996_start(struct ieee80211_hw *hw)
 {
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	int ret;
+
+	dev->mt76.debug_lvl = debug_lvl;
 
 	flush_work(&dev->init_work);
 
@@ -303,6 +359,13 @@ int mt7996_set_channel(struct mt7996_phy *phy)
 
 	mt76_set_channel(phy->mt76);
 
+#if 0
+	if (mt76_testmode_enabled(phy->mt76) || phy->mt76->test.bf_en) {
+		mt7996_tm_update_channel(phy);
+		goto out;
+	}
+#endif
+
 	ret = mt7996_mcu_set_chan_info(phy, UNI_CHANNEL_SWITCH);
 	if (ret)
 		goto out;
@@ -364,14 +427,14 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	case WLAN_CIPHER_SUITE_SMS4:
 		break;
 	case WLAN_CIPHER_SUITE_AES_CMAC:
-		wcid_keyidx = &wcid->hw_key_idx2;
-		key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIE;
-		fallthrough;
 	case WLAN_CIPHER_SUITE_BIP_CMAC_256:
 	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
 	case WLAN_CIPHER_SUITE_BIP_GMAC_256:
-		if (key->keyidx == 6 || key->keyidx == 7)
+		if (key->keyidx == 6 || key->keyidx == 7) {
+			wcid_keyidx = &wcid->hw_key_idx2;
+			key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIE;
 			break;
+		}
 		fallthrough;
 	case WLAN_CIPHER_SUITE_WEP40:
 	case WLAN_CIPHER_SUITE_WEP104:
@@ -415,6 +478,18 @@ static int mt7996_config(struct ieee80211_hw *hw, u32 changed)
 	int ret;
 
 	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
+		ret = mt7996_mcu_set_pp_en(phy, PP_USR_MODE,
+					   phy->mt76->chandef.punctured);
+		if (ret)
+			return ret;
+
+#if 0
+		if (!mt76_testmode_enabled(phy->mt76) && !phy->mt76->test.bf_en) {
+			ret = mt7996_mcu_edcca_enable(phy, true);
+			if (ret)
+				return ret;
+		}
+#endif
 		ieee80211_stop_queues(hw);
 		ret = mt7996_set_channel(phy);
 		if (ret)
@@ -425,23 +500,27 @@ static int mt7996_config(struct ieee80211_hw *hw, u32 changed)
 	if (changed & (IEEE80211_CONF_CHANGE_POWER |
 		       IEEE80211_CONF_CHANGE_CHANNEL)) {
 		ret = mt7996_mcu_set_txpower_sku(phy);
-		if (ret)
+		if (ret) {
+			dev_err(dev->mt76.dev,
+				"config:  Failed to set txpower: %d\n", ret);
 			return ret;
+		}
 	}
 
 	mutex_lock(&dev->mt76.mutex);
 
 	if (changed & IEEE80211_CONF_CHANGE_MONITOR) {
 		bool enabled = !!(hw->conf.flags & IEEE80211_CONF_MONITOR);
+		u32 total_flags = phy->mac80211_rxfilter_flags;
+		u64 multicast = 0; /* not used by this driver currently. */
 
-		if (!enabled)
-			phy->rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
-		else
-			phy->rxfilter &= ~MT_WF_RFCR_DROP_OTHER_UC;
+		phy->monitor_enabled = enabled;
 
 		mt76_rmw_field(dev, MT_DMA_DCR0(phy->mt76->band_idx),
-			       MT_DMA_DCR0_RXD_G5_EN, enabled);
-		mt76_wr(dev, MT_WF_RFCR(phy->mt76->band_idx), phy->rxfilter);
+			       MT_DMA_DCR0_RXD_G5_EN, enabled || dev->rx_group_5_enable);
+
+		__mt7996_configure_filter(hw, 0, &total_flags, multicast);
+		mt7996_mcu_set_sniffer_mode(phy, enabled);
 	}
 
 	mutex_unlock(&dev->mt76.mutex);
@@ -469,10 +548,10 @@ mt7996_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	return 0;
 }
 
-static void mt7996_configure_filter(struct ieee80211_hw *hw,
-				    unsigned int changed_flags,
-				    unsigned int *total_flags,
-				    u64 multicast)
+static void __mt7996_configure_filter(struct ieee80211_hw *hw,
+				      unsigned int changed_flags,
+				      unsigned int *total_flags,
+				      u64 multicast)
 {
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	struct mt7996_phy *phy = mt7996_hw_phy(hw);
@@ -480,8 +559,14 @@ static void mt7996_configure_filter(struct ieee80211_hw *hw,
 			MT_WF_RFCR1_DROP_BF_POLL |
 			MT_WF_RFCR1_DROP_BA |
 			MT_WF_RFCR1_DROP_CFEND |
+			MT_WF_RFCR1_DROP_NO2ME_TF |
+			MT_WF_RFCR1_DROP_NON_MUBAR_TF |
+			MT_WF_RFCR1_DROP_RXS_BRP |
+			MT_WF_RFCR1_DROP_TF_BFRP |
 			MT_WF_RFCR1_DROP_CFACK;
 	u32 flags = 0;
+	bool is_promisc = *total_flags & FIF_CONTROL || phy->monitor_vif ||
+		phy->monitor_enabled;
 
 #define MT76_FILTER(_flag, _hw) do {					\
 		flags |= *total_flags & FIF_##_flag;			\
@@ -489,7 +574,7 @@ static void mt7996_configure_filter(struct ieee80211_hw *hw,
 		phy->rxfilter |= !(flags & FIF_##_flag) * (_hw);	\
 	} while (0)
 
-	mutex_lock(&dev->mt76.mutex);
+	phy->mac80211_rxfilter_flags = *total_flags; /* save requested flags for later */
 
 	phy->rxfilter &= ~(MT_WF_RFCR_DROP_OTHER_BSS |
 			   MT_WF_RFCR_DROP_OTHER_BEACON |
@@ -500,7 +585,15 @@ static void mt7996_configure_filter(struct ieee80211_hw *hw,
 			   MT_WF_RFCR_DROP_BCAST |
 			   MT_WF_RFCR_DROP_DUPLICATE |
 			   MT_WF_RFCR_DROP_A2_BSSID |
-			   MT_WF_RFCR_DROP_UNWANTED_CTL |
+			   MT_WF_RFCR_RX_UNWANTED_CTL |
+			   MT_WF_RFCR_SECOND_BCN_EN |
+			   MT_WF_RFCR_RX_MGMT_FRAME_CTRL |
+			   MT_WF_RFCR_RX_SAMEBSSIDPRORESP_CTRL |
+			   MT_WF_RFCR_RX_DIFFBSSIDPRORESP_CTRL |
+			   MT_WF_RFCR_RX_SAMEBSSIDBCN_CTRL |
+			   MT_WF_RFCR_RX_SAMEBSSIDNULL_CTRL |
+			   MT_WF_RFCR_RX_DIFFBSSIDNULL_CTRL |
+			   //MT_WF_RFCR_IND_FILTER_EN_OF_31_23_BIT |
 			   MT_WF_RFCR_DROP_STBC_MULTI);
 
 	MT76_FILTER(OTHER_BSS, MT_WF_RFCR_DROP_OTHER_TIM |
@@ -511,16 +604,51 @@ static void mt7996_configure_filter(struct ieee80211_hw *hw,
 
 	MT76_FILTER(CONTROL, MT_WF_RFCR_DROP_CTS |
 			     MT_WF_RFCR_DROP_RTS |
-			     MT_WF_RFCR_DROP_CTL_RSV |
-			     MT_WF_RFCR_DROP_NDPA);
+			     MT_WF_RFCR_DROP_CTL_RSV);
+
+	phy->rxfilter |= (MT_WF_RFCR_DROP_OTHER_UC |
+			  MT_WF_RFCR_DROP_DIFFBSSIDMGT_CTRL);
+
+	if (is_promisc) {
+		phy->rxfilter &= ~MT_WF_RFCR_DROP_OTHER_UC;
+		//phy->rxfilter |= MT_WF_RFCR_IND_FILTER_EN_OF_31_23_BIT;
+		phy->rxfilter |= MT_WF_RFCR_RX_DATA_FRAME_CTRL;
+		if (flags & FIF_CONTROL) {
+			phy->rxfilter |= MT_WF_RFCR_RX_UNWANTED_CTL;
+			phy->rxfilter |= MT_WF_RFCR_SECOND_BCN_EN;
+			phy->rxfilter |= MT_WF_RFCR_RX_MGMT_FRAME_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDPRORESP_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_DIFFBSSIDPRORESP_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDBCN_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDNULL_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_DIFFBSSIDNULL_CTRL;
+			phy->rxfilter &= ~(MT_WF_RFCR_DROP_DIFFBSSIDMGT_CTRL);
+		}
+	}
 
 	*total_flags = flags;
+
+	//dev_err(dev->mt76.dev, "apply-rxfilter, promisc: %d  rxfilter: 0x%x FIF_CONTROL: 0x%x monitor-vif: %p mon-enabled: %d\n",
+	//	is_promisc, phy->rxfilter, flags & FIF_CONTROL, phy->monitor_vif,
+	//	phy->monitor_enabled);
 	mt76_wr(dev, MT_WF_RFCR(phy->mt76->band_idx), phy->rxfilter);
 
-	if (*total_flags & FIF_CONTROL)
+	if (is_promisc)
 		mt76_clear(dev, MT_WF_RFCR1(phy->mt76->band_idx), ctl_flags);
 	else
 		mt76_set(dev, MT_WF_RFCR1(phy->mt76->band_idx), ctl_flags);
+}
+
+static void mt7996_configure_filter(struct ieee80211_hw *hw,
+				    unsigned int changed_flags,
+				    unsigned int *total_flags,
+				    u64 multicast)
+{
+	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+
+	mutex_lock(&dev->mt76.mutex);
+
+	__mt7996_configure_filter(hw, changed_flags, total_flags, multicast);
 
 	mutex_unlock(&dev->mt76.mutex);
 }
@@ -552,6 +680,7 @@ static u8
 mt7996_get_rates_table(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		       bool beacon, bool mcast)
 {
+#define FR_RATE_IDX_OFDM_6M 0x004b
 	struct mt76_vif *mvif = (struct mt76_vif *)vif->drv_priv;
 	struct mt76_phy *mphy = hw->priv;
 	u16 rate;
@@ -561,6 +690,9 @@ mt7996_get_rates_table(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	if (beacon) {
 		struct mt7996_phy *phy = mphy->priv;
+
+		if (mphy->dev->lpi_bcn_enhance)
+			rate = FR_RATE_IDX_OFDM_6M;
 
 		/* odd index for driver, even index for firmware */
 		idx = MT7996_BEACON_RATES_TBL + 2 * phy->mt76->band_idx;
@@ -665,6 +797,9 @@ static void mt7996_bss_info_changed(struct ieee80211_hw *hw,
 	if (changed & BSS_CHANGED_MU_GROUPS)
 		mt7996_update_mu_group(hw, vif, info);
 
+	if (changed & BSS_CHANGED_TXPOWER)
+		mt7996_mcu_set_txpower_sku(phy);
+
 	mutex_unlock(&dev->mt76.mutex);
 }
 
@@ -718,6 +853,7 @@ void mt7996_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 {
 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
 	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+	struct mt76_wcid *wcid = &msta->wcid;
 	int i;
 
 	mt7996_mcu_add_sta(dev, vif, sta, false, false);
@@ -734,6 +870,17 @@ void mt7996_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 	if (!list_empty(&msta->rc_list))
 		list_del_init(&msta->rc_list);
 	spin_unlock_bh(&mdev->sta_poll_lock);
+
+	if (WARN_ON_ONCE(!idr_is_empty(&wcid->pktid))) {
+		dev_err(dev->mt76.dev,
+			"wcid->pktid is not empty in mac_sta_remove, will force status check to recover.\n");
+		mt76_tx_status_check(mdev, true);
+	}
+
+	spin_lock_bh(&mdev->status_lock);
+	if (WARN_ON(!list_empty(&wcid->list)))
+		list_del_init(&wcid->list);
+	spin_unlock_bh(&mdev->status_lock);
 }
 
 static void mt7996_tx(struct ieee80211_hw *hw,
@@ -759,6 +906,9 @@ static void mt7996_tx(struct ieee80211_hw *hw,
 		mvif = (struct mt7996_vif *)vif->drv_priv;
 		wcid = &mvif->sta.wcid;
 	}
+
+	mtk_dbg(&dev->mt76, TXV, "mt7996-tx, wcid: %p wcid->idx: %d skb: %p, call mt76_tx\n",
+		wcid, wcid->idx, skb);
 
 	mt76_tx(mphy, control->sta, wcid, skb);
 }
@@ -800,31 +950,43 @@ mt7996_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
 				   params->buf_size);
 		ret = mt7996_mcu_add_rx_ba(dev, params, true);
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, RX_START, tid: %d ssn: %d ret: %d\n",
+			tid, ssn, ret);
 		break;
 	case IEEE80211_AMPDU_RX_STOP:
 		mt76_rx_aggr_stop(&dev->mt76, &msta->wcid, tid);
 		ret = mt7996_mcu_add_rx_ba(dev, params, false);
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, RX_STOP, tid: %d ssn: %d ret: %d\n",
+			tid, ssn, ret);
 		break;
 	case IEEE80211_AMPDU_TX_OPERATIONAL:
 		mtxq->aggr = true;
 		mtxq->send_bar = false;
 		ret = mt7996_mcu_add_tx_ba(dev, params, true);
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, TX_OPERATIONAL, tid: %d ssn: %d ret: %d\n",
+			tid, ssn, ret);
 		break;
 	case IEEE80211_AMPDU_TX_STOP_FLUSH:
 	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
 		mtxq->aggr = false;
 		clear_bit(tid, &msta->wcid.ampdu_state);
 		ret = mt7996_mcu_add_tx_ba(dev, params, false);
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, TX_AMPDU_STOP_FLUSH(%d), tid: %d ssn: %d ret: %d\n",
+			action, tid, ssn, ret);
 		break;
 	case IEEE80211_AMPDU_TX_START:
 		set_bit(tid, &msta->wcid.ampdu_state);
 		ret = IEEE80211_AMPDU_TX_START_IMMEDIATE;
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, TX_START, tid: %d ssn: %d ret: %d\n",
+			tid, ssn, ret);
 		break;
 	case IEEE80211_AMPDU_TX_STOP_CONT:
 		mtxq->aggr = false;
 		clear_bit(tid, &msta->wcid.ampdu_state);
 		ret = mt7996_mcu_add_tx_ba(dev, params, false);
 		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
+		mtk_dbg(&dev->mt76, BA, "ampdu-action, AMPDU_TX_STOP_CONT, tid: %d ssn: %d ret: %d\n",
+			tid, ssn, ret);
 		break;
 	}
 	mutex_unlock(&dev->mt76.mutex);
@@ -870,6 +1032,7 @@ mt7996_get_stats(struct ieee80211_hw *hw,
 
 u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif *mvif)
 {
+#define FR_RATE_IDX_OFDM_6M 0x004b
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	struct mt7996_phy *phy = mt7996_hw_phy(hw);
 	union {
@@ -1052,7 +1215,7 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
 		sinfo->rx_bytes = msta->wcid.stats.rx_bytes;
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BYTES64);
 
-		sinfo->tx_packets = msta->wcid.stats.tx_packets;
+		sinfo->tx_packets = msta->wcid.stats.tx_mpdu_ok;
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
 
 		sinfo->rx_packets = msta->wcid.stats.rx_packets;
@@ -1078,8 +1241,15 @@ static void mt7996_sta_rc_update(struct ieee80211_hw *hw,
 				 struct ieee80211_sta *sta,
 				 u32 changed)
 {
+	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
 	struct mt7996_phy *phy = mt7996_hw_phy(hw);
 	struct mt7996_dev *dev = phy->dev;
+
+	if (!msta->vif) {
+		dev_warn(dev->mt76.dev, "Un-initialized STA %pM wcid %d in rc_work\n",
+			 sta->addr, msta->wcid.idx);
+		return;
+	}
 
 	mt7996_sta_rc_work(&changed, sta);
 	ieee80211_queue_work(hw, &dev->rc_work);
@@ -1143,6 +1313,10 @@ static void mt7996_sta_set_decap_offload(struct ieee80211_hw *hw,
 }
 
 static const char mt7996_gstrings_stats[][ETH_GSTRING_LEN] = {
+	"tx_pkts_nic", /* from driver, phy tx-ok skb */
+	"tx_bytes_nic", /* from driver, phy tx-ok bytes */
+	"rx_pkts_nic", /* from driver, phy rx OK skb */
+	"rx_bytes_nic", /* from driver, phy rx OK bytes */
 	"tx_ampdu_cnt",
 	"tx_stop_q_empty_cnt",
 	"tx_mpdu_attempts",
@@ -1206,7 +1380,28 @@ static const char mt7996_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"rx_vec_queue_overflow_drop_cnt",
 	"rx_ba_cnt",
 
+	/* driver rx counters */
+	"d_rx_skb",
+	"d_rx_rxd2_amsdu_err",
+	"d_rx_null_channels",
+	"d_rx_max_len_err",
+	"d_rx_too_short",
+	"d_rx_bad_ht_rix",
+	"d_rx_bad_vht_rix",
+	"d_rx_bad_mode",
+	"d_rx_bad_bw",
+
 	/* per vif counters */
+	"v_tx_mpdu_attempts", /* counting any retries (all frames) */
+	"v_tx_mpdu_fail",  /* frames that failed even after retry (all frames) */
+	"v_tx_mpdu_retry", /* number of times frames were retried (all frames) */
+	"v_tx_mpdu_ok", /* frames that succeeded, perhaps after retry (all frames) */
+
+	"v_txo_tx_mpdu_attempts", /* counting any retries, txo frames */
+	"v_txo_tx_mpdu_fail",  /* frames that failed even after retry, txo frames */
+	"v_txo_tx_mpdu_retry", /* number of times frames were retried, txo frames */
+	"v_txo_tx_mpdu_ok", /* frames that succeeded, perhaps after retry, txo frames */
+
 	"v_tx_mode_cck",
 	"v_tx_mode_ofdm",
 	"v_tx_mode_ht",
@@ -1242,6 +1437,62 @@ static const char mt7996_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"v_tx_nss_2",
 	"v_tx_nss_3",
 	"v_tx_nss_4",
+
+	/* per-vif rx counters */
+	"v_rx_nss_1",
+	"v_rx_nss_2",
+	"v_rx_nss_3",
+	"v_rx_nss_4",
+	"v_rx_mode_cck",
+	"v_rx_mode_ofdm",
+	"v_rx_mode_ht",
+	"v_rx_mode_ht_gf",
+	"v_rx_mode_vht",
+	"v_rx_mode_he_su",
+	"v_rx_mode_he_ext_su",
+	"v_rx_mode_he_tb",
+	"v_rx_mode_he_mu",
+	"v_rx_mode_eht_su",
+	"v_rx_mode_eht_trig",
+	"v_rx_mode_eht_mu",
+	"v_rx_bw_20",
+	"v_rx_bw_40",
+	"v_rx_bw_80",
+	"v_rx_bw_160",
+	"v_rx_bw_320",
+	"v_rx_bw_he_ru",
+	"v_rx_ru_106",
+
+	"v_rx_mcs_0",
+	"v_rx_mcs_1",
+	"v_rx_mcs_2",
+	"v_rx_mcs_3",
+	"v_rx_mcs_4",
+	"v_rx_mcs_5",
+	"v_rx_mcs_6",
+	"v_rx_mcs_7",
+	"v_rx_mcs_8",
+	"v_rx_mcs_9",
+	"v_rx_mcs_10",
+	"v_rx_mcs_11",
+	"v_rx_mcs_12",
+	"v_rx_mcs_13",
+
+	"rx_ampdu_len:0-1",
+	"rx_ampdu_len:2-10",
+	"rx_ampdu_len:11-19",
+	"rx_ampdu_len:20-28",
+	"rx_ampdu_len:29-37",
+	"rx_ampdu_len:38-46",
+	"rx_ampdu_len:47-55",
+	"rx_ampdu_len:56-79",
+	"rx_ampdu_len:80-103",
+	"rx_ampdu_len:104-127",
+	"rx_ampdu_len:128-151",
+	"rx_ampdu_len:152-175",
+	"rx_ampdu_len:176-199",
+	"rx_ampdu_len:200-223",
+	"rx_ampdu_len:224-247",
 };
 
 #define MT7996_SSTATS_LEN ARRAY_SIZE(mt7996_gstrings_stats)
@@ -1290,6 +1541,7 @@ void mt7996_get_et_stats(struct ieee80211_hw *hw,
 	struct mt76_ethtool_worker_info wi = {
 		.data = data,
 		.idx = mvif->mt76.idx,
+		.has_eht = true,
 	};
 	/* See mt7996_ampdu_stat_read_phy, etc */
 	int i, ei = 0;
@@ -1298,6 +1550,13 @@ void mt7996_get_et_stats(struct ieee80211_hw *hw,
 
 	mt7996_mac_update_stats(phy);
 
+	/* driver phy-wide stats */
+	data[ei++] = mib->tx_pkts_nic;
+	data[ei++] = mib->tx_bytes_nic;
+	data[ei++] = mib->rx_pkts_nic;
+	data[ei++] = mib->rx_bytes_nic;
+
+	/* MIB stats from FW/HW */
 	data[ei++] = mib->tx_ampdu_cnt;
 	data[ei++] = mib->tx_stop_q_empty_cnt;
 	data[ei++] = mib->tx_mpdu_attempts_cnt;
@@ -1354,6 +1613,17 @@ void mt7996_get_et_stats(struct ieee80211_hw *hw,
 	data[ei++] = mib->rx_pfdrop_cnt;
 	data[ei++] = mib->rx_vec_queue_overflow_drop_cnt;
 	data[ei++] = mib->rx_ba_cnt;
+
+	/* rx stats from driver */
+	data[ei++] = mib->rx_d_skb;
+	data[ei++] = mib->rx_d_rxd2_amsdu_err;
+	data[ei++] = mib->rx_d_null_channels;
+	data[ei++] = mib->rx_d_max_len_err;
+	data[ei++] = mib->rx_d_too_short;
+	data[ei++] = mib->rx_d_bad_ht_rix;
+	data[ei++] = mib->rx_d_bad_vht_rix;
+	data[ei++] = mib->rx_d_bad_mode;
+	data[ei++] = mib->rx_d_bad_bw;
 
 	/* Add values for all stations owned by this vif */
 	wi.initial_stat_idx = ei;
@@ -1514,6 +1784,8 @@ const struct ieee80211_ops mt7996_ops = {
 	.sta_set_decap_offload = mt7996_sta_set_decap_offload,
 	.add_twt_setup = mt7996_mac_add_twt_setup,
 	.twt_teardown_request = mt7996_twt_teardown_request,
+	CFG80211_TESTMODE_CMD(mt76_testmode_cmd)
+	CFG80211_TESTMODE_DUMP(mt76_testmode_dump)
 #ifdef CONFIG_MAC80211_DEBUGFS
 	.sta_add_debugfs = mt7996_sta_add_debugfs,
 #endif

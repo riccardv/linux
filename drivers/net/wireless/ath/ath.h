@@ -151,6 +151,9 @@ struct ath_common {
 	int debug_mask;
 	enum ath_device_state state;
 	unsigned long op_flags;
+	u32 chan_bw;
+	bool plus_half_mhz_center; /* Adjust center freq by 500Khz higher,
+				    * 4.9, 5Ghz band only. */
 
 	struct ath_ani ani;
 

@@ -161,6 +161,8 @@ struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_init)
 
 	memcpy(&clp->cl_addr, cl_init->addr, cl_init->addrlen);
 	clp->cl_addrlen = cl_init->addrlen;
+	memcpy(&clp->srcaddr, cl_init->srcaddr, cl_init->srcaddrlen);
+	clp->srcaddrlen = cl_init->srcaddrlen;
 
 	if (cl_init->hostname) {
 		err = -ENOMEM;
@@ -283,6 +285,9 @@ static struct nfs_client *nfs_match_client(const struct nfs_client_initdata *dat
 again:
 	list_for_each_entry(clp, &nn->nfs_client_list, cl_share_link) {
 	        const struct sockaddr *clap = (struct sockaddr *)&clp->cl_addr;
+		const struct sockaddr *sa;
+		sa = (const struct sockaddr *)&clp->srcaddr;
+
 		/* Don't match clients that failed to initialise properly */
 		if (clp->cl_cons_state < 0)
 			continue;
@@ -324,6 +329,13 @@ again:
 
 		/* Match the xprt security policy */
 		if (clp->cl_xprtsec.policy != data->xprtsec.policy)
+			continue;
+
+		/* Check to make sure local-IP bindings match,
+		 * but just the IP-addr.
+		 */
+		if (data->srcaddr &&
+		    !rpc_cmp_addr(data->srcaddr, sa))
 			continue;
 
 		refcount_inc(&clp->cl_count);
@@ -504,6 +516,7 @@ int nfs_create_rpc_client(struct nfs_client *clp,
 		.protocol	= clp->cl_proto,
 		.nconnect	= clp->cl_nconnect,
 		.address	= (struct sockaddr *)&clp->cl_addr,
+		.saddress	= (struct sockaddr *)&clp->srcaddr,
 		.addrsize	= clp->cl_addrlen,
 		.timeout	= cl_init->timeparms,
 		.servername	= clp->cl_hostname,
@@ -567,6 +580,7 @@ static int nfs_start_lockd(struct nfs_server *server)
 	struct nlmclnt_initdata nlm_init = {
 		.hostname	= clp->cl_hostname,
 		.address	= (struct sockaddr *)&clp->cl_addr,
+		.srcaddr        = (struct sockaddr *)&clp->srcaddr,
 		.addrlen	= clp->cl_addrlen,
 		.nfs_version	= clp->rpc_ops->version,
 		.noresvport	= server->flags & NFS_MOUNT_NORESVPORT ?
@@ -679,6 +693,8 @@ static int nfs_init_server(struct nfs_server *server,
 		.nfs_mod = ctx->nfs_mod,
 		.proto = ctx->nfs_server.protocol,
 		.net = fc->net_ns,
+		.srcaddr = &ctx->srcaddr.address,
+		.srcaddrlen = ctx->srcaddr.addrlen,
 		.timeparms = &timeparms,
 		.cred = server->cred,
 		.nconnect = ctx->nfs_server.nconnect,
@@ -1267,7 +1283,7 @@ static int nfs_server_list_show(struct seq_file *m, void *v)
 
 	/* display header on line 1 */
 	if (v == &nn->nfs_client_list) {
-		seq_puts(m, "NV SERVER   PORT USE HOSTNAME\n");
+		seq_puts(m, "NV SERVER   PORT USE HOSTNAME           SRCADDR\n");
 		return 0;
 	}
 
@@ -1279,13 +1295,26 @@ static int nfs_server_list_show(struct seq_file *m, void *v)
 		return 0;
 
 	rcu_read_lock();
-	seq_printf(m, "v%u %s %s %3d %s\n",
+	seq_printf(m, "v%u %s %s %3d %s",
 		   clp->rpc_ops->version,
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_ADDR),
 		   rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_HEX_PORT),
 		   refcount_read(&clp->cl_count),
 		   clp->cl_hostname);
 	rcu_read_unlock();
+
+	if (clp->srcaddr.ss_family == AF_INET) {
+		const struct sockaddr_in *sin;
+		sin = (const struct sockaddr_in *)&clp->srcaddr;
+		seq_printf(m, "   %pI4\n", &sin->sin_addr.s_addr);
+	} else if (clp->srcaddr.ss_family == AF_INET6) {
+		const struct sockaddr_in6 *sin6;
+		sin6 = (const struct sockaddr_in6 *)&clp->srcaddr;
+		seq_printf(m, "   %pI6c\n", &sin6->sin6_addr);
+	} else if (clp->srcaddr.ss_family == AF_UNSPEC)
+		seq_printf(m, "   ANY\n");
+	else
+		seq_printf(m, "   UNKNOWN_%i\n", (int)(clp->srcaddr.ss_family));
 
 	return 0;
 }

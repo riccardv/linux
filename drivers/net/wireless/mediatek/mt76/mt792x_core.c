@@ -7,6 +7,10 @@
 #include "mt792x.h"
 #include "dma.h"
 
+static bool mt792x_allow_cnm;
+module_param_named(allow_cnm, mt792x_allow_cnm, bool, 0644);
+MODULE_PARM_DESC(allow_cnm, "Allow CAP_CNM firmware flag to enable AP + STA on different channels.  Set to false to allow 4 STA.");
+
 static const struct ieee80211_iface_limit if_limits[] = {
 	{
 		.max = MT792x_MAX_INTERFACES,
@@ -337,7 +341,11 @@ void mt792x_set_wakeup(struct ieee80211_hw *hw, bool enabled)
 }
 EXPORT_SYMBOL_GPL(mt792x_set_wakeup);
 
-static const char mt792x_gstrings_stats[][ETH_GSTRING_LEN] = {
+static const char mt792x_gstrings_stats_ax[][ETH_GSTRING_LEN] = {
+	"tx_pkts_nic", /* from driver, phy tx-ok skb */
+	"tx_bytes_nic", /* from driver, phy tx-ok bytes */
+	"rx_pkts_nic", /* from driver, phy rx OK skb */
+	"rx_bytes_nic", /* from driver, phy rx OK bytes */
 	/* tx counters */
 	"tx_ampdu_cnt",
 	"tx_mpdu_attempts",
@@ -379,7 +387,180 @@ static const char mt792x_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"rx_ampdu_cnt",
 	"rx_ampdu_bytes_cnt",
 	"rx_ba_cnt",
+
+	/* driver rx counters */
+	"d_rx_skb",
+	"d_rx_rxd2_amsdu_err",
+	"d_rx_null_channels",
+	"d_rx_max_len_err",
+	"d_rx_too_short",
+	"d_rx_bad_ht_rix",
+	"d_rx_bad_vht_rix",
+	"d_rx_bad_mode",
+	"d_rx_bad_bw",
+
 	/* per vif counters */
+	"v_tx_mpdu_attempts", /* counting any retries (all frames) */
+	"v_tx_mpdu_fail",  /* frames that failed even after retry (all frames) */
+	"v_tx_mpdu_retry", /* number of times frames were retried (all frames) */
+	"v_tx_mpdu_ok", /* frames that succeeded, perhaps after retry (all frames) */
+
+	"v_txo_tx_mpdu_attempts", /* counting any retries, txo frames */
+	"v_txo_tx_mpdu_fail",  /* frames that failed even after retry, txo frames */
+	"v_txo_tx_mpdu_retry", /* number of times frames were retried, txo frames */
+	"v_txo_tx_mpdu_ok", /* frames that succeeded, perhaps after retry, txo frames */
+
+	"v_tx_mode_cck",
+	"v_tx_mode_ofdm",
+	"v_tx_mode_ht",
+	"v_tx_mode_ht_gf",
+	"v_tx_mode_vht",
+	"v_tx_mode_he_su",
+	"v_tx_mode_he_ext_su",
+	"v_tx_mode_he_tb",
+	"v_tx_mode_he_mu",
+
+	"v_tx_bw_20",
+	"v_tx_bw_40",
+	"v_tx_bw_80",
+	"v_tx_bw_160",
+
+	"v_tx_mcs_0",
+	"v_tx_mcs_1",
+	"v_tx_mcs_2",
+	"v_tx_mcs_3",
+	"v_tx_mcs_4",
+	"v_tx_mcs_5",
+	"v_tx_mcs_6",
+	"v_tx_mcs_7",
+	"v_tx_mcs_8",
+	"v_tx_mcs_9",
+	"v_tx_mcs_10",
+	"v_tx_mcs_11",
+
+	"v_tx_nss_1",
+	"v_tx_nss_2",
+	"v_tx_nss_3",
+	"v_tx_nss_4",
+
+	/* per-vif rx counters */
+	"v_rx_nss_1",
+	"v_rx_nss_2",
+	"v_rx_nss_3",
+	"v_rx_nss_4",
+	"v_rx_mode_cck",
+	"v_rx_mode_ofdm",
+	"v_rx_mode_ht",
+	"v_rx_mode_ht_gf",
+	"v_rx_mode_vht",
+	"v_rx_mode_he_su",
+	"v_rx_mode_he_ext_su",
+	"v_rx_mode_he_tb",
+	"v_rx_mode_he_mu",
+	"v_rx_bw_20",
+	"v_rx_bw_40",
+	"v_rx_bw_80",
+	"v_rx_bw_160",
+	"v_rx_bw_he_ru",
+	"v_rx_ru_106",
+	"v_rx_mcs_0",
+	"v_rx_mcs_1",
+	"v_rx_mcs_2",
+	"v_rx_mcs_3",
+	"v_rx_mcs_4",
+	"v_rx_mcs_5",
+	"v_rx_mcs_6",
+	"v_rx_mcs_7",
+	"v_rx_mcs_8",
+	"v_rx_mcs_9",
+	"v_rx_mcs_10",
+	"v_rx_mcs_11",
+	"rx_ampdu_len:0-1",
+	"rx_ampdu_len:2-10",
+	"rx_ampdu_len:11-19",
+	"rx_ampdu_len:20-28",
+	"rx_ampdu_len:29-37",
+	"rx_ampdu_len:38-46",
+	"rx_ampdu_len:47-55",
+	"rx_ampdu_len:56-79",
+	"rx_ampdu_len:80-103",
+	"rx_ampdu_len:104-127",
+	"rx_ampdu_len:128-151",
+	"rx_ampdu_len:152-175",
+	"rx_ampdu_len:176-199",
+	"rx_ampdu_len:200-223",
+	"rx_ampdu_len:224-247",
+};
+
+static const char mt792x_gstrings_stats_eht[][ETH_GSTRING_LEN] = {
+	"tx_pkts_nic", /* from driver, phy tx-ok skb */
+	"tx_bytes_nic", /* from driver, phy tx-ok bytes */
+	"rx_pkts_nic", /* from driver, phy rx OK skb */
+	"rx_bytes_nic", /* from driver, phy rx OK bytes */
+	/* tx counters */
+	"tx_ampdu_cnt",
+	"tx_mpdu_attempts",
+	"tx_mpdu_success",
+	"tx_pkt_ebf_cnt",
+	"tx_pkt_ibf_cnt",
+	"tx_ampdu_len:0-1",
+	"tx_ampdu_len:2-10",
+	"tx_ampdu_len:11-19",
+	"tx_ampdu_len:20-28",
+	"tx_ampdu_len:29-37",
+	"tx_ampdu_len:38-46",
+	"tx_ampdu_len:47-55",
+	"tx_ampdu_len:56-79",
+	"tx_ampdu_len:80-103",
+	"tx_ampdu_len:104-127",
+	"tx_ampdu_len:128-151",
+	"tx_ampdu_len:152-175",
+	"tx_ampdu_len:176-199",
+	"tx_ampdu_len:200-223",
+	"tx_ampdu_len:224-247",
+	"ba_miss_count",
+	"tx_beamformer_ppdu_iBF",
+	"tx_beamformer_ppdu_eBF",
+	"tx_beamformer_rx_feedback_all",
+	"tx_beamformer_rx_feedback_he",
+	"tx_beamformer_rx_feedback_vht",
+	"tx_beamformer_rx_feedback_ht",
+	"tx_msdu_pack_1",
+	"tx_msdu_pack_2",
+	"tx_msdu_pack_3",
+	"tx_msdu_pack_4",
+	"tx_msdu_pack_5",
+	"tx_msdu_pack_6",
+	"tx_msdu_pack_7",
+	"tx_msdu_pack_8",
+	/* rx counters */
+	"rx_mpdu_cnt",
+	"rx_ampdu_cnt",
+	"rx_ampdu_bytes_cnt",
+	"rx_ba_cnt",
+
+	/* driver rx counters */
+	"d_rx_skb",
+	"d_rx_rxd2_amsdu_err",
+	"d_rx_null_channels",
+	"d_rx_max_len_err",
+	"d_rx_too_short",
+	"d_rx_bad_ht_rix",
+	"d_rx_bad_vht_rix",
+	"d_rx_bad_mode",
+	"d_rx_bad_bw",
+
+	/* per vif counters */
+	"v_tx_mpdu_attempts", /* counting any retries (all frames) */
+	"v_tx_mpdu_fail",  /* frames that failed even after retry (all frames) */
+	"v_tx_mpdu_retry", /* number of times frames were retried (all frames) */
+	"v_tx_mpdu_ok", /* frames that succeeded, perhaps after retry (all frames) */
+
+	"v_txo_tx_mpdu_attempts", /* counting any retries, txo frames */
+	"v_txo_tx_mpdu_fail",  /* frames that failed even after retry, txo frames */
+	"v_txo_tx_mpdu_retry", /* number of times frames were retried, txo frames */
+	"v_txo_tx_mpdu_ok", /* frames that succeeded, perhaps after retry, txo frames */
+
 	"v_tx_mode_cck",
 	"v_tx_mode_ofdm",
 	"v_tx_mode_ht",
@@ -392,11 +573,13 @@ static const char mt792x_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"v_tx_mode_eht_su",
 	"v_tx_mode_eht_trig",
 	"v_tx_mode_eht_mu",
+
 	"v_tx_bw_20",
 	"v_tx_bw_40",
 	"v_tx_bw_80",
 	"v_tx_bw_160",
 	"v_tx_bw_320",
+
 	"v_tx_mcs_0",
 	"v_tx_mcs_1",
 	"v_tx_mcs_2",
@@ -411,21 +594,86 @@ static const char mt792x_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"v_tx_mcs_11",
 	"v_tx_mcs_12",
 	"v_tx_mcs_13",
+
 	"v_tx_nss_1",
 	"v_tx_nss_2",
 	"v_tx_nss_3",
 	"v_tx_nss_4",
+
+	/* per-vif rx counters */
+	"v_rx_nss_1",
+	"v_rx_nss_2",
+	"v_rx_nss_3",
+	"v_rx_nss_4",
+	"v_rx_mode_cck",
+	"v_rx_mode_ofdm",
+	"v_rx_mode_ht",
+	"v_rx_mode_ht_gf",
+	"v_rx_mode_vht",
+	"v_rx_mode_he_su",
+	"v_rx_mode_he_ext_su",
+	"v_rx_mode_he_tb",
+	"v_rx_mode_he_mu",
+	"v_rx_mode_eht_su",
+	"v_rx_mode_eht_trig",
+	"v_rx_mode_eht_mu",
+	"v_rx_bw_20",
+	"v_rx_bw_40",
+	"v_rx_bw_80",
+	"v_rx_bw_160",
+	"v_rx_bw_320",
+
+	"v_rx_bw_he_ru",
+	"v_rx_ru_106",
+	"v_rx_mcs_0",
+	"v_rx_mcs_1",
+	"v_rx_mcs_2",
+	"v_rx_mcs_3",
+	"v_rx_mcs_4",
+	"v_rx_mcs_5",
+	"v_rx_mcs_6",
+	"v_rx_mcs_7",
+	"v_rx_mcs_8",
+	"v_rx_mcs_9",
+	"v_rx_mcs_10",
+	"v_rx_mcs_11",
+	"v_rx_mcs_12",
+	"v_rx_mcs_13",
+
+	"rx_ampdu_len:0-1",
+	"rx_ampdu_len:2-10",
+	"rx_ampdu_len:11-19",
+	"rx_ampdu_len:20-28",
+	"rx_ampdu_len:29-37",
+	"rx_ampdu_len:38-46",
+	"rx_ampdu_len:47-55",
+	"rx_ampdu_len:56-79",
+	"rx_ampdu_len:80-103",
+	"rx_ampdu_len:104-127",
+	"rx_ampdu_len:128-151",
+	"rx_ampdu_len:152-175",
+	"rx_ampdu_len:176-199",
+	"rx_ampdu_len:200-223",
+	"rx_ampdu_len:224-247",
 };
 
 void mt792x_get_et_strings(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			   u32 sset, u8 *data)
 {
+	struct mt792x_phy *phy = mt792x_hw_phy(hw);
+	struct mt792x_dev *dev = phy->dev;
+
 	if (sset != ETH_SS_STATS)
 		return;
 
-	memcpy(data, mt792x_gstrings_stats, sizeof(mt792x_gstrings_stats));
+	if (dev->has_eht) {
+		memcpy(data, mt792x_gstrings_stats_eht, sizeof(mt792x_gstrings_stats_eht));
+		data += sizeof(mt792x_gstrings_stats_eht);
+	} else {
+		memcpy(data, mt792x_gstrings_stats_ax, sizeof(mt792x_gstrings_stats_ax));
+		data += sizeof(mt792x_gstrings_stats_ax);
+	}
 
-	data += sizeof(mt792x_gstrings_stats);
 	page_pool_ethtool_stats_get_strings(data);
 }
 EXPORT_SYMBOL_GPL(mt792x_get_et_strings);
@@ -433,10 +681,17 @@ EXPORT_SYMBOL_GPL(mt792x_get_et_strings);
 int mt792x_get_et_sset_count(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			     int sset)
 {
+	struct mt792x_phy *phy = mt792x_hw_phy(hw);
+	struct mt792x_dev *dev = phy->dev;
+
 	if (sset != ETH_SS_STATS)
 		return 0;
 
-	return ARRAY_SIZE(mt792x_gstrings_stats) +
+	if (dev->has_eht)
+		return ARRAY_SIZE(mt792x_gstrings_stats_eht) +
+			page_pool_ethtool_stats_get_count();
+
+	return ARRAY_SIZE(mt792x_gstrings_stats_ax) +
 	       page_pool_ethtool_stats_get_count();
 }
 EXPORT_SYMBOL_GPL(mt792x_get_et_sset_count);
@@ -450,26 +705,38 @@ mt792x_ethtool_worker(void *wi_data, struct ieee80211_sta *sta)
 	if (msta->vif->bss_conf.mt76.idx != wi->idx)
 		return;
 
-	mt76_ethtool_worker(wi, &msta->deflink.wcid.stats, true);
+	mt76_ethtool_worker(wi, &msta->deflink.wcid.stats, wi->has_eht);
 }
 
 void mt792x_get_et_stats(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			 struct ethtool_stats *stats, u64 *data)
 {
 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
-	int stats_size = ARRAY_SIZE(mt792x_gstrings_stats);
+	int stats_size;
 	struct mt792x_phy *phy = mt792x_hw_phy(hw);
 	struct mt792x_dev *dev = phy->dev;
 	struct mt76_mib_stats *mib = &phy->mib;
 	struct mt76_ethtool_worker_info wi = {
 		.data = data,
 		.idx = mvif->bss_conf.mt76.idx,
+		.has_eht = dev->has_eht,
 	};
 	int i, ei = 0;
+
+	if (dev->has_eht)
+		stats_size = ARRAY_SIZE(mt792x_gstrings_stats_eht);
+	else
+		stats_size = ARRAY_SIZE(mt792x_gstrings_stats_ax);
 
 	mt792x_mutex_acquire(dev);
 
 	mt792x_mac_update_mib_stats(phy);
+
+	/* driver phy-wide stats */
+	data[ei++] = mib->tx_pkts_nic;
+	data[ei++] = mib->tx_bytes_nic;
+	data[ei++] = mib->rx_pkts_nic;
+	data[ei++] = mib->rx_bytes_nic;
 
 	data[ei++] = mib->tx_ampdu_cnt;
 	data[ei++] = mib->tx_mpdu_attempts_cnt;
@@ -502,6 +769,17 @@ void mt792x_get_et_stats(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	data[ei++] = mib->rx_ampdu_cnt;
 	data[ei++] = mib->rx_ampdu_bytes_cnt;
 	data[ei++] = mib->rx_ba_cnt;
+
+	/* rx stats from driver */
+	data[ei++] = mib->rx_d_skb;
+	data[ei++] = mib->rx_d_rxd2_amsdu_err;
+	data[ei++] = mib->rx_d_null_channels;
+	data[ei++] = mib->rx_d_max_len_err;
+	data[ei++] = mib->rx_d_too_short;
+	data[ei++] = mib->rx_d_bad_ht_rix;
+	data[ei++] = mib->rx_d_bad_vht_rix;
+	data[ei++] = mib->rx_d_bad_mode;
+	data[ei++] = mib->rx_d_bad_bw;
 
 	/* Add values for all stations owned by this vif */
 	wi.initial_stat_idx = ei;
@@ -582,6 +860,7 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 	struct wiphy *wiphy = hw->wiphy;
 
 	hw->queues = 4;
+	hw->max_report_rates = 1;
 	if (dev->has_eht) {
 		hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_EHT;
 		hw->max_tx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_EHT;
@@ -645,7 +924,7 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 	ieee80211_hw_set(hw, SUPPORTS_PS);
 	ieee80211_hw_set(hw, SUPPORTS_DYNAMIC_PS);
 	ieee80211_hw_set(hw, SUPPORTS_VHT_EXT_NSS_BW);
-	ieee80211_hw_set(hw, CONNECTION_MONITOR);
+	ieee80211_hw_set(hw, SPECTRUM_MGMT);
 
 	if (dev->pm.enable)
 		ieee80211_hw_set(hw, CONNECTION_MONITOR);
@@ -657,7 +936,8 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 EXPORT_SYMBOL_GPL(mt792x_init_wiphy);
 
 static u8
-mt792x_get_offload_capability(struct device *dev, const char *fw_wm)
+mt792x_get_offload_capability(struct device *dev, const char *fw_wm,
+			      bool can_disable_fw_cap_cnm)
 {
 	const struct mt76_connac2_fw_trailer *hdr;
 	struct mt792x_realease_info *rel_info;
@@ -709,13 +989,17 @@ mt792x_get_offload_capability(struct device *dev, const char *fw_wm)
 out:
 	release_firmware(fw);
 
+	if (can_disable_fw_cap_cnm && !mt792x_allow_cnm)
+		offload_caps &= ~MT792x_FW_CAP_CNM;
+
 	return offload_caps;
 }
 
 struct ieee80211_ops *
 mt792x_get_mac80211_ops(struct device *dev,
 			const struct ieee80211_ops *mac80211_ops,
-			void *drv_data, u8 *fw_features)
+			void *drv_data, u8 *fw_features,
+			bool can_disable_fw_cap_cnm, bool reassign_ops)
 {
 	struct ieee80211_ops *ops;
 
@@ -724,8 +1008,9 @@ mt792x_get_mac80211_ops(struct device *dev,
 	if (!ops)
 		return NULL;
 
-	*fw_features = mt792x_get_offload_capability(dev, drv_data);
-	if (!(*fw_features & MT792x_FW_CAP_CNM)) {
+	*fw_features = mt792x_get_offload_capability(dev, drv_data,
+						     can_disable_fw_cap_cnm);
+	if (reassign_ops && !(*fw_features & MT792x_FW_CAP_CNM)) {
 		ops->remain_on_channel = NULL;
 		ops->cancel_remain_on_channel = NULL;
 		ops->add_chanctx = ieee80211_emulate_add_chanctx;

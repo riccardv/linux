@@ -68,6 +68,11 @@ static int ath9k_ps_enable;
 module_param_named(ps_enable, ath9k_ps_enable, int, 0444);
 MODULE_PARM_DESC(ps_enable, "Enable WLAN PowerSave");
 
+static int modparam_override_eeprom_regdomain = -1;
+module_param_named(override_eeprom_regdomain,
+		   modparam_override_eeprom_regdomain, int, 0444);
+MODULE_PARM_DESC(override_eeprom_regdomain, "Override regdomain hardcoded in EEPROM with this value (DANGEROUS).");
+
 #ifdef CONFIG_ATH9K_CHANNEL_CONTEXT
 
 int ath9k_use_chanctx;
@@ -875,13 +880,14 @@ static void ath9k_init_txpower_limits(struct ath_softc *sc)
 
 static const struct ieee80211_iface_limit if_limits[] = {
 	{ .max = 2048,	.types = BIT(NL80211_IFTYPE_STATION) },
-	{ .max = 8,	.types =
+	{ .max = 32,	.types =
 #ifdef CONFIG_MAC80211_MESH
 				 BIT(NL80211_IFTYPE_MESH_POINT) |
 #endif
 				 BIT(NL80211_IFTYPE_AP) },
 	{ .max = 1,	.types = BIT(NL80211_IFTYPE_P2P_CLIENT) |
 				 BIT(NL80211_IFTYPE_P2P_GO) },
+	{ .max = 1,     .types = BIT(NL80211_IFTYPE_ADHOC) },
 };
 
 #ifdef CONFIG_ATH9K_CHANNEL_CONTEXT
@@ -962,6 +968,17 @@ static void ath9k_set_hw_capab(struct ath_softc *sc, struct ieee80211_hw *hw)
 	ieee80211_hw_set(hw, HOST_BROADCAST_PS_BUFFERING);
 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
 	ieee80211_hw_set(hw, SUPPORTS_CLONED_SKBS);
+
+	if (modparam_override_eeprom_regdomain != -1) {
+		struct ath_regulatory *regulatory = ath9k_hw_regulatory(sc->sc_ah);
+		printk(KERN_ERR "ath9k: DANGER! You're overriding EEPROM-defined regulatory domain,"
+		       "\nfrom: 0x%x to 0x%x\n",
+		       regulatory->current_rd, modparam_override_eeprom_regdomain);
+		printk(KERN_ERR "ath9k: Your card was not certified to operate in the domain you chose.\n");
+		printk(KERN_ERR "ath9k: This might result in a violation of your local regulatory rules.\n");
+		printk(KERN_ERR "ath9k: Do not ever do this unless you really know what you are doing!\n");
+		regulatory->current_rd = modparam_override_eeprom_regdomain | COUNTRY_ERD_FLAG;
+	}
 
 	if (ath9k_ps_enable)
 		ieee80211_hw_set(hw, SUPPORTS_PS);
@@ -1047,6 +1064,7 @@ static void ath9k_set_hw_capab(struct ath_softc *sc, struct ieee80211_hw *hw)
 	wiphy_ext_feature_set(hw->wiphy,
 			      NL80211_EXT_FEATURE_MULTICAST_REGISTRATIONS);
 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_ETHTOOL_VDEV_STATS);
 }
 
 int ath9k_init_device(u16 devid, struct ath_softc *sc,

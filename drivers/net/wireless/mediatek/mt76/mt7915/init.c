@@ -12,6 +12,8 @@
 #include "coredump.h"
 #include "eeprom.h"
 
+#define MT76_DRIVER_VERSION "6.6.0-ct"
+
 static const struct ieee80211_iface_limit if_limits[] = {
 	{
 		.max = 1,
@@ -301,6 +303,7 @@ static void __mt7915_init_txpower(struct mt7915_phy *phy,
 		target_power += pwr_delta;
 		target_power = mt76_get_rate_power_limits(phy->mt76, chan,
 							  &limits,
+							  NULL,
 							  target_power);
 		target_power += nss_delta;
 		target_power = DIV_ROUND_UP(target_power, 2);
@@ -354,6 +357,7 @@ mt7915_init_wiphy(struct mt7915_phy *phy)
 	struct mt7915_dev *dev = phy->dev;
 
 	hw->queues = 4;
+	hw->max_report_rates = 1;
 	hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HE;
 	hw->max_tx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HE;
 	hw->netdev_features = NETIF_F_RXCSUM;
@@ -385,6 +389,7 @@ mt7915_init_wiphy(struct mt7915_phy *phy)
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_FILS_DISCOVERY);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
 
 	if (!is_mt7915(&dev->mt76))
 		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_STA_TX_PWR);
@@ -400,6 +405,8 @@ mt7915_init_wiphy(struct mt7915_phy *phy)
 	ieee80211_hw_set(hw, SUPPORTS_RX_DECAP_OFFLOAD);
 	ieee80211_hw_set(hw, SUPPORTS_MULTI_BSSID);
 	ieee80211_hw_set(hw, WANT_MONITOR_VIF);
+	ieee80211_hw_set(hw, SUPPORTS_TX_FRAG);
+	ieee80211_hw_set(hw, SPECTRUM_MGMT);
 	ieee80211_hw_set(hw, SUPPORTS_TX_FRAG);
 
 	hw->max_tx_fragments = 4;
@@ -492,14 +499,15 @@ mt7915_mac_init_band(struct mt7915_dev *dev, u8 band)
 	       MT_MDP_RCFR1_RX_DROPPED_UCAST |
 	       MT_MDP_RCFR1_RX_DROPPED_MCAST;
 	set = FIELD_PREP(MT_MDP_RCFR1_MCU_RX_BYPASS, MT_MDP_TO_HIF) |
-	      FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_UCAST, MT_MDP_TO_HIF) |
-	      FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_MCAST, MT_MDP_TO_HIF);
+	      FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_UCAST, MT_MDP_PFD_DROP) |
+	      FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_MCAST, MT_MDP_PFD_DROP);
 	mt76_rmw(dev, MT_MDP_BNRCFR1(band), mask, set);
 
 	mt76_rmw_field(dev, MT_DMA_DCR0(band), MT_DMA_DCR0_MAX_RX_LEN, 0x680);
 
 	/* mt7915: disable rx rate report by default due to hw issues */
-	mt76_clear(dev, MT_DMA_DCR0(band), MT_DMA_DCR0_RXD_G5_EN);
+	mt76_rmw_field(dev, MT_DMA_DCR0(band), MT_DMA_DCR0_RXD_G5_EN,
+		       dev->rx_group_5_enable);
 
 	/* clear estimated value of EIFS for Rx duration & OBSS time */
 	mt76_wr(dev, MT_WF_RMAC_RSVD0(band), MT_WF_RMAC_RSVD0_EIFS_CLR);
@@ -720,6 +728,7 @@ static void mt7915_init_work(struct work_struct *work)
 	mt7915_mcu_set_eeprom(dev);
 	mt7915_mac_init(dev);
 	mt7915_txbf_init(dev);
+	dev->dbg.muru_onoff = OFDMA_DL | MUMIMO_UL | MUMIMO_DL;
 }
 
 void mt7915_wfsys_reset(struct mt7915_dev *dev)
@@ -856,14 +865,15 @@ void mt7915_set_stream_vht_txbf_caps(struct mt7915_phy *phy)
 	sts = hweight8(phy->mt76->chainmask);
 	cap = &phy->mt76->sband_5g.sband.vht_cap.cap;
 
+	*cap &= ~(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK |
+		  IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK |
+		  IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
+		  IEEE80211_VHT_CAP_MU_BEAMFORMER_CAPABLE);
+
 	*cap |= IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
 		IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE |
 		FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK,
 			   sts - 1);
-
-	*cap &= ~(IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK |
-		  IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
-		  IEEE80211_VHT_CAP_MU_BEAMFORMER_CAPABLE);
 
 	if (sts < 2)
 		return;
@@ -1188,7 +1198,7 @@ static void mt7915_unregister_ext_phy(struct mt7915_dev *dev)
 static void mt7915_stop_hardware(struct mt7915_dev *dev)
 {
 	mt7915_mcu_exit(dev);
-	mt76_connac2_tx_token_put(&dev->mt76);
+	mt76_connac2_tx_token_put(&dev->mt76, &dev->phy.mib);
 	mt7915_dma_cleanup(dev);
 	tasklet_disable(&dev->mt76.irq_tasklet);
 
@@ -1200,6 +1210,9 @@ int mt7915_register_device(struct mt7915_dev *dev)
 {
 	struct mt7915_phy *phy2;
 	int ret;
+
+	dev_info(dev->mt76.dev, "mt7915:  register_device  Driver-Version: %s\n",
+		 MT76_DRIVER_VERSION);
 
 	dev->phy.dev = dev;
 	dev->phy.mt76 = &dev->mt76.phy;
@@ -1239,7 +1252,6 @@ int mt7915_register_device(struct mt7915_dev *dev)
 	if (ret)
 		goto unreg_dev;
 
-	ieee80211_queue_work(mt76_hw(dev), &dev->init_work);
 
 	if (phy2) {
 		ret = mt7915_register_ext_phy(dev, phy2);
@@ -1248,6 +1260,8 @@ int mt7915_register_device(struct mt7915_dev *dev)
 	}
 
 	dev->recovery.hw_init_done = true;
+
+	ieee80211_queue_work(mt76_hw(dev), &dev->init_work);
 
 	ret = mt7915_init_debugfs(&dev->phy);
 	if (ret)

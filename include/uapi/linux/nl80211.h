@@ -42,6 +42,19 @@
 
 #include <linux/types.h>
 
+/* Candela hacker space. */
+#define CANDELA_VENDOR_ID 0xCD1A
+struct ct_assoc_info {
+#define CT_DISABLE_TWT (1<<0)
+#define CT_DISABLE_160MHZ (1<<1)
+#define CT_DISABLE_OFDMA (1<<2)
+#define CT_DISABLE_320MHZ (1<<3)
+#define CT_IGNORE_EDCA (1<<4)
+	__u32 flags;
+	__u32 pad32[7]; /* room to grow */
+} __attribute__((packed));
+
+
 #define NL80211_GENL_NAME "nl80211"
 
 #define NL80211_MULTICAST_GROUP_CONFIG		"config"
@@ -3646,6 +3659,7 @@ enum nl80211_he_ru_alloc {
 	NL80211_RATE_INFO_HE_RU_ALLOC_484,
 	NL80211_RATE_INFO_HE_RU_ALLOC_996,
 	NL80211_RATE_INFO_HE_RU_ALLOC_2x996,
+	NL80211_RATE_INFO_HE_RU_ALLOC_LAST /* new entries before this */
 };
 
 /**
@@ -6565,6 +6579,11 @@ enum nl80211_feature_flags {
  * @NL80211_EXT_FEATURE_SPP_AMSDU_SUPPORT: The driver has support for SPP
  *	(signaling and payload protected) A-MSDUs and this shall be advertised
  *	in the RSNXE.
+ * @NL80211_EXT_FEATURE_ETHTOOL_VDEV_STATS: The driver uses the alternate
+ *	ethtool string stat block which include per-vdev accumulator stats.
+ *	This flag is intended for use with IEEE802.11ac and older radios.
+ *	NOTE: This feature will only work if CONFIG_MAC80211_DEBUG_STA_COUNTERS
+ *	is set in the build configuration.
  *
  * @NUM_NL80211_EXT_FEATURES: number of extended features.
  * @MAX_NL80211_EXT_FEATURES: highest extended feature index.
@@ -6641,6 +6660,7 @@ enum nl80211_ext_feature_index {
 	NL80211_EXT_FEATURE_OWE_OFFLOAD_AP,
 	NL80211_EXT_FEATURE_DFS_CONCURRENT,
 	NL80211_EXT_FEATURE_SPP_AMSDU_SUPPORT,
+	NL80211_EXT_FEATURE_ETHTOOL_VDEV_STATS,
 
 	/* add new features before the definition below */
 	NUM_NL80211_EXT_FEATURES,

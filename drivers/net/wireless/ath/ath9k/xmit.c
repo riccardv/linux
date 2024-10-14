@@ -134,8 +134,9 @@ void ath9k_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *queue)
 	struct ath_atx_tid *tid = (struct ath_atx_tid *) queue->drv_priv;
 	struct ath_txq *txq = tid->txq;
 
-	ath_dbg(common, QUEUE, "Waking TX queue: %pM (%d)\n",
-		queue->sta ? queue->sta->addr : queue->vif->addr,
+	ath_dbg(common, QUEUE,
+		"Waking TX queue: sta-addr %pM vif: %pM (tid %d)\n",
+		queue->sta ? queue->sta->addr : NULL, queue->vif->addr,
 		tid->tidno);
 
 	ath_txq_lock(sc, txq);
@@ -217,9 +218,13 @@ static void ath_txq_skb_done(struct ath_softc *sc, struct ath_txq *txq,
 	if (q < 0)
 		return;
 
-	txq = sc->tx.txq_map[q];
-	if (WARN_ON(--txq->pending_frames < 0))
+	if (--txq->pending_frames < 0) {
+		struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+		if (net_ratelimit())
+			ath_err(common, "txq: %p had negative pending_frames, q: %i\n",
+				txq, q);
 		txq->pending_frames = 0;
+	}
 
 }
 
@@ -739,7 +744,7 @@ static void ath_tx_process_buffer(struct ath_softc *sc, struct ath_txq *txq,
 
 	txok = !(ts->ts_status & ATH9K_TXERR_MASK);
 	flush = !!(ts->ts_status & ATH9K_TX_FLUSH);
-	txq->axq_tx_inprogress = false;
+	txq->axq_tx_inprogress = 0;
 
 	txq->axq_depth--;
 	if (bf_is_ampdu_not_probing(bf))
@@ -1470,6 +1475,12 @@ static void ath_tx_fill_desc(struct ath_softc *sc, struct ath_buf *bf,
 			ath_buf_set_rate(sc, bf, &info, len, rts);
 		}
 
+		/* Do not update duration for injected frames.
+		 * Set earlier in ath_buf_set_rate, override here.
+		 */
+		if (unlikely(tx_info->flags & IEEE80211_TX_CTL_INJECTED))
+			info.dur_update = 0;
+
 		info.buf_addr[0] = bf->bf_buf_addr;
 		info.buf_len[0] = skb->len;
 		info.pkt_len = fi->framelen;
@@ -1821,7 +1832,7 @@ struct ath_txq *ath_txq_setup(struct ath_softc *sc, int qtype, int subtype)
 		spin_lock_init(&txq->axq_lock);
 		txq->axq_depth = 0;
 		txq->axq_ampdu_depth = 0;
-		txq->axq_tx_inprogress = false;
+		txq->axq_tx_inprogress = 0;
 		sc->tx.txqsetup |= 1<<axq_qnum;
 
 		txq->txq_headidx = txq->txq_tailidx = 0;
@@ -1923,8 +1934,17 @@ void ath_draintxq(struct ath_softc *sc, struct ath_txq *txq)
 	}
 
 	txq->axq_link = NULL;
-	txq->axq_tx_inprogress = false;
+	txq->axq_tx_inprogress = 0;
 	ath_drain_txq_list(sc, txq, &txq->axq_q);
+
+	if (txq->clear_pending_frames_on_flush && (txq->pending_frames != 0)) {
+		ath_err(ath9k_hw_common(sc->sc_ah),
+			"Pending frames still exist on txq: %i after drain: %i  axq-depth: %i  ampdu-depth: %i\n",
+			txq->mac80211_qnum, txq->pending_frames, txq->axq_depth,
+			txq->axq_ampdu_depth);
+		txq->pending_frames = 0;
+	}
+	txq->clear_pending_frames_on_flush = false;
 
 	ath_txq_unlock_complete(sc, txq);
 	rcu_read_unlock();
@@ -2402,9 +2422,10 @@ out:
 }
 
 void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-		 struct sk_buff *skb)
+		 const int slotwidth)
 {
 	struct ath_softc *sc = hw->priv;
+	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
 	struct ath_tx_control txctl = {
 		.txq = sc->beacon.cabq
 	};
@@ -2414,13 +2435,55 @@ void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	LIST_HEAD(bf_q);
 	int duration = 0;
 	int max_duration;
+	int slot, firstslot;
+	int skippedSlots = 0;
+	struct sk_buff *skb;
+	struct ath_buf *lastbf[ATH_BCBUF] = {};
+	struct ath_frame_info *fi;
 
 	max_duration =
 		sc->cur_chan->beacon.beacon_interval * 1000 *
+		slotwidth *
 		sc->cur_chan->beacon.dtim_period / ATH_BCBUF;
 
-	do {
-		struct ath_frame_info *fi = get_frame_info(skb);
+	skb = ieee80211_get_buffered_bc(hw, vif);
+	if (skb) {
+		((struct ath_vif *) vif->drv_priv)->multicastWakeup = 1;
+	}
+
+	/* loop through all slots again and again until either max_duration is reached or all slots have no more packets */
+	firstslot = ((struct ath_vif *) vif->drv_priv)->av_bslot;
+	for (slot = firstslot; skippedSlots < ATH_BCBUF;
+	     slot = ((slot >= ATH_BCBUF - 1) ? 0 : (slot + 1))) {
+		if (slot == firstslot)
+			/* when all ATH_BCBUF many slots are empty, skippedSlots will reach ATH_BCBUF before slot=firstslot is reached again */
+			skippedSlots = 0;
+
+		vif = sc->beacon.bslot[slot];
+		if (!vif || !(((struct ath_vif *) vif->drv_priv)->multicastWakeup)) {
+			/* there is no vif for this slot or this bss is not woken up */
+			skippedSlots++;
+			continue;
+		};
+
+		if (!skb) /* keep first skb */
+			skb = ieee80211_get_buffered_bc(hw, vif);
+
+		if (!skb) {
+			/* this slot has no more entries */
+			if (lastbf[slot]) {
+				ath9k_set_moredata(sc, lastbf[slot], false);
+				lastbf[slot] = NULL;
+			}
+			((struct ath_vif *) vif->drv_priv)->multicastWakeup = 0;
+			skippedSlots++;
+			continue;
+		} else {
+			skippedSlots = 0;
+		}
+
+		ath_dbg(common, XMIT, "TX see skb in %s:%d for slot %d skb: %p\n", __func__, __LINE__, slot, skb);
+		fi = get_frame_info(skb);
 
 		if (ath_tx_prepare(hw, skb, &txctl))
 			break;
@@ -2428,6 +2491,8 @@ void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		bf = ath_tx_setup_buffer(sc, txctl.txq, NULL, skb);
 		if (!bf)
 			break;
+
+		lastbf[slot] = bf; // this entry will not be freed until header is unset
 
 		bf->bf_lastbf = bf;
 		ath_set_rates(vif, NULL, bf);
@@ -2441,19 +2506,25 @@ void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		skb = NULL;
 
 		if (duration > max_duration)
+		{
+			ath_dbg(common, XMIT, "TX max_duration %d < duration %d reached\n", max_duration, duration);
 			break;
-
-		skb = ieee80211_get_buffered_bc(hw, vif);
-	} while(skb);
+		} else {
+			ath_dbg(common, XMIT, "TX duration %d < max_duration %d reached\n", duration, max_duration);
+		}
+	};
 
 	if (skb)
+	{
+		ath_dbg(common, XMIT, "TX drop skb in %s:%d: skb: %p\n", __func__, __LINE__, skb);
 		ieee80211_free_txskb(hw, skb);
+		skb = NULL;
+	}
 
 	if (list_empty(&bf_q))
 		return;
 
-	bf = list_last_entry(&bf_q, struct ath_buf, list);
-	ath9k_set_moredata(sc, bf, false);
+	/* do not unset moredata as it will be unset only iff there are not more packets for that bss */
 
 	bf = list_first_entry(&bf_q, struct ath_buf, list);
 	ath_txq_lock(sc, txctl.txq);
@@ -2477,7 +2548,7 @@ static void ath_tx_complete(struct ath_softc *sc, struct sk_buff *skb,
 	int padpos, padsize;
 	unsigned long flags;
 
-	ath_dbg(common, XMIT, "TX complete: skb: %p\n", skb);
+	ath_dbg(common, XMIT, "TX complete: skb: %p error:%d\n", skb, !!(tx_flags & ATH_TX_ERROR));
 
 	if (sc->sc_ah->caldata)
 		set_bit(PAPRD_PACKET_SENT, &sc->sc_ah->caldata->cal_flags);

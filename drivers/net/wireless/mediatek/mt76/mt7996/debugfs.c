@@ -566,6 +566,298 @@ mt7996_tx_stats_show(struct seq_file *file, void *data)
 
 DEFINE_SHOW_ATTRIBUTE(mt7996_tx_stats);
 
+struct mt7996_txo_worker_info {
+	char *buf;
+	int sofar;
+	int size;
+};
+
+static void mt7996_txo_worker(void *wi_data, struct ieee80211_sta *sta)
+{
+	struct mt7996_txo_worker_info *wi = wi_data;
+	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+	struct mt76_testmode_data *td = &msta->test;
+	struct ieee80211_vif *vif;
+	struct wireless_dev *wdev;
+
+	if (wi->sofar >= wi->size)
+		return; /* buffer is full */
+
+	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+	wdev = ieee80211_vif_to_wdev(vif);
+
+	wi->sofar += scnprintf(wi->buf + wi->sofar, wi->size - wi->sofar,
+			       "vdev (%s) active=%d tpc=%d sgi=%d mcs=%d nss=%d"
+			       " pream=%d retries=%d dynbw=%d bw=%d stbc=%d ldpc=%d\n",
+			       wdev->netdev->name,
+			       td->txo_active, td->tx_power[0],
+			       td->tx_rate_sgi, td->tx_rate_idx,
+			       td->tx_rate_nss, td->tx_rate_mode,
+			       td->tx_xmit_count, td->tx_dynbw,
+			       td->txbw, td->tx_rate_stbc, td->tx_rate_ldpc);
+}
+
+static ssize_t mt7996_read_set_rate_override(struct file *file,
+					     char __user *user_buf,
+					     size_t count, loff_t *ppos)
+{
+	struct mt7996_dev *dev = file->private_data;
+	struct ieee80211_hw *hw = dev->mphy.hw;
+	char *buf2;
+	int size = 8000;
+	int rv, sofar;
+	struct mt7996_txo_worker_info wi;
+	const char buf[] =
+		"This allows specify specif tx rate parameters for all DATA"
+		" frames on a vdev\n"
+		"To set a value, you specify the dev-name and key-value pairs:\n"
+		"tpc=10 sgi=1 mcs=x nss=x pream=x retries=x dynbw=0|1 bw=x enable=0|1\n"
+		"pream: 0=cck, 1=ofdm, 2=HT, 3=VHT, 4=HE_SU\n"
+		"cck-mcs: 0=1Mbps, 1=2Mbps, 3=5.5Mbps, 3=11Mbps\n"
+		"ofdm-mcs: 0=6Mbps, 1=9Mbps, 2=12Mbps, 3=18Mbps, 4=24Mbps, 5=36Mbps,"
+		" 6=48Mbps, 7=54Mbps\n"
+		"sgi: HT/VHT: 0 | 1, HE 0: 1xLTF+0.8us, 1: 2xLTF+0.8us, 2: 2xLTF+1.6us, 3: 4xLTF+3.2us, 4: 4xLTF+0.8us\n"
+		"tpc: adjust power from defaults, in 1/2 db units 0 - 31, 16 is default\n"
+		"bw is 0-3 for 20-160\n"
+		"stbc: 0 off, 1 on\n"
+		"ldpc: 0 off, 1 on\n"
+		" For example, wlan0:\n"
+		"echo \"wlan0 tpc=255 sgi=1 mcs=0 nss=1 pream=3 retries=1 dynbw=0 bw=0"
+		" active=1\" > ...mt76/set_rate_override\n";
+
+	buf2 = kzalloc(size, GFP_KERNEL);
+	if (!buf2)
+		return -ENOMEM;
+	strcpy(buf2, buf);
+	sofar = strlen(buf2);
+
+	wi.sofar = sofar;
+	wi.buf = buf2;
+	wi.size = size;
+
+	ieee80211_iterate_stations_atomic(hw, mt7996_txo_worker, &wi);
+
+	rv = simple_read_from_buffer(user_buf, count, ppos, buf2, wi.sofar);
+	kfree(buf2);
+	return rv;
+}
+
+/* Set the rates for specific types of traffic.
+ */
+static ssize_t mt7996_write_set_rate_override(struct file *file,
+					      const char __user *user_buf,
+					      size_t count, loff_t *ppos)
+{
+	struct mt7996_dev *dev = file->private_data;
+	struct mt7996_sta *msta;
+	struct ieee80211_vif *vif;
+	struct mt76_testmode_data *td = NULL;
+	struct wireless_dev *wdev;
+	struct mt76_wcid *wcid;
+	struct mt76_phy *mphy = &dev->mt76.phy;
+	char buf[180];
+	char tmp[20];
+	char *tok;
+	int ret, i, j;
+	unsigned int vdev_id = 0xFFFF;
+	char *bufptr = buf;
+	long rc;
+	char dev_name_match[IFNAMSIZ + 2];
+
+	memset(buf, 0, sizeof(buf));
+
+	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
+
+	/* make sure that buf is null terminated */
+	buf[sizeof(buf) - 1] = 0;
+
+#define MT7996_PARSE_LTOK(a, b)						\
+	do {								\
+		tok = strstr(bufptr, " " #a "=");			\
+		if (tok) {						\
+			char *tspace;					\
+			tok += 1; /* move past initial space */		\
+			strncpy(tmp, tok + strlen(#a "="), sizeof(tmp) - 1); \
+			tmp[sizeof(tmp) - 1] = 0;			\
+			tspace = strstr(tmp, " ");			\
+			if (tspace)					\
+				*tspace = 0;				\
+			if (kstrtol(tmp, 0, &rc) != 0)			\
+				dev_info(dev->mt76.dev,			\
+					 "mt7996: set-rate-override: " #a \
+					 "= could not be parsed, tmp: %s\n", \
+					 tmp);				\
+			else						\
+				td->b = rc;				\
+		}							\
+	} while (0)
+
+	/* drop the possible '\n' from the end */
+	if (buf[count - 1] == '\n')
+		buf[count - 1] = 0;
+
+	mutex_lock(&mphy->dev->mutex);
+
+	/* Ignore empty lines, 'echo' appends them sometimes at least. */
+	if (buf[0] == 0) {
+		ret = count;
+		goto exit;
+	}
+
+	/* String starts with vdev name, ie 'wlan0'  Find the proper vif that
+	 * matches the name.
+	 */
+	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid_mask); i++) {
+		u32 mask = dev->mt76.wcid_mask[i];
+		u32 phy_mask = dev->mt76.wcid_phy_mask[i];
+
+		if (!mask)
+			continue;
+
+		for (j = i * 32; mask; j++, mask >>= 1, phy_mask >>= 1) {
+			if (!(mask & 1))
+				continue;
+
+			rcu_read_lock();
+			wcid = rcu_dereference(dev->mt76.wcid[j]);
+			if (!wcid) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			msta = container_of(wcid, struct mt7996_sta, wcid);
+
+			if (!msta->vif) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+
+			wdev = ieee80211_vif_to_wdev(vif);
+
+			if (!wdev || !wdev->netdev) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			snprintf(dev_name_match, sizeof(dev_name_match) - 1, "%s ",
+				 wdev->netdev->name);
+
+			if (strncmp(dev_name_match, buf, strlen(dev_name_match)) == 0) {
+				vdev_id = j;
+				td = &msta->test;
+				bufptr = buf + strlen(dev_name_match) - 1;
+
+				MT7996_PARSE_LTOK(tpc, tx_power[0]);
+				MT7996_PARSE_LTOK(sgi, tx_rate_sgi);
+				MT7996_PARSE_LTOK(mcs, tx_rate_idx);
+				MT7996_PARSE_LTOK(nss, tx_rate_nss);
+				MT7996_PARSE_LTOK(pream, tx_rate_mode);
+				MT7996_PARSE_LTOK(retries, tx_xmit_count);
+				MT7996_PARSE_LTOK(dynbw, tx_dynbw);
+				MT7996_PARSE_LTOK(bw, txbw);
+				MT7996_PARSE_LTOK(active, txo_active);
+				MT7996_PARSE_LTOK(ldpc, tx_rate_ldpc);
+				MT7996_PARSE_LTOK(stbc, tx_rate_stbc);
+
+				/* To match Intel's API
+				 * HE 0: 1xLTF+0.8us, 1: 2xLTF+0.8us, 2: 2xLTF+1.6us, 3: 4xLTF+3.2us, 4: 4xLTF+0.8us
+				 */
+				if (td->tx_rate_mode >= 4) {
+					if (td->tx_rate_sgi == 0) {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 0;
+					} else if (td->tx_rate_sgi == 1) {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 1;
+					} else if (td->tx_rate_sgi == 2) {
+						td->tx_rate_sgi = 1;
+						td->tx_ltf = 1;
+					} else if (td->tx_rate_sgi == 3) {
+						td->tx_rate_sgi = 2;
+						td->tx_ltf = 2;
+					}
+					else {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 2;
+					}
+				}
+				//td->tx_ltf = 1; /* 0: HTLTF 3.2us, 1: HELTF, 6.4us, 2 HELTF 12,8us */
+
+				dev_info(dev->mt76.dev,
+					 "mt7996: set-rate-overrides, vdev %i(%s) active=%d tpc=%d sgi=%d ltf=%d mcs=%d"
+					 " nss=%d pream=%d retries=%d dynbw=%d bw=%d ldpc=%d stbc=%d\n",
+					 vdev_id, dev_name_match,
+					 td->txo_active, td->tx_power[0], td->tx_rate_sgi, td->tx_ltf, td->tx_rate_idx,
+					 td->tx_rate_nss, td->tx_rate_mode, td->tx_xmit_count, td->tx_dynbw,
+					 td->txbw, td->tx_rate_ldpc, td->tx_rate_stbc);
+			}
+
+			rcu_read_unlock();
+		}
+	}
+
+	if (vdev_id == 0xFFFF) {
+		if (strstr(buf, "active=0")) {
+			/* Ignore, we are disabling it anyway */
+			ret = count;
+			goto exit;
+		} else {
+			dev_info(dev->mt76.dev,
+				 "mt7996: set-rate-override, unknown netdev name: %s\n", buf);
+		}
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	ret = count;
+
+exit:
+	mutex_unlock(&mphy->dev->mutex);
+	return ret;
+}
+
+static const struct file_operations fops_set_rate_override = {
+	.read = mt7996_read_set_rate_override,
+	.write = mt7996_write_set_rate_override,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static int
+mt7996_rx_group_5_enable_set(void *data, u64 val)
+{
+	struct mt7996_dev *dev = data;
+
+	mutex_lock(&dev->mt76.mutex);
+
+	dev->rx_group_5_enable = !!val;
+
+	/* Enabled if we requested enabled OR if monitor mode is enabled. */
+	mt76_rmw_field(dev, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN,
+		       dev->rx_group_5_enable);
+	mt76_testmode_reset(dev->phy.mt76, true);
+
+	mutex_unlock(&dev->mt76.mutex);
+
+	return 0;
+}
+
+static int
+mt7996_rx_group_5_enable_get(void *data, u64 *val)
+{
+	struct mt7996_dev *dev = data;
+
+	*val = dev->rx_group_5_enable;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_rx_group_5_enable, mt7996_rx_group_5_enable_get,
+			 mt7996_rx_group_5_enable_set, "%lld\n");
+
 static void
 mt7996_hw_queue_read(struct seq_file *s, u32 size,
 		     const struct hw_queue_map *map)
@@ -785,6 +1077,501 @@ mt7996_rf_regval_set(void *data, u64 val)
 DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7996_rf_regval_get,
 			 mt7996_rf_regval_set, "0x%08llx\n");
 
+static int
+mt7996_txpower_level_set(void *data, u64 val)
+{
+	struct mt7996_phy *phy = data;
+	int ret;
+
+	if (val > 100)
+		return -EINVAL;
+
+	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_PERCENTAGE_CTRL, !!val);
+	if (ret)
+		return ret;
+
+	return mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_PERCENTAGE_DROP_CTRL, val);
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_txpower_level, NULL,
+			 mt7996_txpower_level_set, "%lld\n");
+
+static ssize_t
+mt7996_get_txpower_info(struct file *file, char __user *user_buf,
+			size_t count, loff_t *ppos)
+{
+	struct mt7996_phy *phy = file->private_data;
+	struct mt7996_mcu_txpower_event *event;
+	struct txpower_basic_info *basic_info;
+	struct mt76_phy *mphy = phy->mt76;
+	struct ieee80211_hw *hw = mphy->hw;
+	static const size_t size = 2048;
+	int len = 0;
+	ssize_t ret;
+	char *buf;
+	s8 single_nss_txpower;
+
+	buf = kzalloc(size, GFP_KERNEL);
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!buf || !event) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mt7996_mcu_get_tx_power_info(phy, BASIC_INFO, event);
+	if (ret ||
+	    le32_to_cpu(event->basic_info.category) != UNI_TXPOWER_BASIC_INFO)
+		goto out;
+
+	basic_info = &event->basic_info;
+
+	len += scnprintf(buf + len, size - len,
+			 "======================== BASIC INFO ========================\n");
+	len += scnprintf(buf + len, size - len, "    Band Index: %d, Channel Band: %d\n",
+			 basic_info->band_idx, basic_info->band);
+	len += scnprintf(buf + len, size - len, "    PA Type: %s\n",
+			 basic_info->is_epa ? "ePA" : "iPA");
+	len += scnprintf(buf + len, size - len, "    LNA Type: %s\n",
+			 basic_info->is_elna ? "eLNA" : "iLNA");
+
+	len += scnprintf(buf + len, size - len,
+			 "------------------------------------------------------------\n");
+	len += scnprintf(buf + len, size - len, "    SKU: %s\n",
+			 basic_info->sku_enable ? "enable" : "disable");
+	len += scnprintf(buf + len, size - len, "    Percentage Control: %s\n",
+			 basic_info->percentage_ctrl_enable ? "enable" : "disable");
+	len += scnprintf(buf + len, size - len, "    Power Drop: %d [dBm]\n",
+			 basic_info->power_drop_level >> 1);
+	len += scnprintf(buf + len, size - len, "    Backoff: %s\n",
+			 basic_info->bf_backoff_enable ? "enable" : "disable");
+	len += scnprintf(buf + len, size - len, "    TX Front-end Loss:  %d, %d, %d, %d\n",
+			 basic_info->front_end_loss_tx[0], basic_info->front_end_loss_tx[1],
+			 basic_info->front_end_loss_tx[2], basic_info->front_end_loss_tx[3]);
+	len += scnprintf(buf + len, size - len, "    RX Front-end Loss:  %d, %d, %d, %d\n",
+			 basic_info->front_end_loss_rx[0], basic_info->front_end_loss_rx[1],
+			 basic_info->front_end_loss_rx[2], basic_info->front_end_loss_rx[3]);
+	len += scnprintf(buf + len, size - len,
+			 "    MU TX Power Mode:  %s\n",
+			 basic_info->mu_tx_power_manual_enable ? "manual" : "auto");
+	len += scnprintf(buf + len, size - len,
+			 "    MU TX Power (Auto / Manual): %d / %d [0.5 dBm]\n",
+			 basic_info->mu_tx_power_auto, basic_info->mu_tx_power_manual);
+	len += scnprintf(buf + len, size - len,
+			 "    Thermal Compensation:  %s\n",
+			 basic_info->thermal_compensate_enable ? "enable" : "disable");
+	len += scnprintf(buf + len, size - len,
+			 "    Thermal Compensation Value: %d\n",
+			 basic_info->thermal_compensate_value);
+
+	len += scnprintf(buf + len, size - len,
+			 "    PHY Power Bound: %d\n",
+			 mt7996_get_power_bound(phy, hw->conf.power_level, &single_nss_txpower));
+	len += scnprintf(buf + len, size - len,
+			 "    HW Conf Power Level: %d\n",
+			 hw->conf.power_level);
+	len += scnprintf(buf + len, size - len,
+			 "    Per-Chain TX-Power Cur: %d 1/2dB\n",
+			 mphy->txpower_cur);
+	len += scnprintf(buf + len, size - len,
+			 "    PHY tx-front-end-loss: %d\n",
+			 phy->tx_front_end_loss);
+	len += scnprintf(buf + len, size - len,
+			 "    PHY tx-front-end-loss-acquired: %d\n",
+			 phy->tx_front_end_loss_acquired);
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+
+out:
+	kfree(buf);
+	kfree(event);
+	return ret;
+}
+
+static const struct file_operations mt7996_txpower_info_fops = {
+	.read = mt7996_get_txpower_info,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+#define mt7996_txpower_puts(rate)							\
+({											\
+	len += scnprintf(buf + len, size - len, "%-21s:", #rate " (TMAC)");		\
+	for (i = 0; i < mt7996_sku_group_len[SKU_##rate]; i++, offs++)			\
+		len += scnprintf(buf + len, size - len, " %6d",				\
+				 event->phy_rate_info.frame_power[offs][band_idx]);	\
+	len += scnprintf(buf + len, size - len, "\n");					\
+})
+
+static ssize_t
+__mt7996_get_txpower_sku(struct file *file, char __user *user_buf,
+			 size_t count, loff_t *ppos, struct mt7996_mcu_txpower_event *event,
+			 char* buf, size_t size)
+{
+	struct mt7996_phy *phy = file->private_data;
+	struct mt7996_dev *dev = phy->dev;
+	u8 band_idx = phy->mt76->band_idx;
+	int i, offs = 0, len = 0;
+	ssize_t ret;
+	u32 reg;
+
+	len += scnprintf(buf + len, size - len,
+			 "\nPhy %d TX Power Table (Channel %d)\n",
+			 band_idx, phy->mt76->chandef.chan->hw_value);
+	len += scnprintf(buf + len, size - len, "%-21s  %6s %6s %6s %6s\n",
+			 " ", "1m", "2m", "5m", "11m");
+	mt7996_txpower_puts(CCK);
+
+	len += scnprintf(buf + len, size - len,
+			 "%-21s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 " ", "6m", "9m", "12m", "18m", "24m", "36m", "48m",
+			 "54m");
+	mt7996_txpower_puts(OFDM);
+
+	len += scnprintf(buf + len, size - len,
+			 "%-21s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4",
+			 "mcs5", "mcs6", "mcs7");
+	mt7996_txpower_puts(HT20);
+
+	len += scnprintf(buf + len, size - len,
+			 "%-21s  %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4", "mcs5",
+			 "mcs6", "mcs7", "mcs32");
+	mt7996_txpower_puts(HT40);
+
+	len += scnprintf(buf + len, size - len,
+			 "%-21s  %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4", "mcs5",
+			 "mcs6", "mcs7", "mcs8", "mcs9", "mcs10", "mcs11");
+	mt7996_txpower_puts(VHT20);
+	mt7996_txpower_puts(VHT40);
+	mt7996_txpower_puts(VHT80);
+	mt7996_txpower_puts(VHT160);
+	mt7996_txpower_puts(HE26);
+	mt7996_txpower_puts(HE52);
+	mt7996_txpower_puts(HE106);
+	mt7996_txpower_puts(HE242);
+	mt7996_txpower_puts(HE484);
+	mt7996_txpower_puts(HE996);
+	mt7996_txpower_puts(HE2x996);
+
+	len += scnprintf(buf + len, size - len,
+			 "%-21s  %6s %6s %6s %6s %6s %6s %6s %6s ",
+			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4", "mcs5", "mcs6", "mcs7");
+	len += scnprintf(buf + len, size - len,
+			 "%6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 "mcs8", "mcs9", "mcs10", "mcs11", "mcs12", "mcs13", "mcs14", "mcs15");
+	mt7996_txpower_puts(EHT26);
+	mt7996_txpower_puts(EHT52);
+	mt7996_txpower_puts(EHT106);
+	mt7996_txpower_puts(EHT242);
+	mt7996_txpower_puts(EHT484);
+	mt7996_txpower_puts(EHT996);
+	mt7996_txpower_puts(EHT2x996);
+	mt7996_txpower_puts(EHT4x996);
+	mt7996_txpower_puts(EHT26_52);
+	mt7996_txpower_puts(EHT26_106);
+	mt7996_txpower_puts(EHT484_242);
+	mt7996_txpower_puts(EHT996_484);
+	mt7996_txpower_puts(EHT996_484_242);
+	mt7996_txpower_puts(EHT2x996_484);
+	mt7996_txpower_puts(EHT3x996);
+	mt7996_txpower_puts(EHT3x996_484);
+
+	len += scnprintf(buf + len, size - len, "\nePA Gain: %d\n",
+			 event->phy_rate_info.epa_gain);
+	len += scnprintf(buf + len, size - len, "Max Power Bound: %d\n",
+			 event->phy_rate_info.max_power_bound);
+	len += scnprintf(buf + len, size - len, "Min Power Bound: %d\n",
+			 event->phy_rate_info.min_power_bound);
+
+	reg = MT_WF_PHYDFE_BAND_TPC_CTRL_STAT0(band_idx);
+	len += scnprintf(buf + len, size - len,
+			 "BBP TX Power (target power from TMAC)  : %6ld [0.5 dBm]\n",
+			 mt76_get_field(dev, reg, MT_WF_PHY_TPC_POWER_TMAC));
+	len += scnprintf(buf + len, size - len,
+			 "BBP TX Power (target power from RMAC)  : %6ld [0.5 dBm]\n",
+			 mt76_get_field(dev, reg, MT_WF_PHY_TPC_POWER_RMAC));
+	len += scnprintf(buf + len, size - len,
+			 "BBP TX Power (TSSI module power input)  : %6ld [0.5 dBm]\n",
+			 mt76_get_field(dev, reg, MT_WF_PHY_TPC_POWER_TSSI));
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+
+	return ret;
+}
+
+static ssize_t
+mt7996_get_txpower_sku(struct file *file, char __user *user_buf,
+		       size_t count, loff_t *ppos)
+{
+	struct mt7996_phy *phy = file->private_data;
+	struct mt7996_mcu_txpower_event *event;
+	static const size_t size = 5120;
+	char *buf;
+	int ret;
+
+	buf = kzalloc(size, GFP_KERNEL);
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!buf || !event) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mt7996_mcu_get_tx_power_info(phy, PHY_RATE_INFO, event);
+	if (ret ||
+	    le32_to_cpu(event->phy_rate_info.category) != UNI_TXPOWER_PHY_RATE_INFO)
+		goto out;
+
+	ret = __mt7996_get_txpower_sku(file, user_buf, count, ppos, event, buf, size);
+
+out:
+	kfree(buf);
+	kfree(event);
+
+	return ret;
+}
+
+static const struct file_operations mt7996_txpower_sku_fops = {
+	.read = mt7996_get_txpower_sku,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static ssize_t
+mt7996_get_txpower_default(struct file *file, char __user *user_buf,
+			   size_t count, loff_t *ppos)
+{
+	struct mt7996_phy *phy = file->private_data;
+	static const size_t size = 5120;
+	char *buf;
+	int ret;
+	int len = 0;
+
+	buf = kzalloc(size, GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (phy->default_txpower) {
+		ret = __mt7996_get_txpower_sku(file, user_buf, count, ppos, phy->default_txpower, buf, size);
+	}
+	else {
+		len += scnprintf(buf + len, size - len, "ERROR:  default_txpower is NULL\n");
+		ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+	}
+
+out:
+	kfree(buf);
+
+	return ret;
+}
+
+static const struct file_operations mt7996_txpower_default_fops = {
+	.read = mt7996_get_txpower_default,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+#define mt7996_txpower_path_puts(rate, arr_length)					\
+({											\
+	len += scnprintf(buf + len, size - len, "%-23s:", #rate " (TMAC)");		\
+	for (i = 0; i < arr_length; i++, offs++)					\
+		len += scnprintf(buf + len, size - len, " %4d",				\
+				 event->backoff_table_info.frame_power[offs]);		\
+	len += scnprintf(buf + len, size - len, "\n");					\
+})
+
+static ssize_t
+mt7996_get_txpower_path(struct file *file, char __user *user_buf,
+		       size_t count, loff_t *ppos)
+{
+	struct mt7996_phy *phy = file->private_data;
+	struct mt7996_mcu_txpower_event *event;
+	static const size_t size = 5120;
+	int i, offs = 0, len = 0;
+	ssize_t ret;
+	char *buf;
+
+	buf = kzalloc(size, GFP_KERNEL);
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!buf || !event) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mt7996_mcu_get_tx_power_info(phy, BACKOFF_TABLE_INFO, event);
+	if (ret ||
+	    le32_to_cpu(event->phy_rate_info.category) != UNI_TXPOWER_BACKOFF_TABLE_SHOW_INFO)
+		goto out;
+
+	len += scnprintf(buf + len, size - len, "\n%*c", 25, ' ');
+	len += scnprintf(buf + len, size - len, "1T1S/2T1S/3T1S/4T1S/5T1S/2T2S/3T2S/4T2S/5T2S/"
+			 "3T3S/4T3S/5T3S/4T4S/5T4S/5T5S\n");
+
+	mt7996_txpower_path_puts(CCK, 5);
+	mt7996_txpower_path_puts(OFDM, 5);
+	mt7996_txpower_path_puts(BF-OFDM, 4);
+
+	mt7996_txpower_path_puts(RU26, 15);
+	mt7996_txpower_path_puts(BF-RU26, 15);
+	mt7996_txpower_path_puts(RU52, 15);
+	mt7996_txpower_path_puts(BF-RU52, 15);
+	mt7996_txpower_path_puts(RU26_52, 15);
+	mt7996_txpower_path_puts(BF-RU26_52, 15);
+	mt7996_txpower_path_puts(RU106, 15);
+	mt7996_txpower_path_puts(BF-RU106, 15);
+	mt7996_txpower_path_puts(RU106_52, 15);
+	mt7996_txpower_path_puts(BF-RU106_52, 15);
+
+	mt7996_txpower_path_puts(BW20/RU242, 15);
+	mt7996_txpower_path_puts(BF-BW20/RU242, 15);
+	mt7996_txpower_path_puts(BW40/RU484, 15);
+	mt7996_txpower_path_puts(BF-BW40/RU484, 15);
+	mt7996_txpower_path_puts(RU242_484, 15);
+	mt7996_txpower_path_puts(BF-RU242_484, 15);
+	mt7996_txpower_path_puts(BW80/RU996, 15);
+	mt7996_txpower_path_puts(BF-BW80/RU996, 15);
+	mt7996_txpower_path_puts(RU484_996, 15);
+	mt7996_txpower_path_puts(BF-RU484_996, 15);
+	mt7996_txpower_path_puts(RU242_484_996, 15);
+	mt7996_txpower_path_puts(BF-RU242_484_996, 15);
+	mt7996_txpower_path_puts(BW160/RU996x2, 15);
+	mt7996_txpower_path_puts(BF-BW160/RU996x2, 15);
+	mt7996_txpower_path_puts(RU484_996x2, 15);
+	mt7996_txpower_path_puts(BF-RU484_996x2, 15);
+	mt7996_txpower_path_puts(RU996x3, 15);
+	mt7996_txpower_path_puts(BF-RU996x3, 15);
+	mt7996_txpower_path_puts(RU484_996x3, 15);
+	mt7996_txpower_path_puts(BF-RU484_996x3, 15);
+	mt7996_txpower_path_puts(BW320/RU996x4, 15);
+	mt7996_txpower_path_puts(BF-BW320/RU996x4, 15);
+
+	len += scnprintf(buf + len, size - len, "\nBackoff table: %s\n",
+			 event->backoff_table_info.backoff_en ? "enable" : "disable");
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+
+out:
+	kfree(buf);
+	kfree(event);
+	return ret;
+}
+
+static const struct file_operations mt7996_txpower_path_fops = {
+	.read = mt7996_get_txpower_path,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+
+static int
+mt7996_sr_enable_get(void *data, u64 *val)
+{
+	struct mt7996_phy *phy = data;
+
+	*val = phy->sr_enable;
+
+	return 0;
+}
+
+static int
+mt7996_sr_enable_set(void *data, u64 val)
+{
+	struct mt7996_phy *phy = data;
+	int ret;
+
+	if (!!val == phy->sr_enable)
+		return 0;
+
+	ret = mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_CFG_SR_ENABLE, val, true);
+	if (ret)
+		return ret;
+
+	return mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_CFG_SR_ENABLE, 0, false);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(fops_sr_enable, mt7996_sr_enable_get,
+			 mt7996_sr_enable_set, "%lld\n");
+
+static int
+mt7996_adjust_txp_by_loss_get(void *data, u64 *val)
+{
+	struct mt7996_phy *phy = data;
+
+	*val = phy->adjust_txp_by_loss;
+
+	return 0;
+}
+
+static int
+mt7996_adjust_txp_by_loss_set(void *data, u64 val)
+{
+	struct mt7996_phy *phy = data;
+
+	if (!!val == phy->adjust_txp_by_loss)
+		return 0;
+
+	phy->adjust_txp_by_loss = val;
+	return mt7996_mcu_set_txpower_sku(phy);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(fops_adjust_txp_by_loss, mt7996_adjust_txp_by_loss_get,
+			 mt7996_adjust_txp_by_loss_set, "%lld\n");
+
+static int
+mt7996_sr_enhanced_enable_get(void *data, u64 *val)
+{
+	struct mt7996_phy *phy = data;
+
+	*val = phy->enhanced_sr_enable;
+
+	return 0;
+}
+
+static int
+mt7996_sr_enhanced_enable_set(void *data, u64 val)
+{
+	struct mt7996_phy *phy = data;
+	int ret;
+
+	if (!!val == phy->enhanced_sr_enable)
+		return 0;
+
+	ret = mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_HW_ENHANCE_SR_ENABLE, val, true);
+	if (ret)
+		return ret;
+
+	return mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_HW_ENHANCE_SR_ENABLE, 0, false);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(fops_sr_enhanced_enable, mt7996_sr_enhanced_enable_get,
+			 mt7996_sr_enhanced_enable_set, "%lld\n");
+
+static int
+mt7996_sr_stats_show(struct seq_file *file, void *data)
+{
+	struct mt7996_phy *phy = file->private;
+
+	mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_HW_IND, 0, false);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mt7996_sr_stats);
+
+static int
+mt7996_sr_scene_cond_show(struct seq_file *file, void *data)
+{
+	struct mt7996_phy *phy = file->private;
+
+	mt7996_mcu_set_sr_enable(phy, UNI_CMD_SR_SW_SD, 0, false);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mt7996_sr_scene_cond);
+
 int mt7996_init_debugfs(struct mt7996_phy *phy)
 {
 	struct mt7996_dev *dev = phy->dev;
@@ -806,11 +1593,28 @@ int mt7996_init_debugfs(struct mt7996_phy *phy)
 	/* TODO: wm fw cpu utilization */
 	debugfs_create_file("fw_util_wa", 0400, dir, dev,
 			    &mt7996_fw_util_wa_fops);
+	debugfs_create_file("rx_group_5_enable", 0600, dir, dev, &fops_rx_group_5_enable);
 	debugfs_create_file("implicit_txbf", 0600, dir, dev,
 			    &fops_implicit_txbf);
 	debugfs_create_devm_seqfile(dev->mt76.dev, "twt_stats", dir,
 				    mt7996_twt_stats);
 	debugfs_create_file("rf_regval", 0600, dir, dev, &fops_rf_regval);
+	debugfs_create_u32("ignore_radar", 0600, dir,
+			   &dev->ignore_radar);
+	debugfs_create_file("set_rate_override", 0600, dir,
+			    dev, &fops_set_rate_override);
+	debugfs_create_file("txpower_level", 0600, dir, phy, &fops_txpower_level);
+	debugfs_create_file("txpower_info", 0600, dir, phy, &mt7996_txpower_info_fops);
+	debugfs_create_file("txpower_sku", 0600, dir, phy, &mt7996_txpower_sku_fops);
+	debugfs_create_file("txpower_default", 0600, dir, phy, &mt7996_txpower_default_fops);
+	debugfs_create_file("txpower_path", 0600, dir, phy, &mt7996_txpower_path_fops);
+	debugfs_create_file("adjust_txp_by_loss", 0600, dir, phy, &fops_adjust_txp_by_loss);
+
+	debugfs_create_file("sr_enable", 0600, dir, phy, &fops_sr_enable);
+	debugfs_create_file("sr_enhanced_enable", 0600, dir, phy, &fops_sr_enhanced_enable);
+	debugfs_create_file("sr_stats", 0400, dir, phy, &mt7996_sr_stats_fops);
+	debugfs_create_file("sr_scene_cond", 0400, dir, phy, &mt7996_sr_scene_cond_fops);
+	debugfs_create_bool("mgmt_pwr_enhance", 0600, dir, &dev->mt76.mgmt_pwr_enhance);
 
 	if (phy->mt76->cap.has_5ghz) {
 		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
@@ -973,5 +1777,4 @@ void mt7996_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	debugfs_create_file("fixed_rate", 0600, dir, sta, &fops_fixed_rate);
 	debugfs_create_file("hw-queues", 0400, dir, sta, &mt7996_queues_fops);
 }
-
 #endif

@@ -5,6 +5,7 @@
 #define __MT7915_H
 
 #include <linux/interrupt.h>
+#include <linux/firmware.h>
 #include <linux/ktime.h>
 #include "../mt76_connac.h"
 #include "regs.h"
@@ -25,6 +26,8 @@
 
 #define MT7915_RX_RING_SIZE		1536
 #define MT7915_RX_MCU_RING_SIZE		512
+
+#define MT7915_FIRMWARE_BD		"mediatek"
 
 #define MT7915_FIRMWARE_WA		"mediatek/mt7915_wa.bin"
 #define MT7915_FIRMWARE_WM		"mediatek/mt7915_wm.bin"
@@ -146,6 +149,8 @@ struct mt7915_sta {
 	unsigned long jiffies;
 	struct mt76_connac_sta_key_conf bip;
 
+	struct mt76_testmode_data test;
+
 	struct {
 		u8 flowid_mask;
 		struct mt7915_twt_flow flow[MT7915_MAX_STA_TWT_AGRT];
@@ -200,8 +205,17 @@ struct mt7915_phy {
 	struct ieee80211_sband_iftype_data iftype[NUM_NL80211_BANDS][NUM_NL80211_IFTYPES];
 
 	struct ieee80211_vif *monitor_vif;
+	u16 monitor_cur_aid; /* aid to be used in monitor mode to capture HE trigger frames */
+	/* bss-color to be used in monitor mode to capture HE trigger frames */
+	u8 monitor_cur_color;
+	/* upload/download to be used in monitor mode to capture HE trigger frames */
+	u8 monitor_cur_uldl;
+	/* Specifies which of the above are used:  0x1 is AID, 0x2 is color, 0x3 is uldl */
+	u8 monitor_cur_enables;
 
 	struct thermal_cooling_device *cdev;
+	u32 mac80211_rxfilter_flags;
+	u8 monitor_enabled;
 	u8 cdev_state;
 	u8 throttle_state;
 	u32 throttle_temp[2]; /* 0: critical high, 1: maximum */
@@ -262,6 +276,11 @@ struct mt7915_dev {
 	u16 chainshift;
 	u32 hif_idx;
 
+	/* Should we enable group-5 rx descriptor logic?  This may decrease RX
+	 * throughput, but will give per skb rx rate information..
+	 */
+	bool rx_group_5_enable;
+
 	struct work_struct init_work;
 	struct work_struct rc_work;
 	struct work_struct dump_work;
@@ -277,6 +296,10 @@ struct mt7915_dev {
 		bool restart:1;
 	} recovery;
 
+	struct {
+		u8 muru_onoff;
+	} dbg;
+
 	/* protects coredump data */
 	struct mutex dump_mutex;
 #ifdef CONFIG_DEV_COREDUMP
@@ -290,6 +313,7 @@ struct mt7915_dev {
 	spinlock_t reg_lock;
 
 	u32 hw_pattern;
+	u32 ignore_radar; /* skip propagating up the stack, for debugging */
 
 	bool dbdc_support;
 	bool flash_mode;
@@ -306,6 +330,13 @@ struct mt7915_dev {
 	u8 dpd_chan_num_2g;
 	u8 dpd_chan_num_5g;
 	u8 dpd_chan_num_6g;
+
+	struct {
+#define MT7915_FWCFG_HIGH_BAND	BIT(1)
+
+		u32 flags; /* let us know which fields have been set */
+		u32 high_band;	/* sets upper-band to use ('5' or '6', 0 means no change (5 + 6))GHz */
+	} fwcfg;
 
 	struct {
 		u8 debug_wm;
@@ -590,6 +621,7 @@ int mt7915_mcu_muru_debug_set(struct mt7915_dev *dev, bool enable);
 int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy);
 int mt7915_mcu_wed_enable_rx_stats(struct mt7915_dev *dev);
 int mt7915_init_debugfs(struct mt7915_phy *phy);
+void mt7915_check_apply_monitor_config(struct mt7915_phy *phy);
 void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int len);
 bool mt7915_debugfs_rx_log(struct mt7915_dev *dev, const void *data, int len);
 #ifdef CONFIG_MAC80211_DEBUGFS

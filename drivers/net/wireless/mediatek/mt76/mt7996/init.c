@@ -14,6 +14,9 @@
 #include "coredump.h"
 #include "eeprom.h"
 
+#define MT76_DRIVER_VERSION "6.10.0-ct"
+extern u32 debug_lvl; /* module param */
+
 static const struct ieee80211_iface_limit if_limits[] = {
 	{
 		.max = 1,
@@ -42,6 +45,7 @@ static const struct ieee80211_iface_combination if_comb[] = {
 				       BIT(NL80211_CHAN_WIDTH_40) |
 				       BIT(NL80211_CHAN_WIDTH_80) |
 				       BIT(NL80211_CHAN_WIDTH_160),
+		.beacon_int_min_gcd = 100,
 	}
 };
 
@@ -296,6 +300,12 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
 	int nss_delta = mt76_tx_power_nss_delta(nss);
 	int pwr_delta = mt7996_eeprom_get_power_delta(dev, sband->band);
 	struct mt76_power_limits limits;
+	struct mt76_power_path_limits limits_path;
+	struct device_node *np;
+
+	phy->sku_limit_en = true;
+	phy->sku_path_en = false;
+	np = mt76_find_power_limits_node(&dev->mt76);
 
 	for (i = 0; i < sband->n_channels; i++) {
 		struct ieee80211_channel *chan = &sband->channels[i];
@@ -304,12 +314,18 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
 		target_power += pwr_delta;
 		target_power = mt76_get_rate_power_limits(phy->mt76, chan,
 							  &limits,
+							  &limits_path,
 							  target_power);
+		if (limits_path.ofdm[0])
+			phy->sku_path_en = true;
+
 		target_power += nss_delta;
 		target_power = DIV_ROUND_UP(target_power, 2);
-		chan->max_power = min_t(int, chan->max_reg_power,
-					target_power);
-		chan->orig_mpwr = target_power;
+		if (!np)
+			chan->max_power = min_t(int, chan->max_reg_power,
+						target_power);
+		else
+			chan->orig_mpwr = target_power;
 	}
 }
 
@@ -356,8 +372,10 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
 						IEEE80211_MAX_AMPDU_BUF_HE;
 
 	hw->queues = 4;
+	hw->max_report_rates = 1;
 	hw->max_rx_aggregation_subframes = max_subframes;
 	hw->max_tx_aggregation_subframes = max_subframes;
+	//hw->netdev_features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
 	hw->netdev_features = NETIF_F_RXCSUM;
 	if (mtk_wed_device_active(wed))
 		hw->netdev_features |= NETIF_F_HW_TC;
@@ -388,7 +406,10 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_PUNCT);
 
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_OPERATING_CHANNEL_VALIDATION);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_BEACON_PROTECTION);
 	if (!mdev->dev->of_node ||
 	    !of_property_read_bool(mdev->dev->of_node,
 				   "mediatek,disable-radar-background"))
@@ -400,6 +421,7 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
 	ieee80211_hw_set(hw, SUPPORTS_RX_DECAP_OFFLOAD);
 	ieee80211_hw_set(hw, WANT_MONITOR_VIF);
 	ieee80211_hw_set(hw, SUPPORTS_MULTI_BSSID);
+	ieee80211_hw_set(hw, SPECTRUM_MGMT);
 
 	hw->max_tx_fragments = 4;
 
@@ -470,6 +492,12 @@ mt7996_mac_init_band(struct mt7996_dev *dev, u8 band)
 	      FIELD_PREP(MT_WTBLOFF_RSCR_RCPI_PARAM, 0x3);
 	mt76_rmw(dev, MT_WTBLOFF_RSCR(band), mask, set);
 
+	/* mt7996: disable rx rate report by default due to hw issues
+	 * TODO:  Verify 7996 needs this disabled by default?
+	 */
+	mt76_rmw_field(dev, MT_DMA_DCR0(band), MT_DMA_DCR0_RXD_G5_EN,
+		       dev->rx_group_5_enable);
+
 	/* MT_TXD5_TX_STATUS_HOST (MPDU format) has higher priority than
 	 * MT_AGG_ACR_PPDU_TXS2H (PPDU format) even though ACR bit is set.
 	 */
@@ -497,6 +525,7 @@ void mt7996_mac_init(struct mt7996_dev *dev)
 	int i;
 
 	mt76_clear(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
+	//mt76_wr(dev, MT_MDP_TX_CTRL, 0xF0001); /* enable tx csum offload */
 
 	for (i = 0; i < mt7996_wtbl_size(dev); i++)
 		mt7996_mac_wtbl_update(dev, i,
@@ -883,6 +912,71 @@ out:
 #endif
 }
 
+int mt7996_get_chip_sku(struct mt7996_dev *dev)
+{
+#define MT7976C_CHIP_VER	0x8a10
+#define MT7976C_HL_CHIP_VER	0x8b00
+#define MT7976C_PS_CHIP_VER	0x8c10
+#define MT7976C_EFUSE_OFFSET	0x470
+#define MT7976C_EFUSE_VALUE	0xc
+	u32 regval, val = mt76_rr(dev, MT_PAD_GPIO);
+	u16 adie_chip_id, adie_chip_ver;
+	u8 adie_comb, adie_num, adie_idx = 0;
+
+	switch (mt76_chip(&dev->mt76)) {
+	case 0x7990:
+		if (FIELD_GET(MT_PAD_GPIO_2ADIE_TBTC, val)) {
+			dev->chip_sku = MT7996_SKU_233;
+			dev->fem_type = MT7996_FEM_INT;
+			return 0;
+		}
+
+		adie_comb = FIELD_GET(MT_PAD_GPIO_ADIE_COMB, val);
+		if (adie_comb <= 1)
+			dev->chip_sku = MT7996_SKU_444;
+		else
+			dev->chip_sku = MT7996_SKU_404;
+		break;
+	case 0x7992:
+		adie_comb = FIELD_GET(MT_PAD_GPIO_ADIE_COMB_7992, val);
+		adie_num = FIELD_GET(MT_PAD_GPIO_ADIE_NUM_7992, val);
+		adie_idx = !adie_num;
+		if (adie_num)
+			dev->chip_sku = MT7992_SKU_23;
+		else if (adie_comb)
+			dev->chip_sku = MT7992_SKU_44;
+		else
+			dev->chip_sku = MT7992_SKU_24;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state)) {
+		u8 buf[MT7996_EEPROM_BLOCK_SIZE];
+		u8 idx = MT7976C_EFUSE_OFFSET % MT7996_EEPROM_BLOCK_SIZE;
+		bool is_7976c;
+
+		mt7996_mcu_rf_regval(dev, MT_ADIE_CHIP_ID(adie_idx), &regval, false);
+		adie_chip_id = FIELD_GET(MT_ADIE_CHIP_ID_MASK, regval);
+		adie_chip_ver = FIELD_GET(MT_ADIE_VERSION_MASK, regval);
+		mt7996_mcu_get_eeprom(dev, MT7976C_EFUSE_OFFSET, buf);
+		is_7976c = (adie_chip_ver == MT7976C_CHIP_VER) ||
+			   (adie_chip_ver == MT7976C_HL_CHIP_VER) ||
+			   (adie_chip_ver == MT7976C_PS_CHIP_VER) ||
+			   (buf[idx] == MT7976C_EFUSE_VALUE);
+		if (adie_chip_id == 0x7975 || (adie_chip_id == 0x7976 && is_7976c) ||
+		    adie_chip_id == 0x7979)
+			dev->fem_type = MT7996_FEM_INT;
+		else if (adie_chip_id == 0x7977 && adie_comb == 1)
+			dev->fem_type = MT7996_FEM_MIX;
+		else
+			dev->fem_type = MT7996_FEM_EXT;
+	}
+
+	return 0;
+}
+
 static int mt7996_init_hardware(struct mt7996_dev *dev)
 {
 	int ret, idx;
@@ -898,11 +992,22 @@ static int mt7996_init_hardware(struct mt7996_dev *dev)
 	INIT_LIST_HEAD(&dev->wed_rro.poll_list);
 	spin_lock_init(&dev->wed_rro.lock);
 
+	ret = mt7996_get_chip_sku(dev);
+	if (ret)
+		return ret;
+
+	dev_info(dev->mt76.dev, "mt7996:  chip: 0x%x sku: %d fem-type: %d\n",
+		 mt76_chip(&dev->mt76), dev->chip_sku, dev->fem_type);
+
 	ret = mt7996_dma_init(dev);
 	if (ret)
 		return ret;
 
 	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+
+	ret = mt7996_eeprom_check_fw_mode(dev);
+	if (ret < 0)
+		return ret;
 
 	ret = mt7996_mcu_init(dev);
 	if (ret)
@@ -941,8 +1046,12 @@ void mt7996_set_stream_vht_txbf_caps(struct mt7996_phy *phy)
 	cap = &phy->mt76->sband_5g.sband.vht_cap.cap;
 
 	*cap |= IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
-		IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE |
-		FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, sts - 1);
+		IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE;
+
+	if (is_mt7996(phy->mt76->dev))
+		*cap |= FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, 3);
+	else
+		*cap |= FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, 4);
 
 	*cap &= ~(IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK |
 		  IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
@@ -987,9 +1096,15 @@ mt7996_set_stream_he_txbf_caps(struct mt7996_phy *phy,
 	    IEEE80211_HE_PHY_CAP2_UL_MU_PARTIAL_MU_MIMO;
 	elem->phy_cap_info[2] |= c;
 
-	c = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
-	    IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_4 |
-	    IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4;
+	c = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE;
+
+	if (is_mt7996(phy->mt76->dev))
+		c |= IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_4 |
+		     IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4;
+	else
+		c |= IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_5 |
+		     IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_5;
+
 	elem->phy_cap_info[4] |= c;
 
 	/* do not support NG16 due to spec D4.0 changes subcarrier idx */
@@ -1186,7 +1301,8 @@ mt7996_init_eht_caps(struct mt7996_phy *phy, enum nl80211_band band,
 		IEEE80211_EHT_PHY_CAP0_SU_BEAMFORMER |
 		IEEE80211_EHT_PHY_CAP0_SU_BEAMFORMEE;
 
-	val = max_t(u8, sts - 1, 3);
+	/* Set the maximum capability regardless of the antenna configuration. */
+	val = is_mt7992(phy->mt76->dev) ? 4 : 3;
 	eht_cap_elem->phy_cap_info[0] |=
 		u8_encode_bits(u8_get_bits(val, BIT(0)),
 			       IEEE80211_EHT_PHY_CAP0_BEAMFORMEE_SS_80MHZ_MASK);
@@ -1323,9 +1439,13 @@ int mt7996_register_device(struct mt7996_dev *dev)
 	struct ieee80211_hw *hw = mt76_hw(dev);
 	int ret;
 
+	dev_info(dev->mt76.dev, "mt7996:  register_device  Driver-Version: %s\n",
+		 MT76_DRIVER_VERSION);
+
 	dev->phy.dev = dev;
 	dev->phy.mt76 = &dev->mt76.phy;
 	dev->mt76.phy.priv = &dev->phy;
+	dev->mt76.debug_lvl = debug_lvl;
 	INIT_WORK(&dev->rc_work, mt7996_mac_sta_rc_work);
 	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7996_mac_work);
 	INIT_LIST_HEAD(&dev->sta_rc_list);
@@ -1341,6 +1461,10 @@ int mt7996_register_device(struct mt7996_dev *dev)
 		return ret;
 
 	mt7996_init_wiphy(hw, &dev->mt76.mmio.wed);
+
+#ifdef CONFIG_NL80211_TESTMODE
+	dev->mt76.test_ops = &mt7996_testmode_ops;
+#endif
 
 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
 				   ARRAY_SIZE(mt76_rates));
@@ -1381,6 +1505,9 @@ error:
 
 void mt7996_unregister_device(struct mt7996_dev *dev)
 {
+	kfree(dev->phy.default_txpower);
+	dev->phy.default_txpower = NULL;
+
 	cancel_work_sync(&dev->wed_rro.work);
 	mt7996_unregister_phy(mt7996_phy3(dev), MT_BAND2);
 	mt7996_unregister_phy(mt7996_phy2(dev), MT_BAND1);

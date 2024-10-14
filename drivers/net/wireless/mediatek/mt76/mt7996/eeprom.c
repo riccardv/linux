@@ -6,17 +6,41 @@
 #include <linux/firmware.h>
 #include "mt7996.h"
 #include "eeprom.h"
+#include <linux/moduleparam.h>
+
+static bool testmode_enable;
+module_param(testmode_enable, bool, 0644);
+MODULE_PARM_DESC(testmode_enable, "Enable testmode");
 
 static int mt7996_check_eeprom(struct mt7996_dev *dev)
 {
+#define FEM_INT				0
+#define FEM_EXT				3
 	u8 *eeprom = dev->mt76.eeprom.data;
+	u8 i, fem[__MT_MAX_BAND], fem_type;
 	u16 val = get_unaligned_le16(eeprom);
+
+	for (i = 0; i < __MT_MAX_BAND; i++)
+		fem[i] = eeprom[MT_EE_WIFI_CONF + 6 + i] & MT_EE_WIFI_PA_LNA_CONFIG;
 
 	switch (val) {
 	case 0x7990:
 		return is_mt7996(&dev->mt76) ? 0 : -EINVAL;
 	case 0x7992:
-		return is_mt7992(&dev->mt76) ? 0 : -EINVAL;
+		if (dev->fem_type == MT7996_FEM_UNSET)
+			return is_mt7992(&dev->mt76) ? 0 : -EINVAL;
+
+		if (fem[0] == FEM_EXT && fem[1] == FEM_EXT)
+			fem_type = MT7996_FEM_EXT;
+		else if (fem[0] == FEM_INT && fem[1] == FEM_INT)
+			fem_type = MT7996_FEM_INT;
+		else if (fem[0] == FEM_INT && fem[1] == FEM_EXT)
+			fem_type = MT7996_FEM_MIX;
+		else
+			return -EINVAL;
+
+		return (is_mt7992(&dev->mt76) ? 0 : -EINVAL) |
+		       (dev->fem_type == fem_type ? 0 : -EINVAL);
 	default:
 		return -EINVAL;
 	}
@@ -24,11 +48,29 @@ static int mt7996_check_eeprom(struct mt7996_dev *dev)
 
 static char *mt7996_eeprom_name(struct mt7996_dev *dev)
 {
+	if (dev->testmode_enable)
+		return MT7996_EEPROM_DEFAULT_TM;
+
 	switch (mt76_chip(&dev->mt76)) {
 	case 0x7990:
+		if (dev->chip_sku == MT7996_SKU_404)
+			return MT7996_EEPROM_DEFAULT_404;
+		else if (dev->chip_sku == MT7996_SKU_233)
+			return MT7996_EEPROM_DEFAULT_233;
 		return MT7996_EEPROM_DEFAULT;
 	case 0x7992:
-		return MT7992_EEPROM_DEFAULT;
+		if (dev->chip_sku == MT7992_SKU_23) {
+			if (dev->fem_type == MT7996_FEM_INT)
+				return MT7992_EEPROM_DEFAULT_23;
+			return MT7992_EEPROM_DEFAULT_23_EXT;
+		} else if (dev->chip_sku == MT7992_SKU_44) {
+			if (dev->fem_type == MT7996_FEM_INT)
+				return MT7992_EEPROM_DEFAULT;
+			else if (dev->fem_type == MT7996_FEM_MIX)
+				return MT7992_EEPROM_DEFAULT_MIX;
+			return MT7992_EEPROM_DEFAULT_EXT;
+		}
+		return MT7992_EEPROM_DEFAULT_24;
 	default:
 		return MT7996_EEPROM_DEFAULT;
 	}
@@ -42,6 +84,8 @@ mt7996_eeprom_load_default(struct mt7996_dev *dev)
 	int ret;
 
 	ret = request_firmware(&fw, mt7996_eeprom_name(dev), dev->mt76.dev);
+	dev_warn(dev->mt76.dev, "eeprom-load-default, request-fw ret: %d  eeprom-name: %s\n",
+		 ret, mt7996_eeprom_name(dev));
 	if (ret)
 		return ret;
 
@@ -60,21 +104,45 @@ out:
 	return ret;
 }
 
-static int mt7996_eeprom_load(struct mt7996_dev *dev)
+int mt7996_eeprom_check_fw_mode(struct mt7996_dev *dev)
 {
+	u8 *eeprom;
 	int ret;
 
+	mtk_dbg(&dev->mt76, CFG, "attemping eeprom-init.\n");
+
+	/* load eeprom in flash or bin file mode to determine fw mode */
 	ret = mt76_eeprom_init(&dev->mt76, MT7996_EEPROM_SIZE);
-	if (ret < 0)
+	dev_warn(dev->mt76.dev, "eeprom-check-fw-mode, eeprom-init ret: %d\n", ret);
+	if (ret < 0) {
+		mtk_dbg(&dev->mt76, CFG, "eeprom-init had error: %d\n", ret);
 		return ret;
+	}
 
 	if (ret) {
 		dev->flash_mode = true;
-	} else {
-		u8 free_block_num;
-		u32 block_num, i;
-		u32 eeprom_blk_size = MT7996_EEPROM_BLOCK_SIZE;
+		eeprom = dev->mt76.eeprom.data;
+		/* testmode enable priority: eeprom field > module parameter */
+		/* Disable this:  Work around eeprom that sets this flag when it should not. */
+		//dev->testmode_enable = !mt7996_check_eeprom(dev) ? eeprom[MT_EE_TESTMODE_EN] :
+		//						   testmode_enable;
+	}
 
+	return ret;
+}
+
+static int mt7996_eeprom_load(struct mt7996_dev *dev)
+{
+	int ret;
+	u8 free_block_num;
+	u32 block_num, i;
+	u32 eeprom_blk_size = MT7996_EEPROM_BLOCK_SIZE;
+
+	dev_warn(dev->mt76.dev, "mt7996-eeprom-load, flash-mode: %d\n",
+		 dev->flash_mode);
+
+	/* flash or bin file mode eeprom is loaded before mcu init */
+	if (!dev->flash_mode) {
 		ret = mt7996_mcu_get_eeprom_free_block(dev, &free_block_num);
 		if (ret < 0)
 			return ret;
@@ -83,13 +151,15 @@ static int mt7996_eeprom_load(struct mt7996_dev *dev)
 		if (free_block_num >= 59)
 			return -EINVAL;
 
+		memset(dev->mt76.eeprom.data, 0, MT7996_EEPROM_SIZE);
 		/* read eeprom data from efuse */
 		block_num = DIV_ROUND_UP(MT7996_EEPROM_SIZE, eeprom_blk_size);
 		for (i = 0; i < block_num; i++) {
-			ret = mt7996_mcu_get_eeprom(dev, i * eeprom_blk_size);
-			if (ret < 0)
+			ret = mt7996_mcu_get_eeprom(dev, i * eeprom_blk_size, NULL);
+			if (ret < 0 && ret != -EINVAL)
 				return ret;
 		}
+		dev_warn(dev->mt76.dev, "mt7996-eeprom-load, not flash mode, read from NIC's efuse\n");
 	}
 
 	return mt7996_check_eeprom(dev);
@@ -219,6 +289,14 @@ int mt7996_eeprom_init(struct mt7996_dev *dev)
 {
 	int ret;
 
+	ret = mt7996_get_chip_sku(dev);
+	if (ret)
+		return ret;
+
+	ret = mt7996_get_chip_sku(dev);
+	if (ret)
+		return ret;
+
 	ret = mt7996_eeprom_load(dev);
 	if (ret < 0) {
 		if (ret != -EINVAL)
@@ -278,3 +356,37 @@ s8 mt7996_eeprom_get_power_delta(struct mt7996_dev *dev, int band)
 
 	return val & MT_EE_RATE_DELTA_SIGN ? delta : -delta;
 }
+
+const u8 mt7996_sku_group_len[] = {
+	[SKU_CCK] = 4,
+	[SKU_OFDM] = 8,
+	[SKU_HT20] = 8,
+	[SKU_HT40] = 9,
+	[SKU_VHT20] = 12,
+	[SKU_VHT40] = 12,
+	[SKU_VHT80] = 12,
+	[SKU_VHT160] = 12,
+	[SKU_HE26] = 12,
+	[SKU_HE52] = 12,
+	[SKU_HE106] = 12,
+	[SKU_HE242] = 12,
+	[SKU_HE484] = 12,
+	[SKU_HE996] = 12,
+	[SKU_HE2x996] = 12,
+	[SKU_EHT26] = 16,
+	[SKU_EHT52] = 16,
+	[SKU_EHT106] = 16,
+	[SKU_EHT242] = 16,
+	[SKU_EHT484] = 16,
+	[SKU_EHT996] = 16,
+	[SKU_EHT2x996] = 16,
+	[SKU_EHT4x996] = 16,
+	[SKU_EHT26_52] = 16,
+	[SKU_EHT26_106] = 16,
+	[SKU_EHT484_242] = 16,
+	[SKU_EHT996_484] = 16,
+	[SKU_EHT996_484_242] = 16,
+	[SKU_EHT2x996_484] = 16,
+	[SKU_EHT3x996] = 16,
+	[SKU_EHT3x996_484] = 16,
+};

@@ -42,6 +42,7 @@ enum {
 #define MT_TX_FREE_COUNT		GENMASK(12, 0)
 /* 0: success, others: dropped */
 #define MT_TX_FREE_STATUS		GENMASK(14, 13)
+#define MT_TX_FREE_HEAD_OF_PAGE         BIT(15)
 #define MT_TX_FREE_MSDU_ID		GENMASK(30, 16)
 #define MT_TX_FREE_PAIR			BIT(31)
 /* will support this field in further revision */
@@ -99,6 +100,7 @@ enum {
 #define MT_TXD5_PN_HIGH			GENMASK(31, 16)
 #define MT_TXD5_MD			BIT(15)
 #define MT_TXD5_ADD_BA			BIT(14)
+// Request txs for this skb
 #define MT_TXD5_TX_STATUS_HOST		BIT(10)
 #define MT_TXD5_TX_STATUS_MCU		BIT(9)
 #define MT_TXD5_TX_STATUS_FMT		BIT(8)
@@ -148,10 +150,12 @@ enum {
 #define MT_TXS0_TXOP_TIMEOUT		BIT(20)
 #define MT_TXS0_BIP_ERROR		BIT(19)
 
+#define MT_TXS0_TXOP_LIMIT		BIT(20)
+#define MT_TXS0_BIP_OR_BF_ERROR		BIT(19)
 #define MT_TXS0_QUEUE_TIMEOUT		BIT(18)
 #define MT_TXS0_RTS_TIMEOUT		BIT(17)
 #define MT_TXS0_ACK_TIMEOUT		BIT(16)
-#define MT_TXS0_ACK_ERROR_MASK		GENMASK(18, 16)
+#define MT_TXS0_ACK_ERROR_MASK		GENMASK(20, 16)
 
 #define MT_TXS0_TX_STATUS_HOST		BIT(15)
 #define MT_TXS0_TX_STATUS_MCU		BIT(14)
@@ -353,6 +357,13 @@ enum tx_mcu_port_q_idx {
 enum tx_port_idx {
 	MT_TX_PORT_IDX_LMAC,
 	MT_TX_PORT_IDX_MCU
+};
+
+enum tx_frag_idx {
+	MT_TX_FRAG_NONE,
+	MT_TX_FRAG_FIRST,
+	MT_TX_FRAG_MID,
+	MT_TX_FRAG_LAST
 };
 
 #endif /* __MT76_CONNAC2_MAC_H */

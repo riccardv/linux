@@ -43,6 +43,8 @@ static int iwl_mvm_mld_mac_add_interface(struct ieee80211_hw *hw,
 	mvmvif->deflink.active = 0;
 	/* the first link always points to the default one */
 	mvmvif->link[0] = &mvmvif->deflink;
+	//pr_err("add-iface: setting link %d, mvmvif: %p  link[i]: %p\n",
+	//       0, mvmvif, mvmvif->link[0]);
 
 	ret = iwl_mvm_mld_mac_ctxt_add(mvm, vif);
 	if (ret)
@@ -104,6 +106,8 @@ static int iwl_mvm_mld_mac_add_interface(struct ieee80211_hw *hw,
 				       IEEE80211_VIF_SUPPORTS_CQM_RSSI);
 	}
  out_remove_mac:
+	pr_err("out-remove-mac: clearing link %d, mvmvif: %p  link[i]: %p\n",
+	       0, mvmvif, mvmvif->link[0]);
 	mvmvif->link[0] = NULL;
 	iwl_mvm_mld_mac_ctxt_remove(mvm, vif);
 	return ret;
@@ -223,7 +227,7 @@ static void iwl_mvm_restart_mpdu_count(struct iwl_mvm *mvm,
 		spin_unlock_bh(&mvmsta->mpdu_counters[q].lock);
 	}
 
-	IWL_DEBUG_STATS(mvm, "MPDU counters are cleared\n");
+	IWL_DEBUG_INFO(mvm, "MPDU counters are cleared\n");
 }
 
 static int iwl_mvm_esr_mode_active(struct iwl_mvm *mvm,
@@ -268,6 +272,9 @@ static int iwl_mvm_esr_mode_active(struct iwl_mvm *mvm,
 	 * will be at the end of the window.
 	 */
 	iwl_mvm_restart_mpdu_count(mvm, mvmvif);
+
+	iwl_dbg_tlv_time_point(&mvm->fwrt, IWL_FW_INI_TIME_ESR_LINK_UP,
+			       NULL);
 
 	return ret;
 }
@@ -346,11 +353,6 @@ __iwl_mvm_mld_assign_vif_chanctx(struct iwl_mvm *mvm,
 					     phy_ctxt->channel->band);
 		rcu_read_unlock();
 	}
-
-	if (vif->type == NL80211_IFTYPE_STATION)
-		iwl_mvm_send_ap_tx_power_constraint_cmd(mvm, vif,
-							link_conf,
-							false);
 
 	/* then activate */
 	ret = iwl_mvm_link_changed(mvm, vif, link_conf,
@@ -456,6 +458,9 @@ static int iwl_mvm_esr_mode_inactive(struct iwl_mvm *mvm,
 	/* Start a new counting window */
 	iwl_mvm_restart_mpdu_count(mvm, mvmvif);
 
+	iwl_dbg_tlv_time_point(&mvm->fwrt, IWL_FW_INI_TIME_ESR_LINK_DOWN,
+			       NULL);
+
 	return ret;
 }
 
@@ -531,37 +536,9 @@ static void iwl_mvm_mld_unassign_vif_chanctx(struct ieee80211_hw *hw,
 }
 
 static void
-iwl_mvm_tpe_sta_cmd_data(struct iwl_txpower_constraints_cmd *cmd,
-			 const struct ieee80211_bss_conf *bss_info)
-{
-	u8 i;
-
-	/*
-	 * NOTE: the 0 here is IEEE80211_TPE_CAT_6GHZ_DEFAULT,
-	 * we fully ignore IEEE80211_TPE_CAT_6GHZ_SUBORDINATE
-	 */
-
-	BUILD_BUG_ON(ARRAY_SIZE(cmd->psd_pwr) !=
-		     ARRAY_SIZE(bss_info->tpe.psd_local[0].power));
-
-	/* if not valid, mac80211 puts default (max value) */
-	for (i = 0; i < ARRAY_SIZE(cmd->psd_pwr); i++)
-		cmd->psd_pwr[i] = min(bss_info->tpe.psd_local[0].power[i],
-				      bss_info->tpe.psd_reg_client[0].power[i]);
-
-	BUILD_BUG_ON(ARRAY_SIZE(cmd->eirp_pwr) !=
-		     ARRAY_SIZE(bss_info->tpe.max_local[0].power));
-
-	for (i = 0; i < ARRAY_SIZE(cmd->eirp_pwr); i++)
-		cmd->eirp_pwr[i] = min(bss_info->tpe.max_local[0].power[i],
-				       bss_info->tpe.max_reg_client[0].power[i]);
-}
-
-void
 iwl_mvm_send_ap_tx_power_constraint_cmd(struct iwl_mvm *mvm,
 					struct ieee80211_vif *vif,
-					struct ieee80211_bss_conf *bss_conf,
-					bool is_ap)
+					struct ieee80211_bss_conf *bss_conf)
 {
 	struct iwl_txpower_constraints_cmd cmd = {};
 	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
@@ -581,21 +558,18 @@ iwl_mvm_send_ap_tx_power_constraint_cmd(struct iwl_mvm *mvm,
 	    link_info->fw_link_id == IWL_MVM_FW_LINK_ID_INVALID)
 		return;
 
-	if (bss_conf->chanreq.oper.chan->band != NL80211_BAND_6GHZ)
+	if (bss_conf->chanreq.oper.chan->band != NL80211_BAND_6GHZ ||
+	    bss_conf->chanreq.oper.chan->flags &
+		    IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)
 		return;
 
 	cmd.link_id = cpu_to_le16(link_info->fw_link_id);
+	/*
+	 * Currently supporting VLP Soft AP only.
+	 */
+	cmd.ap_type = cpu_to_le16(IWL_6GHZ_AP_TYPE_VLP);
 	memset(cmd.psd_pwr, DEFAULT_TPE_TX_POWER, sizeof(cmd.psd_pwr));
 	memset(cmd.eirp_pwr, DEFAULT_TPE_TX_POWER, sizeof(cmd.eirp_pwr));
-
-	if (is_ap) {
-		cmd.ap_type = cpu_to_le16(IWL_6GHZ_AP_TYPE_VLP);
-	} else if (bss_conf->power_type == IEEE80211_REG_UNSET_AP) {
-		return;
-	} else {
-		cmd.ap_type = cpu_to_le16(bss_conf->power_type - 1);
-		iwl_mvm_tpe_sta_cmd_data(&cmd, bss_conf);
-	}
 
 	ret = iwl_mvm_send_cmd_pdu(mvm,
 				   WIDE_ID(PHY_OPS_GROUP,
@@ -618,8 +592,7 @@ static int iwl_mvm_mld_start_ap_ibss(struct ieee80211_hw *hw,
 	guard(mvm)(mvm);
 
 	if (vif->type == NL80211_IFTYPE_AP)
-		iwl_mvm_send_ap_tx_power_constraint_cmd(mvm, vif,
-							link_conf, true);
+		iwl_mvm_send_ap_tx_power_constraint_cmd(mvm, vif, link_conf);
 
 	/* Send the beacon template */
 	ret = iwl_mvm_mac_ctxt_beacon_changed(mvm, vif, link_conf);
@@ -1192,6 +1165,8 @@ iwl_mvm_mld_change_vif_links(struct ieee80211_hw *hw,
 		err = iwl_mvm_disable_link(mvm, vif, &vif->bss_conf);
 		if (err)
 			goto out_err;
+		pr_err("old-links == 0: clearing link %d, mvmvif: %p  link[i]: %p\n",
+		       0, mvmvif, mvmvif->link[0]);
 		mvmvif->link[0] = NULL;
 	}
 
@@ -1202,6 +1177,8 @@ iwl_mvm_mld_change_vif_links(struct ieee80211_hw *hw,
 			err = iwl_mvm_disable_link(mvm, vif, link_conf);
 			if (err)
 				goto out_err;
+			pr_err("removed: freeing link %d, mvmvif: %p  link[i]: %p\n",
+			       i, mvmvif, mvmvif->link[i]);
 			kfree(mvmvif->link[i]);
 			mvmvif->link[i] = NULL;
 		} else if (added & BIT(i)) {
@@ -1212,8 +1189,11 @@ iwl_mvm_mld_change_vif_links(struct ieee80211_hw *hw,
 				continue;
 
 			if (!test_bit(IWL_MVM_STATUS_IN_HW_RESTART,
-				      &mvm->status))
+				      &mvm->status)) {
 				mvmvif->link[i] = new_link[i];
+				pr_err("assigning-newlink: setting link %d, mvmvif: %p  link[i]: %p\n",
+				       i, mvmvif, mvmvif->link[i]);
+			}
 			new_link[i] = NULL;
 			err = iwl_mvm_add_link(mvm, vif, link_conf);
 			if (err)
@@ -1224,6 +1204,8 @@ iwl_mvm_mld_change_vif_links(struct ieee80211_hw *hw,
 	err = 0;
 	if (new_links == 0) {
 		mvmvif->link[0] = &mvmvif->deflink;
+		pr_err("new-links == 0, setting deflink link %d, mvmvif: %p  link[i]: %p\n",
+		       0, mvmvif, mvmvif->link[0]);
 		err = iwl_mvm_add_link(mvm, vif, &vif->bss_conf);
 		if (err == 0)
 			mvmvif->primary_link = 0;
@@ -1264,16 +1246,26 @@ bool iwl_mvm_vif_has_esr_cap(struct iwl_mvm *mvm, struct ieee80211_vif *vif)
 	lockdep_assert_held(&mvm->mutex);
 
 	if (!ieee80211_vif_is_mld(vif) || !vif->cfg.assoc ||
-	    hweight16(ieee80211_vif_usable_links(vif)) == 1)
+	    hweight16(ieee80211_vif_usable_links(vif)) == 1) {
+		IWL_DEBUG_INFO(mvm, "iwl-has-esr-cap false, is-mld: %d  assoc: %d usable-links: 0x%x\n",
+			       ieee80211_vif_is_mld(vif), !!vif->cfg.assoc, ieee80211_vif_usable_links(vif));
 		return false;
+	}
 
-	if (!(vif->cfg.eml_cap & IEEE80211_EML_CAP_EMLSR_SUPP))
+	if (!(vif->cfg.eml_cap & IEEE80211_EML_CAP_EMLSR_SUPP)) {
+		IWL_DEBUG_INFO(mvm, "iwl-has-esr-cap false, eml_cap does not support CAP_EMLSR_SUPP\n");
 		return false;
+	}
 
 	ext_capa = cfg80211_get_iftype_ext_capa(mvm->hw->wiphy,
 						ieee80211_vif_type_p2p(vif));
-	return (ext_capa &&
-		(ext_capa->eml_capabilities & IEEE80211_EML_CAP_EMLSR_SUPP));
+	if (!(ext_capa &&
+	      (ext_capa->eml_capabilities & IEEE80211_EML_CAP_EMLSR_SUPP))) {
+		IWL_DEBUG_INFO(mvm, "iwl-has-esr-cap false, ext-capa: %p  CAP_EMLSR_SUPP: %d\n",
+			       ext_capa, ext_capa ? (ext_capa->eml_capabilities & IEEE80211_EML_CAP_EMLSR_SUPP) : 0);
+		return false;
+	}
+	return true;
 }
 
 static bool iwl_mvm_mld_can_activate_links(struct ieee80211_hw *hw,
@@ -1335,6 +1327,22 @@ iwl_mvm_mld_mac_pre_channel_switch(struct ieee80211_hw *hw,
 		else
 			selected = primary;
 
+		/*
+		 * remembers to tell the firmware that this link can't tx
+		 * Note that this logic seems to be unrelated to esr, but it
+		 * really is needed only when esr is active. When we have a
+		 * single link, the firmware will handle all this on its own.
+		 * In multi-link scenarios, we can learn about the CSA from
+		 * another link and this logic is too complex for the firmware
+		 * to track.
+		 * Since we want to de-activate the link that got a CSA, we
+		 * need to tell the firmware not to send any frame on that link
+		 * as the firmware may not be aware that link is under a CSA
+		 * with mode=1 (no Tx allowed).
+		 */
+		if (chsw->block_tx && mvmvif->link[chsw->link_id])
+			mvmvif->link[chsw->link_id]->csa_block_tx = true;
+
 		iwl_mvm_exit_esr(mvm, vif, IWL_MVM_ESR_EXIT_CSA, selected);
 		mutex_unlock(&mvm->mutex);
 
@@ -1360,6 +1368,9 @@ const struct ieee80211_ops iwl_mvm_mld_hw_ops = {
 	.ampdu_action = iwl_mvm_mac_ampdu_action,
 	.get_antenna = iwl_mvm_op_get_antenna,
 	.set_antenna = iwl_mvm_op_set_antenna,
+	.get_et_sset_count = iwl_mvm_get_et_sset_count,
+	.get_et_stats = iwl_mvm_get_et_stats,
+	.get_et_strings = iwl_mvm_get_et_strings,
 	.start = iwl_mvm_mac_start,
 	.reconfig_complete = iwl_mvm_mac_reconfig_complete,
 	.stop = iwl_mvm_mac_stop,

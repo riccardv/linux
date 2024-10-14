@@ -7,6 +7,11 @@
 #include "mac.h"
 #include "eeprom.h"
 
+static int fw_debug = 0;
+module_param(fw_debug, int, 0644);
+MODULE_PARM_DESC(fw_debug,
+		 "Set to 1 to enable FW debugging on startup.");
+
 #define fw_name(_dev, name, ...)	({			\
 	char *_fw;						\
 	switch (mt76_chip(&(_dev)->mt76)) {			\
@@ -157,20 +162,61 @@ static int
 mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 			  struct sk_buff *skb, int seq)
 {
+	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
 	struct mt76_connac2_mcu_rxd *rxd;
 	int ret = 0;
 
 	if (!skb) {
-		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
-			cmd, seq);
+		const char* first = "Secondary";
+
+		mdev->mcu_timeouts++;
+		if (!mdev->first_failed_mcu_cmd)
+			first = "Initial";
+
+		dev_err(mdev->dev, "MCU: %s Failure: Message %08x (cid %lx ext_cid: %lx seq %d) timeout (%d/%d).  Last successful cmd: 0x%x\n",
+			first,
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq,
+			mdev->mcu_timeouts, MAX_MCU_TIMEOUTS,
+			mdev->last_successful_mcu_cmd);
+
+		if (!mdev->first_failed_mcu_cmd)
+			mdev->first_failed_mcu_cmd = cmd;
+
+		dev->recovery.restart = true;
+		set_bit(MT76_MCU_RESET, &dev->mphy.state);
+		wake_up(&dev->mt76.mcu.wait);
+		queue_work(dev->mt76.wq, &dev->reset_work);
+		wake_up(&dev->reset_wait);
+
 		return -ETIMEDOUT;
 	}
 
+	mdev->mcu_timeouts = 0;
+	mdev->last_successful_mcu_cmd = cmd;
+
+	if (mdev->first_failed_mcu_cmd) {
+		dev_err(mdev->dev, "MCU: First success after failure: Message %08x (cid %lx ext_cid: %lx seq %d)\n",
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq);
+		mdev->first_failed_mcu_cmd = 0;
+	}
+	else {
+		/* verbose debugging
+		dev_err(mdev->dev, "MCU: OK response to message %08x (cid %lx ext_cid: %lx seq %d)\n",
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq);
+		*/
+	}
+
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
-	if (seq != rxd->seq &&
-	    !(rxd->eid == MCU_CMD_EXT_CID &&
-	      rxd->ext_eid == MCU_EXT_EVENT_WA_TX_STAT))
+	if (seq != rxd->seq) {
+		/* This is expected case, some async msg response was
+		 * found before the one we are waiting on...will
+		 * retry.
+		 */
 		return -EAGAIN;
+	}
 
 	if (cmd == MCU_CMD(PATCH_SEM_CONTROL)) {
 		skb_pull(skb, sizeof(*rxd) - 4);
@@ -191,11 +237,6 @@ mt7915_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
 {
 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
 	enum mt76_mcuq_id qid;
-	int ret;
-
-	ret = mt76_connac2_mcu_fill_message(mdev, skb, cmd, wait_seq);
-	if (ret)
-		return ret;
 
 	if (cmd == MCU_CMD(FW_SCATTER))
 		qid = MT_MCUQ_FWDL;
@@ -281,19 +322,26 @@ mt7915_mcu_rx_radar_detected(struct mt7915_dev *dev, struct sk_buff *skb)
 
 	r = (struct mt7915_mcu_rdd_report *)skb->data;
 
+	dev_info(dev->mt76.dev, "rx-radar-detected: band-idx: %d long_detected: %d const_prf_det %d staggered_prf_det: %d"
+		 " radar_type_idx: %d periodic_pulse_num: %d  long_pulse_num: %d hw_pulse_num: %d",
+		 r->band_idx, r->long_detected, r->constant_prf_detected, r->staggered_prf_detected,
+		 r->radar_type_idx, r->periodic_pulse_num, r->long_pulse_num, r->hw_pulse_num);
+
 	if (r->band_idx > MT_RX_SEL2)
 		return;
 
-	if ((r->band_idx && !dev->phy.mt76->band_idx) &&
-	    dev->mt76.phys[MT_BAND1])
-		mphy = dev->mt76.phys[MT_BAND1];
+	if (!dev->ignore_radar) {
+		if ((r->band_idx && !dev->phy.mt76->band_idx) &&
+		    dev->mt76.phys[MT_BAND1])
+			mphy = dev->mt76.phys[MT_BAND1];
 
-	if (r->band_idx == MT_RX_SEL2)
-		cfg80211_background_radar_event(mphy->hw->wiphy,
-						&dev->rdd2_chandef,
-						GFP_ATOMIC);
-	else
-		ieee80211_radar_detected(mphy->hw);
+		if (r->band_idx == MT_RX_SEL2)
+			cfg80211_background_radar_event(mphy->hw->wiphy,
+							&dev->rdd2_chandef,
+							GFP_ATOMIC);
+		else
+			ieee80211_radar_detected(mphy->hw);
+	}
 	dev->hw_pattern++;
 }
 
@@ -360,6 +408,9 @@ mt7915_mcu_rx_ext_event(struct mt7915_dev *dev, struct sk_buff *skb)
 	struct mt76_connac2_mcu_rxd *rxd;
 
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+
+	mtk_dbg(&dev->mt76, MSG, "mt7915-mcu-rx-ext-event, ext-eid: %d\n", rxd->ext_eid);
+
 	switch (rxd->ext_eid) {
 	case MCU_EXT_EVENT_THERMAL_PROTECT:
 		mt7915_mcu_rx_thermal_notify(dev, skb);
@@ -376,7 +427,13 @@ mt7915_mcu_rx_ext_event(struct mt7915_dev *dev, struct sk_buff *skb)
 	case MCU_EXT_EVENT_BCC_NOTIFY:
 		mt7915_mcu_rx_bcc_notify(dev, skb);
 		break;
+	case MCU_EXT_EVENT_IGMP_FLOODING:
+	case MCU_EXT_EVENT_PS_SYNC:
+		/* ignore some we know we do not care about */
+		break;
 	default:
+		/* in SDK, grep for EventExtEventHandler */
+		mtk_dbg(&dev->mt76, WRN, "mt7915, unhandled rx_ext_event: 0x%x", rxd->ext_eid);
 		break;
 	}
 }
@@ -392,6 +449,7 @@ mt7915_mcu_rx_unsolicited_event(struct mt7915_dev *dev, struct sk_buff *skb)
 		mt7915_mcu_rx_ext_event(dev, skb);
 		break;
 	default:
+		dev_info(dev->mt76.dev, "mt7915, unhandled unsolicited event: 0x%x", rxd->eid);
 		break;
 	}
 	dev_kfree_skb(skb);
@@ -778,9 +836,11 @@ mt7915_mcu_sta_he_tlv(struct sk_buff *skb, struct ieee80211_sta *sta,
 	    IEEE80211_HE_PHY_CAP6_TRIG_CQI_FB)
 		cap |= STA_REC_HE_CAP_TRIG_CQI_FK;
 
-	if (elem->phy_cap_info[6] &
-	    IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE)
-		cap |= STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE;
+	if (!(sta->deflink.conn_settings.conn_flags & IEEE80211_CONN_DISABLE_OFDMA)) {
+		if (elem->phy_cap_info[6] &
+		    IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE)
+			cap |= STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE;
+	}
 
 	if (elem->phy_cap_info[7] &
 	    IEEE80211_HE_PHY_CAP7_HE_SU_MU_PPDU_4XLTF_AND_08_US_GI)
@@ -802,13 +862,15 @@ mt7915_mcu_sta_he_tlv(struct sk_buff *skb, struct ieee80211_sta *sta,
 	    IEEE80211_HE_PHY_CAP8_HE_ER_SU_1XLTF_AND_08_US_GI)
 		cap |= STA_REC_HE_CAP_ER_SU_PPDU_1LTF_8US_GI;
 
-	if (elem->phy_cap_info[9] &
-	    IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU)
-		cap |= STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242;
+	if (!(sta->deflink.conn_settings.conn_flags & IEEE80211_CONN_DISABLE_OFDMA)) {
+		if (elem->phy_cap_info[9] &
+		    IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU)
+			cap |= STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242;
 
-	if (elem->phy_cap_info[9] &
-	    IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU)
-		cap |= STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242;
+		if (elem->phy_cap_info[9] &
+		    IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU)
+			cap |= STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242;
+	}
 
 	he->he_cap = cpu_to_le32(cap);
 
@@ -875,12 +937,29 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
 
 	muru = (struct sta_rec_muru *)tlv;
 
-	muru->cfg.mimo_dl_en = mvif->cap.he_mu_ebfer ||
-			       mvif->cap.vht_mu_ebfer ||
-			       mvif->cap.vht_mu_ebfee;
+	muru->cfg.mimo_dl_en = ((mvif->cap.he_mu_ebfer ||
+				 mvif->cap.vht_mu_ebfer ||
+				 mvif->cap.vht_mu_ebfee) &&
+				!!(dev->dbg.muru_onoff & MUMIMO_DL));
+
+	muru->cfg.ofdma_dl_en = !!(dev->dbg.muru_onoff & OFDMA_DL);
 	if (!is_mt7915(&dev->mt76))
-		muru->cfg.mimo_ul_en = true;
-	muru->cfg.ofdma_dl_en = true;
+		muru->cfg.ofdma_ul_en = !!(dev->dbg.muru_onoff & OFDMA_UL);
+
+	/* The muru enable/disable are only set after the first station connection.
+	 * Without this patch, the firmware couldn't enable muru
+	 * if the first connected station is non-HE type.  So enable it unless
+	 * the user has specifically disabled ofdma.
+	 */
+	if (!vif->bss_conf.he_ofdma_disable) {
+		if (!(dev->dbg.muru_onoff & MUMIMO_UL)) {
+			if (!is_mt7915(&dev->mt76))
+				muru->cfg.mimo_ul_en = true;
+		}
+		if (!(dev->dbg.muru_onoff & OFDMA_DL)) {
+			muru->cfg.ofdma_dl_en = true;
+		}
+	}
 
 	if (sta->deflink.vht_cap.vht_supported)
 		muru->mimo_dl.vht_mu_bfee =
@@ -889,31 +968,37 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
 	if (!sta->deflink.he_cap.has_he)
 		return;
 
-	muru->mimo_dl.partial_bw_dl_mimo =
-		HE_PHY(CAP6_PARTIAL_BANDWIDTH_DL_MUMIMO, elem->phy_cap_info[6]);
+	if (vif->bss_conf.he_ofdma_disable ||
+	    (sta->deflink.conn_settings.conn_flags & IEEE80211_CONN_DISABLE_OFDMA)) {
+		pr_info("STA: %pM  sta-muru-tlv, NOT enabling OFDMA", sta->addr);
+	} else {
+		pr_info("STA: %pM  sta-muru-tlv, enabling OFDMA", sta->addr);
 
-	muru->mimo_ul.full_ul_mimo =
-		HE_PHY(CAP2_UL_MU_FULL_MU_MIMO, elem->phy_cap_info[2]);
-	muru->mimo_ul.partial_ul_mimo =
-		HE_PHY(CAP2_UL_MU_PARTIAL_MU_MIMO, elem->phy_cap_info[2]);
+		muru->mimo_dl.partial_bw_dl_mimo =
+			HE_PHY(CAP6_PARTIAL_BANDWIDTH_DL_MUMIMO, elem->phy_cap_info[6]);
 
-	muru->ofdma_dl.punc_pream_rx =
-		HE_PHY(CAP1_PREAMBLE_PUNC_RX_MASK, elem->phy_cap_info[1]);
-	muru->ofdma_dl.he_20m_in_40m_2g =
-		HE_PHY(CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G, elem->phy_cap_info[8]);
-	muru->ofdma_dl.he_20m_in_160m =
-		HE_PHY(CAP8_20MHZ_IN_160MHZ_HE_PPDU, elem->phy_cap_info[8]);
-	muru->ofdma_dl.he_80m_in_160m =
-		HE_PHY(CAP8_80MHZ_IN_160MHZ_HE_PPDU, elem->phy_cap_info[8]);
+		if (!(dev->dbg.muru_onoff & OFDMA_UL)) {
+			muru->cfg.ofdma_ul_en = true;
+		}
 
-	muru->ofdma_ul.t_frame_dur =
-		HE_MAC(CAP1_TF_MAC_PAD_DUR_MASK, elem->mac_cap_info[1]);
-	muru->ofdma_ul.mu_cascading =
-		HE_MAC(CAP2_MU_CASCADING, elem->mac_cap_info[2]);
-	muru->ofdma_ul.uo_ra =
-		HE_MAC(CAP3_OFDMA_RA, elem->mac_cap_info[3]);
-	muru->ofdma_ul.rx_ctrl_frame_to_mbss =
-		HE_MAC(CAP3_RX_CTRL_FRAME_TO_MULTIBSS, elem->mac_cap_info[3]);
+		muru->ofdma_dl.punc_pream_rx =
+			HE_PHY(CAP1_PREAMBLE_PUNC_RX_MASK, elem->phy_cap_info[1]);
+		muru->ofdma_dl.he_20m_in_40m_2g =
+			HE_PHY(CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G, elem->phy_cap_info[8]);
+		muru->ofdma_dl.he_20m_in_160m =
+			HE_PHY(CAP8_20MHZ_IN_160MHZ_HE_PPDU, elem->phy_cap_info[8]);
+		muru->ofdma_dl.he_80m_in_160m =
+			HE_PHY(CAP8_80MHZ_IN_160MHZ_HE_PPDU, elem->phy_cap_info[8]);
+
+		muru->ofdma_ul.t_frame_dur =
+			HE_MAC(CAP1_TF_MAC_PAD_DUR_MASK, elem->mac_cap_info[1]);
+		muru->ofdma_ul.mu_cascading =
+			HE_MAC(CAP2_MU_CASCADING, elem->mac_cap_info[2]);
+		muru->ofdma_ul.uo_ra =
+			HE_MAC(CAP3_OFDMA_RA, elem->mac_cap_info[3]);
+		muru->ofdma_ul.rx_ctrl_frame_to_mbss =
+			HE_MAC(CAP3_RX_CTRL_FRAME_TO_MULTIBSS, elem->mac_cap_info[3]);
+	}
 }
 
 static void
@@ -1018,7 +1103,7 @@ mt7915_mcu_sta_wtbl_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
 	return 0;
 }
 
-static inline bool
+static bool
 mt7915_is_ebf_supported(struct mt7915_phy *phy, struct ieee80211_vif *vif,
 			struct ieee80211_sta *sta, bool bfee)
 {
@@ -1046,12 +1131,15 @@ mt7915_is_ebf_supported(struct mt7915_phy *phy, struct ieee80211_vif *vif,
 	if (sta->deflink.vht_cap.vht_supported) {
 		u32 cap = sta->deflink.vht_cap.cap;
 
-		if (bfee)
+		if (bfee) {
 			return mvif->cap.vht_su_ebfee &&
 			       (cap & IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE);
-		else
+		} else {
+			if (vif->type == NL80211_IFTYPE_STATION)
+				return false;
 			return mvif->cap.vht_su_ebfer &&
 			       (cap & IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE);
+		}
 	}
 
 	return false;
@@ -1145,10 +1233,13 @@ mt7915_mcu_sta_bfer_he(struct ieee80211_sta *sta, struct ieee80211_vif *vif,
 
 	mt7915_mcu_sta_sounding_rate(bf);
 
-	bf->trigger_su = HE_PHY(CAP6_TRIG_SU_BEAMFORMING_FB,
-				pe->phy_cap_info[6]);
-	bf->trigger_mu = HE_PHY(CAP6_TRIG_MU_BEAMFORMING_PARTIAL_BW_FB,
-				pe->phy_cap_info[6]);
+	/* TODO:  Ryder thinks this probably doesn't need to be disabled */
+	if (!(sta->deflink.conn_settings.conn_flags & IEEE80211_CONN_DISABLE_OFDMA)) {
+		bf->trigger_su = HE_PHY(CAP6_TRIG_SU_BEAMFORMING_FB,
+					pe->phy_cap_info[6]);
+		bf->trigger_mu = HE_PHY(CAP6_TRIG_MU_BEAMFORMING_PARTIAL_BW_FB,
+					pe->phy_cap_info[6]);
+	}
 	snd_dim = HE_PHY(CAP5_BEAMFORMEE_NUM_SND_DIM_UNDER_80MHZ_MASK,
 			 ve->phy_cap_info[5]);
 	sts = HE_PHY(CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_MASK,
@@ -2344,17 +2435,41 @@ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
 	}
 
 	ret = mt7915_load_firmware(dev);
-	if (ret)
+	if (ret) {
+		dev_info(dev->mt76.dev, "mcu-init: Failed to load firmware, err: %d",
+			 ret);
 		return ret;
+	}
 
 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
-	ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, 0);
-	if (ret)
-		return ret;
 
-	ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA, 0);
-	if (ret)
-		return ret;
+	if (fw_debug) {
+		enum mt_debug debug;
+
+		/* enable debugging on bootup */
+		dev->fw.debug_wm = 1;
+		dev->fw.debug_wa = 1;
+		ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, dev->fw.debug_wm);
+		if (ret)
+			return ret;
+		ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA, dev->fw.debug_wa);
+		if (ret)
+			return ret;
+		for (debug = DEBUG_TXCMD; debug <= DEBUG_RPT_RX; debug++) {
+			ret = mt7915_mcu_fw_dbg_ctrl(dev, debug, 1);
+			if (ret)
+				return ret;
+		}
+		dev_info(dev->mt76.dev, "mt7915: enabled wm/wa debugging on init\n");
+	} else {
+		ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, 0);
+		if (ret)
+			return ret;
+
+		ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA, 0);
+		if (ret)
+			return ret;
+	}
 
 	if ((mtk_wed_device_active(&dev->mt76.mmio.wed) &&
 	     is_mt7915(&dev->mt76)) ||
@@ -2380,7 +2495,9 @@ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
 int mt7915_mcu_init(struct mt7915_dev *dev)
 {
 	static const struct mt76_mcu_ops mt7915_mcu_ops = {
+		.max_retry = 3,
 		.headroom = sizeof(struct mt76_connac2_mcu_txd),
+		.mcu_skb_prepare_msg = mt76_connac2_mcu_fill_message,
 		.mcu_skb_send_msg = mt7915_mcu_send_message,
 		.mcu_parse_response = mt7915_mcu_parse_response,
 	};
@@ -3339,7 +3456,7 @@ int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy)
 
 	tx_power = mt7915_get_power_bound(phy, hw->conf.power_level);
 	tx_power = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
-					      &limits_array, tx_power);
+					      &limits_array, NULL, tx_power);
 	mphy->txpower_cur = tx_power;
 
 	for (i = 0, idx = 0; i < ARRAY_SIZE(mt7915_sku_group_len); i++) {
@@ -3854,7 +3971,7 @@ int mt7915_mcu_twt_agrt_update(struct mt7915_dev *dev,
 		.own_mac_idx = mvif->mt76.omac_idx,
 		.flowid = flow->id,
 		.peer_id = cpu_to_le16(flow->wcid),
-		.duration = flow->duration,
+		.duration = (flow->duration * 7) >> 3,
 		.bss_idx = mvif->mt76.idx,
 		.start_tsf = cpu_to_le64(flow->tsf),
 		.mantissa = flow->mantissa,
@@ -3929,10 +4046,13 @@ int mt7915_mcu_wed_wa_tx_stats(struct mt7915_dev *dev, u16 wlan_idx)
 	rcu_read_lock();
 
 	wcid = rcu_dereference(dev->mt76.wcid[wlan_idx]);
-	if (wcid)
-		wcid->stats.tx_packets += le32_to_cpu(res->tx_packets);
-	else
+	if (wcid) {
+		/* TODO:  Nice if this path reported retries and failures */
+		wcid->stats.tx_attempts += le32_to_cpu(res->tx_packets);
+		wcid->stats.tx_mpdu_ok += le32_to_cpu(res->tx_packets);
+	} else {
 		ret = -EINVAL;
+	}
 
 	rcu_read_unlock();
 out:

@@ -8,6 +8,23 @@
 #include "mt7915.h"
 #include "mcu.h"
 
+static u32 debug_lvl = MTK_DEBUG_FATAL | MTK_DEBUG_WRN;
+module_param(debug_lvl, uint, 0644);
+MODULE_PARM_DESC(debug_lvl,
+		 "Enable debugging messages\n"
+		 "0x00001	tx path\n"
+		 "0x00002	tx path verbose\n"
+		 "0x00004	fatal/very-important messages\n"
+		 "0x00008	warning messages\n"
+		 "0x00010	Info about messages to/from firmware\n"
+		 "0xffffffff	any/all\n"
+	);
+
+static void __mt7915_configure_filter(struct ieee80211_hw *hw,
+				      unsigned int changed_flags,
+				      unsigned int *total_flags,
+				      u64 multicast);
+
 static bool mt7915_dev_running(struct mt7915_dev *dev)
 {
 	struct mt7915_phy *phy;
@@ -98,6 +115,8 @@ static int mt7915_start(struct ieee80211_hw *hw)
 {
 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
 	int ret;
+
+	dev->mt76.debug_lvl = debug_lvl;
 
 	flush_work(&dev->init_work);
 
@@ -245,7 +264,9 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
 	dev->mt76.vif_mask |= BIT_ULL(mvif->mt76.idx);
 	phy->omac_mask |= BIT_ULL(mvif->mt76.omac_idx);
 
-	idx = MT7915_WTBL_RESERVED - mvif->mt76.idx;
+	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, mt7915_wtbl_size(dev));
+	if (idx < 0)
+		return -ENOSPC;
 
 	INIT_LIST_HEAD(&mvif->sta.rc_list);
 	INIT_LIST_HEAD(&mvif->sta.wcid.poll_list);
@@ -483,22 +504,23 @@ static int mt7915_config(struct ieee80211_hw *hw, u32 changed)
 	if (changed & IEEE80211_CONF_CHANGE_MONITOR) {
 		bool enabled = !!(hw->conf.flags & IEEE80211_CONF_MONITOR);
 		bool band = phy->mt76->band_idx;
-		u32 rxfilter = phy->rxfilter;
+		u32 total_flags = phy->mac80211_rxfilter_flags;
+		u64 multicast = 0; /* not used by this driver currently. */
 
 		if (!enabled) {
-			rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 			dev->monitor_mask &= ~BIT(band);
 		} else {
-			rxfilter &= ~MT_WF_RFCR_DROP_OTHER_UC;
 			dev->monitor_mask |= BIT(band);
 		}
 
+		phy->monitor_enabled = enabled;
+
 		mt76_rmw_field(dev, MT_DMA_DCR0(band), MT_DMA_DCR0_RXD_G5_EN,
-			       enabled);
+			       dev->rx_group_5_enable);
 		mt76_rmw_field(dev, MT_DMA_DCR0(band), MT_MDP_DCR0_RX_HDR_TRANS_EN,
 			       !dev->monitor_mask);
 		mt76_testmode_reset(phy->mt76, true);
-		mt76_wr(dev, MT_WF_RFCR(band), rxfilter);
+		__mt7915_configure_filter(hw, 0, &total_flags, multicast);
 	}
 
 	mutex_unlock(&dev->mt76.mutex);
@@ -520,10 +542,44 @@ mt7915_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	return 0;
 }
 
-static void mt7915_configure_filter(struct ieee80211_hw *hw,
-				    unsigned int changed_flags,
-				    unsigned int *total_flags,
-				    u64 multicast)
+void mt7915_check_apply_monitor_config(struct mt7915_phy *phy)
+{
+	/* I first thought that this would not work well when combined
+	 * with STA mode, but now I think it will not matter since it appears
+	 * the HEMU rule 1 is only used after normal HE MU operations
+	 * have happened. --Ben
+	 */
+	struct mt7915_dev *dev = phy->dev;
+	u32 reg = mt76_rr(dev, MT_WF_HEMU_RULE1);
+
+	reg &= ~(MT_WF_HEMU_RULE1_AID |
+		 MT_WF_HEMU_RULE1_COLOR |
+		 MT_WF_HEMU_RULE1_ULDL |
+		 MT_WF_HEMU_RULE1_AID_ENABLE |
+		 MT_WF_HEMU_RULE1_BSS_COLOR_ENABLE |
+		 MT_WF_HEMU_RULE1_ULDL_ENABLE |
+		 MT_WF_HEMU_RULE1_PRIORITY);
+	reg |= phy->monitor_cur_aid;
+	reg |= (phy->monitor_cur_color << 10) & 0x3f;
+	if (phy->monitor_cur_uldl)
+		reg |= MT_WF_HEMU_RULE1_ULDL;
+	if (phy->monitor_cur_enables) {
+		if (phy->monitor_cur_enables & 0x1)
+			reg |= MT_WF_HEMU_RULE1_AID_ENABLE;
+		if (phy->monitor_cur_enables & 0x2)
+			reg |= MT_WF_HEMU_RULE1_BSS_COLOR_ENABLE;
+		if (phy->monitor_cur_enables & 0x4)
+			reg |= MT_WF_HEMU_RULE1_ULDL_ENABLE;
+		reg |= MT_WF_HEMU_RULE1_PRIORITY; /* set priority to 7 */
+	}
+
+	mt76_wr(dev, MT_WF_HEMU_RULE1, reg);
+}
+
+static void __mt7915_configure_filter(struct ieee80211_hw *hw,
+				      unsigned int changed_flags,
+				      unsigned int *total_flags,
+				      u64 multicast)
 {
 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
@@ -532,9 +588,20 @@ static void mt7915_configure_filter(struct ieee80211_hw *hw,
 			MT_WF_RFCR1_DROP_BF_POLL |
 			MT_WF_RFCR1_DROP_BA |
 			MT_WF_RFCR1_DROP_CFEND |
+			MT_WF_RFCR1_DROP_PS_BFRPOL |
+			MT_WF_RFCR1_DROP_PS_NDPA |
+			MT_WF_RFCR1_DROP_NO2ME_TF |
+			MT_WF_RFCR1_DROP_NON_MUBAR_TF |
+			MT_WF_RFCR1_DROP_RXS_BRP |
+			MT_WF_RFCR1_DROP_TF_BFRP |
 			MT_WF_RFCR1_DROP_CFACK;
 	u32 rxfilter;
 	u32 flags = 0;
+	bool is_promisc = *total_flags & FIF_CONTROL || phy->monitor_vif ||
+		phy->monitor_enabled;
+	u32 mdp_rcfr1_mask = MT_MDP_RCFR1_RX_DROPPED_UCAST |
+		MT_MDP_RCFR1_RX_DROPPED_MCAST;
+	u32 mdp_rcfr1_set;
 
 #define MT76_FILTER(_flag, _hw) do {					\
 		flags |= *total_flags & FIF_##_flag;			\
@@ -542,7 +609,7 @@ static void mt7915_configure_filter(struct ieee80211_hw *hw,
 		phy->rxfilter |= !(flags & FIF_##_flag) * (_hw);	\
 	} while (0)
 
-	mutex_lock(&dev->mt76.mutex);
+	phy->mac80211_rxfilter_flags = *total_flags; /* save requested flags for later */
 
 	phy->rxfilter &= ~(MT_WF_RFCR_DROP_OTHER_BSS |
 			   MT_WF_RFCR_DROP_OTHER_BEACON |
@@ -553,8 +620,12 @@ static void mt7915_configure_filter(struct ieee80211_hw *hw,
 			   MT_WF_RFCR_DROP_BCAST |
 			   MT_WF_RFCR_DROP_DUPLICATE |
 			   MT_WF_RFCR_DROP_A2_BSSID |
-			   MT_WF_RFCR_DROP_UNWANTED_CTL |
+			   MT_WF_RFCR_DROP_UNWANTED_CTL | /* 0 means drop */
+			   MT_WF_RFCR_IND_FILTER_EN_OF_31_23_BIT |
+			   MT_WF_RFCR_DROP_DIFFBSSIDMGT_CTRL |
 			   MT_WF_RFCR_DROP_STBC_MULTI);
+
+	phy->rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 
 	MT76_FILTER(OTHER_BSS, MT_WF_RFCR_DROP_OTHER_TIM |
 			       MT_WF_RFCR_DROP_A3_MAC |
@@ -565,6 +636,22 @@ static void mt7915_configure_filter(struct ieee80211_hw *hw,
 	MT76_FILTER(CONTROL, MT_WF_RFCR_DROP_CTS |
 			     MT_WF_RFCR_DROP_RTS |
 			     MT_WF_RFCR_DROP_CTL_RSV);
+	if (is_promisc) {
+		phy->rxfilter &= ~MT_WF_RFCR_DROP_OTHER_UC;
+		phy->rxfilter |= MT_WF_RFCR_IND_FILTER_EN_OF_31_23_BIT;
+		if (flags & FIF_CONTROL) {
+			phy->rxfilter |= MT_WF_RFCR_DROP_UNWANTED_CTL; /* 1 means receive */
+			phy->rxfilter |= MT_WF_RFCR_SECOND_BCN_EN;
+			phy->rxfilter |= MT_WF_RFCR_RX_MGMT_FRAME_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDPRORESP_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_DIFFBSSIDPRORESP_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDBCN_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_SAMEBSSIDNULL_CTRL;
+			phy->rxfilter |= MT_WF_RFCR_RX_DIFFBSSIDNULL_CTRL;
+			phy->rxfilter &= ~(MT_WF_RFCR_DROP_DIFFBSSIDMGT_CTRL);
+		}
+		phy->rxfilter |= MT_WF_RFCR_RX_DATA_FRAME_CTRL;
+	}
 
 	*total_flags = flags;
 	rxfilter = phy->rxfilter;
@@ -574,10 +661,34 @@ static void mt7915_configure_filter(struct ieee80211_hw *hw,
 		rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
 	mt76_wr(dev, MT_WF_RFCR(band), rxfilter);
 
-	if (*total_flags & FIF_CONTROL)
+	if (is_promisc) {
 		mt76_clear(dev, MT_WF_RFCR1(band), ctl_flags);
-	else
+		mt76_set(dev, MT_WF_RMAC_TOP_TF_PARSER(band),
+			 MT_WF_RMAC_TOP_TF_SNIFFER);
+		mt7915_check_apply_monitor_config(phy);
+
+		mdp_rcfr1_set = FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_UCAST, MT_MDP_PFD_TO_HIF) |
+			FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_MCAST, MT_MDP_PFD_TO_HIF);
+	} else {
 		mt76_set(dev, MT_WF_RFCR1(band), ctl_flags);
+		mt76_clear(dev, MT_WF_RMAC_TOP_TF_PARSER(band),
+			   MT_WF_RMAC_TOP_TF_SNIFFER);
+		mdp_rcfr1_set = FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_UCAST, MT_MDP_PFD_DROP) |
+			FIELD_PREP(MT_MDP_RCFR1_RX_DROPPED_MCAST, MT_MDP_PFD_DROP);
+	}
+	mt76_rmw(dev, MT_MDP_BNRCFR1(band), mdp_rcfr1_mask, mdp_rcfr1_set);
+}
+
+static void mt7915_configure_filter(struct ieee80211_hw *hw,
+				    unsigned int changed_flags,
+				    unsigned int *total_flags,
+				    u64 multicast)
+{
+	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+
+	mutex_lock(&dev->mt76.mutex);
+
+	__mt7915_configure_filter(hw, changed_flags, total_flags, multicast);
 
 	mutex_unlock(&dev->mt76.mutex);
 }
@@ -602,6 +713,34 @@ mt7915_update_bss_color(struct ieee80211_hw *hw,
 		break;
 	default:
 		break;
+	}
+}
+
+static void
+mt7915_update_mu_group(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+		       struct ieee80211_bss_conf *info)
+{
+	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+	u8 i, band = phy->mt76->band_idx;
+	u32 *mu;
+
+	mu = (u32 *)info->mu_group.membership;
+	for (i = 0; i < WLAN_MEMBERSHIP_LEN / sizeof(*mu); i++) {
+		if (is_mt7916(&dev->mt76))
+			mt76_wr(dev, MT_WF_PHY_RX_GID_TAB_VLD_MT7916(band, i),
+				mu[i]);
+		else
+			mt76_wr(dev, MT_WF_PHY_RX_GID_TAB_VLD(band, i), mu[i]);
+	}
+
+	mu = (u32 *)info->mu_group.position;
+	for (i = 0; i < WLAN_USER_POSITION_LEN / sizeof(*mu); i++) {
+		if (is_mt7916(&dev->mt76))
+			mt76_wr(dev, MT_WF_PHY_RX_GID_TAB_POS_MT7916(band, i),
+				mu[i]);
+		else
+			mt76_wr(dev, MT_WF_PHY_RX_GID_TAB_POS(band, i), mu[i]);
 	}
 }
 
@@ -668,6 +807,19 @@ static void mt7915_bss_info_changed(struct ieee80211_hw *hw,
 		mt7915_mcu_add_bss_info(phy, vif, false);
 	if (set_sta == 0)
 		mt7915_mcu_add_sta(dev, vif, NULL, false);
+
+	if (changed & BSS_CHANGED_MU_GROUPS) {
+		/* Assumption is that in case of non-monitor VDEV existing, then
+		 * that device should control the mu-group directly.
+		 */
+		int vif_count = mt76_vif_count(&dev->mt76);
+		int max_ok = 0;
+
+		if (phy->monitor_vif)
+			max_ok = 1;
+		if (vif_count <= max_ok)
+			mt7915_update_mu_group(hw, vif, info);
+	}
 
 	mutex_unlock(&dev->mt76.mutex);
 }
@@ -778,6 +930,7 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 {
 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+	struct mt76_wcid *wcid = &msta->wcid;
 	int i;
 
 	mt7915_mcu_add_sta(dev, vif, sta, false);
@@ -794,6 +947,17 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 	if (!list_empty(&msta->rc_list))
 		list_del_init(&msta->rc_list);
 	spin_unlock_bh(&mdev->sta_poll_lock);
+
+	if (WARN_ON_ONCE(!idr_is_empty(&wcid->pktid))) {
+		dev_err(dev->mt76.dev,
+			"wcid->pktid is not empty in mac_sta_remove, will force status check to recover.\n");
+		mt76_tx_status_check(mdev, true);
+	}
+
+	spin_lock_bh(&mdev->status_lock);
+	if (WARN_ON(!list_empty(&wcid->list)))
+		list_del_init(&wcid->list);
+	spin_unlock_bh(&mdev->status_lock);
 }
 
 static void mt7915_tx(struct ieee80211_hw *hw,
@@ -819,6 +983,9 @@ static void mt7915_tx(struct ieee80211_hw *hw,
 		mvif = (struct mt7915_vif *)vif->drv_priv;
 		wcid = &mvif->sta.wcid;
 	}
+
+	mtk_dbg(&dev->mt76, TXV, "mt7615-tx, wcid: %d\n",
+		wcid->idx);
 
 	mt76_tx(mphy, control->sta, wcid, skb);
 }
@@ -1072,6 +1239,7 @@ mt7915_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant)
 	mt76_set_stream_caps(phy->mt76, true);
 	mt7915_set_stream_vht_txbf_caps(phy);
 	mt7915_set_stream_he_caps(phy);
+	mt7915_mcu_set_txpower_sku(phy);
 
 	mutex_unlock(&dev->mt76.mutex);
 
@@ -1117,7 +1285,7 @@ static void mt7915_sta_statistics(struct ieee80211_hw *hw,
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
 
 		if (!mt7915_mcu_wed_wa_tx_stats(phy->dev, msta->wcid.idx)) {
-			sinfo->tx_packets = msta->wcid.stats.tx_packets;
+			sinfo->tx_packets = msta->wcid.stats.tx_mpdu_ok;
 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
 		}
 
@@ -1161,8 +1329,15 @@ static void mt7915_sta_rc_update(struct ieee80211_hw *hw,
 				 struct ieee80211_sta *sta,
 				 u32 changed)
 {
+	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
 	struct mt7915_dev *dev = phy->dev;
+
+	if (!msta->vif) {
+		dev_warn(dev->mt76.dev, "Un-initialized STA %pM wcid %d in rc_work\n",
+			 sta->addr, msta->wcid.idx);
+		return;
+	}
 
 	mt7915_sta_rc_work(&changed, sta);
 	ieee80211_queue_work(hw, &dev->rc_work);
@@ -1259,6 +1434,10 @@ out:
 }
 
 static const char mt7915_gstrings_stats[][ETH_GSTRING_LEN] = {
+	"tx_pkts_nic", /* from driver, phy tx-ok skb */
+	"tx_bytes_nic", /* from driver, phy tx-ok bytes */
+	"rx_pkts_nic", /* from driver, phy rx OK skb */
+	"rx_bytes_nic", /* from driver, phy rx OK bytes */
 	"tx_ampdu_cnt",
 	"tx_stop_q_empty_cnt",
 	"tx_mpdu_attempts",
@@ -1306,9 +1485,17 @@ static const char mt7915_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"tx_msdu_pack_6",
 	"tx_msdu_pack_7",
 	"tx_msdu_pack_8",
+	"tx_mgt_frame", /* SDR38, management frame tx counter */
+	"tx_mgt_frame_retry", /* SDR39, management frame retried counter */
+	"tx_data_frame_retry", /* SDR40, data frame retried counter */
+	"tx_drop_rts_retry_fail", /* TX Drop, RTS retries exhausted */
+	"tx_drop_mpdu_retry_fail", /* TX Drop, MPDU retries exhausted */
+	"tx_drop_lto_limit_fail", /* TX drop, Life Time Out limit reached. */
+	"tx_dbnss", /* pkts TX using double number of spatial streams */
 
 	/* rx counters */
 	"rx_fifo_full_cnt",
+	"rx_oor_cnt", /* rx ppdu length is bad */
 	"rx_mpdu_cnt",
 	"channel_idle_cnt",
 	"primary_cca_busy_time",
@@ -1328,6 +1515,9 @@ static const char mt7915_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"rx_pfdrop_cnt",
 	"rx_vec_queue_overflow_drop_cnt",
 	"rx_ba_cnt",
+	"rx_partial_beacon",
+	"rx_oppo_ps_rx_dis_drop",
+	"rx_fcs_ok",
 
 	/* muru mu-mimo and ofdma related stats */
 	"dl_cck_cnt",
@@ -1361,7 +1551,60 @@ static const char mt7915_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"ul_hetrig_3mu_cnt",
 	"ul_hetrig_4mu_cnt",
 
+	/* driver rx counters */
+	"d_rx_skb",
+	"d_rx_rxd2_amsdu_err",
+	"d_rx_null_channels",
+	"d_rx_max_len_err",
+	"d_rx_too_short",
+	"d_rx_bad_ht_rix",
+	"d_rx_bad_vht_rix",
+	"d_rx_bad_mode",
+	"d_rx_bad_bw",
+
+	/* muru mu-mimo and ofdma related stats */
+	"rx_cck_cnt",
+	"rx_ofdm_cnt",
+	"rx_htmix_cnt",
+	"rx_htgf_cnt",
+	"rx_vht_su_cnt",
+	"rx_vht_2mu_cnt",
+	"rx_vht_3mu_cnt",
+	"rx_vht_4mu_cnt",
+	"rx_he_su_cnt",
+	"rx_he_ext_su_cnt",
+	"rx_he_2ru_cnt",
+	"rx_he_2mu_cnt",
+	"rx_he_3ru_cnt",
+	"rx_he_3mu_cnt",
+	"rx_he_4ru_cnt",
+	"rx_he_4mu_cnt",
+	"rx_he_5to8ru_cnt",
+	"rx_he_9to16ru_cnt",
+	"rx_he_gtr16ru_cnt",
+
+	"tx_hetrig_su_cnt",
+	"tx_hetrig_2ru_cnt",
+	"tx_hetrig_3ru_cnt",
+	"tx_hetrig_4ru_cnt",
+	"tx_hetrig_5to8ru_cnt",
+	"tx_hetrig_9to16ru_cnt",
+	"tx_hetrig_gtr16ru_cnt",
+	"tx_hetrig_2mu_cnt",
+	"tx_hetrig_3mu_cnt",
+	"tx_hetrig_4mu_cnt",
+
 	/* per vif counters */
+	"v_tx_mpdu_attempts", /* counting any retries (all frames) */
+	"v_tx_mpdu_fail",  /* frames that failed even after retry (all frames) */
+	"v_tx_mpdu_retry", /* number of times frames were retried (all frames) */
+	"v_tx_mpdu_ok", /* frames that succeeded, perhaps after retry (all frames) */
+
+	"v_txo_tx_mpdu_attempts", /* counting any retries, txo frames */
+	"v_txo_tx_mpdu_fail",  /* frames that failed even after retry, txo frames */
+	"v_txo_tx_mpdu_retry", /* number of times frames were retried, txo frames */
+	"v_txo_tx_mpdu_ok", /* frames that succeeded, perhaps after retry, txo frames */
+
 	"v_tx_mode_cck",
 	"v_tx_mode_ofdm",
 	"v_tx_mode_ht",
@@ -1391,6 +1634,54 @@ static const char mt7915_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"v_tx_nss_2",
 	"v_tx_nss_3",
 	"v_tx_nss_4",
+
+	/* per-vif rx counters */
+	"v_rx_nss_1",
+	"v_rx_nss_2",
+	"v_rx_nss_3",
+	"v_rx_nss_4",
+	"v_rx_mode_cck",
+	"v_rx_mode_ofdm",
+	"v_rx_mode_ht",
+	"v_rx_mode_ht_gf",
+	"v_rx_mode_vht",
+	"v_rx_mode_he_su",
+	"v_rx_mode_he_ext_su",
+	"v_rx_mode_he_tb",
+	"v_rx_mode_he_mu",
+	"v_rx_bw_20",
+	"v_rx_bw_40",
+	"v_rx_bw_80",
+	"v_rx_bw_160",
+	"v_rx_bw_he_ru",
+	"v_rx_ru_106",
+	"v_rx_mcs_0",
+	"v_rx_mcs_1",
+	"v_rx_mcs_2",
+	"v_rx_mcs_3",
+	"v_rx_mcs_4",
+	"v_rx_mcs_5",
+	"v_rx_mcs_6",
+	"v_rx_mcs_7",
+	"v_rx_mcs_8",
+	"v_rx_mcs_9",
+	"v_rx_mcs_10",
+	"v_rx_mcs_11",
+	"rx_ampdu_len:0-1",
+	"rx_ampdu_len:2-10",
+	"rx_ampdu_len:11-19",
+	"rx_ampdu_len:20-28",
+	"rx_ampdu_len:29-37",
+	"rx_ampdu_len:38-46",
+	"rx_ampdu_len:47-55",
+	"rx_ampdu_len:56-79",
+	"rx_ampdu_len:80-103",
+	"rx_ampdu_len:104-127",
+	"rx_ampdu_len:128-151",
+	"rx_ampdu_len:152-175",
+	"rx_ampdu_len:176-199",
+	"rx_ampdu_len:200-223",
+	"rx_ampdu_len:224-247",
 };
 
 #define MT7915_SSTATS_LEN ARRAY_SIZE(mt7915_gstrings_stats)
@@ -1442,6 +1733,7 @@ void mt7915_get_et_stats(struct ieee80211_hw *hw,
 	struct mt76_ethtool_worker_info wi = {
 		.data = data,
 		.idx = mvif->mt76.idx,
+		.has_eht = false,
 	};
 	/* See mt7915_ampdu_stat_read_phy, etc */
 	int i, ei = 0, stats_size;
@@ -1450,6 +1742,13 @@ void mt7915_get_et_stats(struct ieee80211_hw *hw,
 
 	mt7915_mac_update_stats(phy);
 
+	/* driver phy-wide stats */
+	data[ei++] = mib->tx_pkts_nic;
+	data[ei++] = mib->tx_bytes_nic;
+	data[ei++] = mib->rx_pkts_nic;
+	data[ei++] = mib->rx_bytes_nic;
+
+	/* MIB stats from FW/HW */
 	data[ei++] = mib->tx_ampdu_cnt;
 	data[ei++] = mib->tx_stop_q_empty_cnt;
 	data[ei++] = mib->tx_mpdu_attempts_cnt;
@@ -1493,8 +1792,17 @@ void mt7915_get_et_stats(struct ieee80211_hw *hw,
 	for (i = 0; i < ARRAY_SIZE(mib->tx_amsdu); i++)
 		data[ei++] = mib->tx_amsdu[i];
 
+	data[ei++] = mib->tx_mgt_frame_cnt;
+	data[ei++] = mib->tx_mgt_frame_retry_cnt;
+	data[ei++] = mib->tx_data_frame_retry_cnt;
+	data[ei++] = mib->tx_drop_rts_retry_fail_cnt;
+	data[ei++] = mib->tx_drop_mpdu_retry_fail_cnt;
+	data[ei++] = mib->tx_drop_lto_limit_fail_cnt;
+	data[ei++] = mib->tx_dbnss_cnt;
+
 	/* rx counters */
-	data[ei++] = mib->rx_fifo_full_cnt;
+	data[ei++] = mib->rx_fifo_full_cnt; /* group-5 might exacerbate this */
+	data[ei++] = mib->rx_oor_cnt;
 	data[ei++] = mib->rx_mpdu_cnt;
 	data[ei++] = mib->channel_idle_cnt;
 	data[ei++] = mib->primary_cca_busy_time;
@@ -1514,6 +1822,51 @@ void mt7915_get_et_stats(struct ieee80211_hw *hw,
 	data[ei++] = mib->rx_pfdrop_cnt;
 	data[ei++] = mib->rx_vec_queue_overflow_drop_cnt;
 	data[ei++] = mib->rx_ba_cnt;
+	data[ei++] = mib->rx_partial_beacon_cnt;
+	data[ei++] = mib->rx_oppo_ps_rx_dis_drop_cnt;
+	data[ei++] = mib->rx_fcs_ok_cnt;
+
+	data[ei++] = mib->dl_cck_cnt;
+	data[ei++] = mib->dl_ofdm_cnt;
+	data[ei++] = mib->dl_htmix_cnt;
+	data[ei++] = mib->dl_htgf_cnt;
+	data[ei++] = mib->dl_vht_su_cnt;
+	data[ei++] = mib->dl_vht_2mu_cnt;
+	data[ei++] = mib->dl_vht_3mu_cnt;
+	data[ei++] = mib->dl_vht_4mu_cnt;
+	data[ei++] = mib->dl_he_su_cnt;
+	data[ei++] = mib->dl_he_ext_su_cnt;
+	data[ei++] = mib->dl_he_2ru_cnt;
+	data[ei++] = mib->dl_he_2mu_cnt;
+	data[ei++] = mib->dl_he_3ru_cnt;
+	data[ei++] = mib->dl_he_3mu_cnt;
+	data[ei++] = mib->dl_he_4ru_cnt;
+	data[ei++] = mib->dl_he_4mu_cnt;
+	data[ei++] = mib->dl_he_5to8ru_cnt;
+	data[ei++] = mib->dl_he_9to16ru_cnt;
+	data[ei++] = mib->dl_he_gtr16ru_cnt;
+
+	data[ei++] = mib->ul_hetrig_su_cnt;
+	data[ei++] = mib->ul_hetrig_2ru_cnt;
+	data[ei++] = mib->ul_hetrig_3ru_cnt;
+	data[ei++] = mib->ul_hetrig_4ru_cnt;
+	data[ei++] = mib->ul_hetrig_5to8ru_cnt;
+	data[ei++] = mib->ul_hetrig_9to16ru_cnt;
+	data[ei++] = mib->ul_hetrig_gtr16ru_cnt;
+	data[ei++] = mib->ul_hetrig_2mu_cnt;
+	data[ei++] = mib->ul_hetrig_3mu_cnt;
+	data[ei++] = mib->ul_hetrig_4mu_cnt;
+
+	/* rx stats from driver */
+	data[ei++] = mib->rx_d_skb;
+	data[ei++] = mib->rx_d_rxd2_amsdu_err;
+	data[ei++] = mib->rx_d_null_channels;
+	data[ei++] = mib->rx_d_max_len_err;
+	data[ei++] = mib->rx_d_too_short;
+	data[ei++] = mib->rx_d_bad_ht_rix;
+	data[ei++] = mib->rx_d_bad_vht_rix;
+	data[ei++] = mib->rx_d_bad_mode;
+	data[ei++] = mib->rx_d_bad_bw;
 
 	data[ei++] = mib->dl_cck_cnt;
 	data[ei++] = mib->dl_ofdm_cnt;

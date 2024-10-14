@@ -110,7 +110,8 @@ static void ath9k_beacon_setup(struct ath_softc *sc, struct ieee80211_vif *vif,
 }
 
 static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
-					     struct ieee80211_vif *vif)
+					     struct ieee80211_vif *vif,
+					     const int slotwidth)
 {
 	struct ath_softc *sc = hw->priv;
 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
@@ -162,8 +163,6 @@ static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
 		return NULL;
 	}
 
-	skb = ieee80211_get_buffered_bc(hw, vif);
-
 	/*
 	 * if the CABQ traffic from previous DTIM is pending and the current
 	 *  beacon is also a DTIM.
@@ -176,42 +175,92 @@ static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
 	cabq_depth = cabq->axq_depth;
 	spin_unlock_bh(&cabq->axq_lock);
 
-	if (skb && cabq_depth) {
-		if (sc->cur_chan->nvifs > 1) {
-			ath_dbg(common, BEACON,
-				"Flushing previous cabq traffic\n");
-			ath_draintxq(sc, cabq);
-		}
-	}
-
 	ath9k_beacon_setup(sc, vif, bf, info->control.rates[0].idx);
 
-	if (skb)
-		ath_tx_cabq(hw, vif, skb);
+	ath_tx_cabq(hw, vif, slotwidth);
 
 	return bf;
 }
 
-void ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
+bool ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
 {
 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
 	struct ath_vif *avp = (void *)vif->drv_priv;
-	int slot;
 
+	int slot, i;
+	int curstart = 0; /* last item in use before free area */
+	int curwidth = 0; /* number of free items following curstart item */
+	int maxstart = 0;
+	int maxwidth = 0;
+	int old_maxw;
+
+	avp->multicastWakeup = 0;
 	avp->av_bcbuf = list_first_entry(&sc->beacon.bbuf, struct ath_buf, list);
+	if (WARN_ON_ONCE(!avp->av_bcbuf))
+		return false;
 	list_del(&avp->av_bcbuf->list);
 
-	for (slot = 0; slot < ATH_BCBUF; slot++) {
-		if (sc->beacon.bslot[slot] == NULL) {
-			avp->av_bslot = slot;
-			break;
+	/* iterate two times over all slots and find maximum length empty area */
+	for (i = 0; i < 2; i++) {
+		for (slot = 0; slot < ATH_BCBUF; slot++) {
+			if (sc->beacon.bslot[slot] == NULL)
+				curwidth++;
+			else {
+				curstart = slot;
+				curwidth = 0;
+			}
+
+			if (curwidth > maxwidth) {
+				maxstart = curstart;
+				maxwidth = curwidth;
+			}
 		}
 	}
+
+	old_maxw = maxwidth;
+	if (maxwidth >= ATH_BCBUF) {
+		/* all slots are empty */
+		slot = 0;
+	} else if (maxwidth == 1) {
+		/* First empty one */
+		for (slot = 0; slot < ATH_BCBUF; slot++) {
+			if (sc->beacon.bslot[slot] == NULL)
+				break;
+		}
+	} else {
+		/* use middle slot, round up */
+		/* given maxwidth > 0 --> maxwidth > 0 */
+		/* given maxwidth < n --> maxwidth <= n/2 < n for n > 0 */
+		maxwidth = (maxwidth + 1) / 2;
+		slot = (maxstart + maxwidth) % ATH_BCBUF;
+	}
+
+	/* Check if all slots are full? */
+	if (WARN_ON_ONCE(slot == ATH_BCBUF))
+		goto free_bbuf;
+
+	if (sc->beacon.bslot[slot] != NULL) {
+		/* This should not happen, log to figure out why. */
+		ath_err(common, "beacon slot is NOT null, slot: %d  maxwith: %d  old_maxw: %d ATH_BCBUF: %d max-start: %d\n",
+			slot, maxwidth, old_maxw, ATH_BCBUF, maxstart);
+		for (slot = 0; slot < ATH_BCBUF; slot++) {
+			ath_err(common, "slot[%d] == %p\n",
+				slot, sc->beacon.bslot[slot]);
+		}
+		goto free_bbuf;
+	}
+
+	avp->av_bslot = slot;
 
 	sc->beacon.bslot[avp->av_bslot] = vif;
 
 	ath_dbg(common, CONFIG, "Added interface at beacon slot: %d\n",
 		avp->av_bslot);
+	return true;
+
+free_bbuf:
+	list_add_tail(&avp->av_bcbuf->list, &sc->beacon.bbuf);
+	return false;
 }
 
 void ath9k_beacon_remove_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
@@ -394,12 +443,24 @@ void ath9k_beacon_tasklet(struct tasklet_struct *t)
 	struct ieee80211_vif *vif;
 	bool edma = !!(ah->caps.hw_caps & ATH9K_HW_CAP_EDMA);
 	int slot;
+	int slotwidth;
+	int i;
 
 	if (test_bit(ATH_OP_HW_RESET, &common->op_flags)) {
 		ath_dbg(common, RESET,
 			"reset work is pending, skip beaconing now\n");
 		return;
 	}
+
+	/* Check if slot is occupied. Only check for stuck beacons
+	 * if slot is occupied to allow a bss to push out buffered
+	 * multicasts for more than one slot
+	 */
+	slot = ath9k_beacon_choose_slot(sc);
+	vif = sc->beacon.bslot[slot];
+
+	if (!vif || !vif->bss_conf.enable_beacon)
+		return;
 
 	/*
 	 * Check if the previous beacon has gone out.  If
@@ -438,9 +499,6 @@ void ath9k_beacon_tasklet(struct tasklet_struct *t)
 		return;
 	}
 
-	slot = ath9k_beacon_choose_slot(sc);
-	vif = sc->beacon.bslot[slot];
-
 	/* EDMA devices check that in the tx completion function. */
 	if (!edma) {
 		if (ath9k_is_chanctx_enabled()) {
@@ -452,14 +510,24 @@ void ath9k_beacon_tasklet(struct tasklet_struct *t)
 			return;
 	}
 
-	if (!vif || !vif->bss_conf.enable_beacon)
-		return;
-
 	if (ath9k_is_chanctx_enabled()) {
 		ath_chanctx_event(sc, vif, ATH_CHANCTX_EVENT_BEACON_PREPARE);
 	}
 
-	bf = ath9k_beacon_generate(sc->hw, vif);
+	/* calculate width of current slot - i.e. the number of slots following
+	 * this slot that are unoccupied
+	 */
+	slotwidth = 1;
+	for (i = slot + 1; i < ATH_BCBUF && !sc->beacon.bslot[i]; i++) {
+		slotwidth++;
+	}
+	if (i == ATH_BCBUF) {
+		for (i = 0; i < slot && !sc->beacon.bslot[i]; i++) {
+			slotwidth++;
+		}
+	}
+
+	bf = ath9k_beacon_generate(sc->hw, vif, slotwidth);
 
 	if (sc->beacon.bmisscnt != 0) {
 		ath_dbg(common, BSTUCK, "resume beacon xmit after %u misses\n",

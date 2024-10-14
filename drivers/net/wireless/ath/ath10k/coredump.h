@@ -9,7 +9,7 @@
 
 #include "core.h"
 
-#define ATH10K_FW_CRASH_DUMP_VERSION 1
+#define ATH10K_FW_CRASH_DUMP_VERSION 2 /* upstream stole some bits I was using, or will soon. --Ben */
 
 /**
  * enum ath10k_fw_crash_dump_type - types of data in the dump file
@@ -17,6 +17,11 @@
  * @ATH10K_FW_CRASH_DUMP_CE_DATA: Copy Engine crash dump data
  * @ATH10K_FW_CRASH_DUMP_RAM_DATA: RAM crash dump data, contains multiple
  *				   struct ath10k_dump_ram_data_hdr
+ * @ATH10K_FW_ERROR_DUMP_DBGLOG:  Recent firmware debug log entries
+ * @ATH10K_FW_CRASH_DUMP_STACK:   Stack memory contents.
+ * @ATH10K_FW_CRASH_DUMP_EXC_STACK:   Exception stack memory contents.
+ * @ATH10K_FW_CRASH_DUMP_RAM_BSS:  BSS area for RAM code
+ * @ATH10K_FW_CRASH_DUMP_ROM_BSS:  BSS area for ROM code
  * @ATH10K_FW_CRASH_DUMP_MAX: Maximum enumeration
  */
 enum ath10k_fw_crash_dump_type {
@@ -25,7 +30,11 @@ enum ath10k_fw_crash_dump_type {
 
 	/* contains multiple struct ath10k_dump_ram_data_hdr */
 	ATH10K_FW_CRASH_DUMP_RAM_DATA = 2,
-
+	ATH10K_FW_CRASH_DUMP_DBGLOG = 20,
+	ATH10K_FW_CRASH_DUMP_STACK = 21,
+	ATH10K_FW_CRASH_DUMP_EXC_STACK = 22,
+	ATH10K_FW_CRASH_DUMP_RAM_BSS = 23,
+	ATH10K_FW_CRASH_DUMP_ROM_BSS = 24,
 	ATH10K_FW_CRASH_DUMP_MAX,
 };
 
@@ -89,8 +98,13 @@ struct ath10k_dump_file_data {
 	/* VERMAGIC_STRING */
 	char kernel_ver[64];
 
+	__le32 stack_addr;
+	__le32 exc_stack_addr;
+	__le32 rom_bss_addr;
+	__le32 ram_bss_addr;
+
 	/* room for growth w/out changing binary format */
-	u8 unused[128];
+	u8 unused[112];
 
 	/* struct ath10k_tlv_dump_data + more */
 	u8 data[];
@@ -172,8 +186,7 @@ struct ath10k_hw_mem_layout {
 /* FIXME: where to put this? */
 extern unsigned long ath10k_coredump_mask;
 
-#ifdef CONFIG_DEV_COREDUMP
-
+#if ((defined CONFIG_DEV_COREDUMP) || defined (CONFIG_ATH10K_DEBUGFS))
 int ath10k_coredump_submit(struct ath10k *ar);
 struct ath10k_fw_crash_data *ath10k_coredump_new(struct ath10k *ar);
 int ath10k_coredump_create(struct ath10k *ar);
@@ -184,7 +197,7 @@ void ath10k_coredump_destroy(struct ath10k *ar);
 const struct ath10k_hw_mem_layout *_ath10k_coredump_get_mem_layout(struct ath10k *ar);
 const struct ath10k_hw_mem_layout *ath10k_coredump_get_mem_layout(struct ath10k *ar);
 
-#else /* CONFIG_DEV_COREDUMP */
+#else /* CONFIG_DEV_COREDUMP || CONFIG_ATH10K_DEBUGFS */
 
 static inline int ath10k_coredump_submit(struct ath10k *ar)
 {

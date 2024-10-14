@@ -44,14 +44,15 @@ static void mt7921e_unregister_device(struct mt792x_dev *dev)
 	struct mt76_connac_pm *pm = &dev->pm;
 
 	cancel_work_sync(&dev->init_work);
-	mt76_unregister_device(&dev->mt76);
+	if (dev->hw_registered)
+		mt76_unregister_device(&dev->mt76);
 	mt76_for_each_q_rx(&dev->mt76, i)
 		napi_disable(&dev->mt76.napi[i]);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_work_sync(&pm->wake_work);
 	cancel_work_sync(&dev->reset_work);
 
-	mt76_connac2_tx_token_put(&dev->mt76);
+	mt76_connac2_tx_token_put(&dev->mt76, &dev->phy.mib);
 	__mt792x_mcu_drv_pmctrl(dev);
 	mt792x_dma_cleanup(dev);
 	mt792x_wfsys_reset(dev);
@@ -276,12 +277,16 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	int ret;
 
 	ret = pcim_enable_device(pdev);
-	if (ret)
+	if (ret) {
+		pr_info("pcim_enable_device failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = pcim_iomap_regions(pdev, BIT(0), pci_name(pdev));
-	if (ret)
+	if (ret) {
+		pr_info("pcim_iomap_regions failed: %d\n", ret);
 		return ret;
+	}
 
 	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
 	if (!(cmd & PCI_COMMAND_MEMORY)) {
@@ -291,18 +296,23 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	pci_set_master(pdev);
 
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_info("pci_alloc_irq_vectors failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
+	if (ret) {
+		pr_info("dma_set_mask failed: %d\n", ret);
 		goto err_free_pci_vec;
+	}
 
 	if (mt7921_disable_aspm)
 		mt76_pci_disable_aspm(pdev);
 
 	ops = mt792x_get_mac80211_ops(&pdev->dev, &mt7921_ops,
-				      (void *)id->driver_data, &features);
+				      (void *)id->driver_data, &features,
+				      true, true);
 	if (!ops) {
 		ret = -ENOMEM;
 		goto err_free_pci_vec;
@@ -310,6 +320,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 
 	mdev = mt76_alloc_device(&pdev->dev, sizeof(*dev), ops, &drv_ops);
 	if (!mdev) {
+		pr_info("mt76_alloc_device failed (ENOMEM?)\n");
 		ret = -ENOMEM;
 		goto err_free_pci_vec;
 	}
@@ -330,6 +341,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	bus_ops = devm_kmemdup(dev->mt76.dev, dev->bus_ops, sizeof(*bus_ops),
 			       GFP_KERNEL);
 	if (!bus_ops) {
+		dev_info(mdev->dev, "devm_kmemdup bus-opps failed (ENOMEM?)\n");
 		ret = -ENOMEM;
 		goto err_free_dev;
 	}
@@ -347,8 +359,10 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 		goto err_free_dev;
 
 	ret = __mt792xe_mcu_drv_pmctrl(dev);
-	if (ret)
+	if (ret) {
+		dev_info(mdev->dev, "__mt792xe_mcu_drv_pmctrl failed: %d\n", ret);
 		goto err_free_dev;
+	}
 
 	chipid = mt7921_l1_rr(dev, MT_HW_CHIPID);
 	if (chipid == 0x7961 && (mt7921_l1_rr(dev, MT_HW_BOUND) & BIT(7)))
@@ -367,16 +381,22 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 
 	ret = devm_request_irq(mdev->dev, pdev->irq, mt792x_irq_handler,
 			       IRQF_SHARED, KBUILD_MODNAME, dev);
-	if (ret)
+	if (ret) {
+		dev_info(mdev->dev, "devm_request_irq failed: %d\n", ret);
 		goto err_free_dev;
+	}
 
 	ret = mt7921_dma_init(dev);
-	if (ret)
+	if (ret) {
+		dev_info(mdev->dev, "mt7921_dma_init failed: %d\n", ret);
 		goto err_free_irq;
+	}
 
 	ret = mt7921_register_device(dev);
-	if (ret)
+	if (ret) {
+		dev_info(mdev->dev, "mt7921_register_device failed failed: %d\n", ret);
 		goto err_free_irq;
+	}
 
 	if (of_property_read_bool(dev->mt76.dev->of_node, "wakeup-source"))
 		device_init_wakeup(dev->mt76.dev, true);

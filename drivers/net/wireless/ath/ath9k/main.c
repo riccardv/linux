@@ -814,7 +814,8 @@ static void ath9k_tx(struct ieee80211_hw *hw,
 	txctl.txq = sc->tx.txq_map[skb_get_queue_mapping(skb)];
 	txctl.sta = control->sta;
 
-	ath_dbg(common, XMIT, "transmitting packet, skb: %p\n", skb);
+	ath_dbg(common, XMIT, "transmitting packet, skb: %p  dur/id: 0x%x\n",
+		skb, hdr->duration_id);
 
 	if (ath_tx_start(hw, skb, &txctl) != 0) {
 		ath_dbg(common, XMIT, "TX failed\n");
@@ -1350,8 +1351,13 @@ static int ath9k_add_interface(struct ieee80211_hw *hw,
 	if (vif->type == NL80211_IFTYPE_STATION && ath9k_is_chanctx_enabled())
 		vif->driver_flags |= IEEE80211_VIF_GET_NOA_UPDATE;
 
-	if (ath9k_uses_beacons(vif->type))
-		ath9k_beacon_assign_slot(sc, vif);
+	if (ath9k_uses_beacons(vif->type)) {
+		if (!ath9k_beacon_assign_slot(sc, vif)) {
+			sc->cur_chan->nvifs--;
+			mutex_unlock(&sc->mutex);
+			return -EOPNOTSUPP;
+		}
+	}
 
 	avp->vif = vif;
 	if (!ath9k_is_chanctx_enabled()) {

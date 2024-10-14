@@ -439,7 +439,6 @@ mt76_phy_init(struct mt76_phy *phy, struct ieee80211_hw *hw)
 			WIPHY_FLAG_AP_UAPSD;
 
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CQM_RSSI_LIST);
-	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_AIRTIME_FAIRNESS);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_AQL);
 
 	wiphy->available_antennas_tx = phy->antenna_mask;
@@ -694,6 +693,14 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
 	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++)
 		skb_queue_head_init(&dev->rx_skb[i]);
 
+	/* Check twice as often as the timeout value so that we mitigate
+	 * worse-case timeout detection (where we do the check right before
+	 * the per skb timer would have expired and so have to wait another interval
+	 * to detect the skb status timeout.)
+	 */
+	dev->stale_skb_status_check = MT_TX_STATUS_SKB_TIMEOUT_DFLT / 2;
+	dev->stale_skb_status_timeout = MT_TX_STATUS_SKB_TIMEOUT_DFLT;
+
 	dev->wq = alloc_ordered_workqueue("mt76", 0);
 	if (!dev->wq) {
 		ieee80211_free_hw(hw);
@@ -848,13 +855,15 @@ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
 	struct mt76_phy *phy = mt76_dev_phy(dev, status->phy_idx);
 
-	if (!test_bit(MT76_STATE_RUNNING, &phy->state)) {
+	if (!test_bit(MT76_STATE_RUNNING, &phy->state) ||
+	    unlikely(dev->block_traffic & MT_BLOCK_RX)) {
 		dev_kfree_skb(skb);
 		return;
 	}
 
 #ifdef CONFIG_NL80211_TESTMODE
-	if (phy->test.state == MT76_TM_STATE_RX_FRAMES) {
+	if (!(phy->test.flag & MT_TM_FW_RX_COUNT) &&
+	    phy->test.state == MT76_TM_STATE_RX_FRAMES) {
 		phy->test.rx_stats.packets[q]++;
 		if (status->flag & RX_FLAG_FAILED_FCS_CRC)
 			phy->test.rx_stats.fcs_error[q]++;
@@ -1697,14 +1706,15 @@ int mt76_get_rate(struct mt76_dev *dev,
 		  struct ieee80211_supported_band *sband,
 		  int idx, bool cck)
 {
+	bool is_2g = sband->band == NL80211_BAND_2GHZ;
 	int i, offset = 0, len = sband->n_bitrates;
 
 	if (cck) {
-		if (sband != &dev->phy.sband_2g.sband)
+		if (!is_2g)
 			return 0;
 
 		idx &= ~BIT(2); /* short preamble */
-	} else if (sband == &dev->phy.sband_2g.sband) {
+	} else if (is_2g) {
 		offset = 4;
 	}
 
@@ -1797,10 +1807,20 @@ EXPORT_SYMBOL_GPL(mt76_calculate_default_rate);
 void mt76_ethtool_worker(struct mt76_ethtool_worker_info *wi,
 			 struct mt76_sta_stats *stats, bool eht)
 {
-	int i, ei = wi->initial_stat_idx;
+	int i, q, ei = wi->initial_stat_idx;
 	u64 *data = wi->data;
 
 	wi->sta_count++;
+
+	data[ei++] += stats->tx_attempts;
+	data[ei++] += stats->tx_failed;
+	data[ei++] += stats->tx_retries;
+	data[ei++] += stats->tx_mpdu_ok;
+
+	data[ei++] += stats->txo_tx_mpdu_attempts;
+	data[ei++] += stats->txo_tx_mpdu_fail;
+	data[ei++] += stats->txo_tx_mpdu_retry;
+	data[ei++] += stats->txo_tx_mpdu_ok;
 
 	data[ei++] += stats->tx_mode[MT_PHY_TYPE_CCK];
 	data[ei++] += stats->tx_mode[MT_PHY_TYPE_OFDM];
@@ -1825,6 +1845,40 @@ void mt76_ethtool_worker(struct mt76_ethtool_worker_info *wi,
 
 	for (i = 0; i < 4; i++)
 		data[ei++] += stats->tx_nss[i];
+
+	/* rx stats */
+	for (q = 0; q < ARRAY_SIZE(stats->rx_nss); q++)
+		data[ei++] += stats->rx_nss[q];
+
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_CCK];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_OFDM];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HT];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HT_GF];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_VHT];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HE_SU];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HE_EXT_SU];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HE_TB];
+	data[ei++] += stats->rx_mode[MT_PHY_TYPE_HE_MU];
+	if (eht) {
+		data[ei++] += stats->rx_mode[MT_PHY_TYPE_EHT_SU];
+		data[ei++] += stats->rx_mode[MT_PHY_TYPE_EHT_TRIG];
+		data[ei++] += stats->rx_mode[MT_PHY_TYPE_EHT_MU];
+	}
+
+	data[ei++] += stats->rx_bw_20;
+	data[ei++] += stats->rx_bw_40;
+	data[ei++] += stats->rx_bw_80;
+	data[ei++] += stats->rx_bw_160;
+	if (eht)
+		data[ei++] += stats->rx_bw_320;
+	data[ei++] += stats->rx_bw_he_ru;
+	data[ei++] += stats->rx_ru_106;
+
+	for (q = 0; q<(eht ? 14 : 12); q++)
+		data[ei++] += stats->rx_rate_idx[q];
+
+	for (q = 0; q<15; q++)
+		data[ei++] += stats->rx_ampdu_len[q];
 
 	wi->worker_stat_count = ei - wi->initial_stat_idx;
 }

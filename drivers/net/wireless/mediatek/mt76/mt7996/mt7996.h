@@ -32,15 +32,45 @@
 #define MT7996_FIRMWARE_WA		"mediatek/mt7996/mt7996_wa.bin"
 #define MT7996_FIRMWARE_WM		"mediatek/mt7996/mt7996_wm.bin"
 #define MT7996_FIRMWARE_DSP		"mediatek/mt7996/mt7996_dsp.bin"
+#define MT7996_FIRMWARE_WM_TM		"mediatek/mt7996/mt7996_wm_tm.bin"
 #define MT7996_ROM_PATCH		"mediatek/mt7996/mt7996_rom_patch.bin"
+
+#define MT7996_FIRMWARE_WA_233		"mediatek/mt7996/mt7996_wa_233.bin"
+#define MT7996_FIRMWARE_WM_233		"mediatek/mt7996/mt7996_wm_233.bin"
+#define MT7996_FIRMWARE_DSP_233		MT7996_FIRMWARE_DSP
+#define MT7996_FIRMWARE_WM_TM_233	"mediatek/mt7996/mt7996_wm_tm_233.bin"
+#define MT7996_ROM_PATCH_233		"mediatek/mt7996/mt7996_rom_patch_233.bin"
+#define MT7996_EEPROM_DEFAULT_233	"mediatek/mt7996/mt7996_eeprom_233.bin"
+#define MT7996_EEPROM_DEFAULT_404	"mediatek/mt7996/mt7996_eeprom_dual_404.bin"
 
 #define MT7992_FIRMWARE_WA		"mediatek/mt7996/mt7992_wa.bin"
 #define MT7992_FIRMWARE_WM		"mediatek/mt7996/mt7992_wm.bin"
 #define MT7992_FIRMWARE_DSP		"mediatek/mt7996/mt7992_dsp.bin"
+#define MT7992_FIRMWARE_WM_TM_23	"mediatek/mt7996/mt7992_wm_tm_23.bin"
+#define MT7992_FIRMWARE_WM_TM_24	"mediatek/mt7996/mt7992_wm_tm_24.bin"
+#define MT7992_FIRMWARE_WM_TM		"mediatek/mt7996/mt7992_wm_tm.bin"
 #define MT7992_ROM_PATCH		"mediatek/mt7996/mt7992_rom_patch.bin"
 
+#define MT7992_FIRMWARE_WA_24		"mediatek/mt7996/mt7992_wa_24.bin"
+#define MT7992_FIRMWARE_WM_24		"mediatek/mt7996/mt7992_wm_24.bin"
+#define MT7992_FIRMWARE_DSP_24		"mediatek/mt7996/mt7992_dsp_24.bin"
+#define MT7992_ROM_PATCH_24		"mediatek/mt7996/mt7992_rom_patch_24.bin"
+
+#define MT7992_FIRMWARE_WA_23		"mediatek/mt7996/mt7992_wa_23.bin"
+#define MT7992_FIRMWARE_WM_23		"mediatek/mt7996/mt7992_wm_23.bin"
+#define MT7992_FIRMWARE_DSP_23		"mediatek/mt7996/mt7992_dsp_23.bin"
+#define MT7992_ROM_PATCH_23		"mediatek/mt7996/mt7992_rom_patch_23.bin"
+
 #define MT7996_EEPROM_DEFAULT		"mediatek/mt7996/mt7996_eeprom.bin"
-#define MT7992_EEPROM_DEFAULT		"mediatek/mt7996/mt7992_eeprom.bin"
+#define MT7996_EEPROM_DEFAULT_TM	"mediatek/mt7996/mt7996_eeprom_tm.bin"
+#define MT7996_EEPROM_DEFAULT_404	"mediatek/mt7996/mt7996_eeprom_dual_404.bin"
+#define MT7992_EEPROM_DEFAULT		"mediatek/mt7996/mt7992_eeprom_2i5i.bin"
+#define MT7992_EEPROM_DEFAULT_EXT	"mediatek/mt7996/mt7992_eeprom_2e5e.bin"
+#define MT7992_EEPROM_DEFAULT_MIX	"mediatek/mt7996/mt7992_eeprom_2i5e.bin"
+#define MT7992_EEPROM_DEFAULT_24	"mediatek/mt7996/mt7992_eeprom_24_2i5i.bin"
+#define MT7992_EEPROM_DEFAULT_23	"mediatek/mt7996/mt7992_eeprom_23_2i5i.bin"
+#define MT7992_EEPROM_DEFAULT_23_EXT	"mediatek/mt7996/mt7992_eeprom_23_2e5e.bin"
+
 #define MT7996_EEPROM_SIZE		7680
 #define MT7996_EEPROM_BLOCK_SIZE	16
 #define MT7996_TOKEN_SIZE		16384
@@ -89,8 +119,28 @@ struct mt7996_sta;
 struct mt7996_dfs_pulse;
 struct mt7996_dfs_pattern;
 
+enum mt7996_fem_type {
+	MT7996_FEM_UNSET,
+	MT7996_FEM_EXT,
+	MT7996_FEM_INT,
+	MT7996_FEM_MIX,
+};
+
+enum mt7996_sku_type {
+	MT7996_SKU_404,
+	MT7996_SKU_444,
+	MT7996_SKU_233,
+};
+
+enum mt7992_sku_type {
+	MT7992_SKU_23,
+	MT7992_SKU_24,
+	MT7992_SKU_44,
+};
+
 enum mt7996_ram_type {
 	MT7996_RAM_TYPE_WM,
+	MT7996_RAM_TYPE_WM_TM = MT7996_RAM_TYPE_WM,
 	MT7996_RAM_TYPE_WA,
 	MT7996_RAM_TYPE_DSP,
 };
@@ -158,6 +208,8 @@ struct mt7996_sta {
 
 	struct mt76_connac_sta_key_conf bip;
 
+	struct mt76_testmode_data test;
+
 	struct {
 		u8 flowid_mask;
 		struct mt7996_twt_flow flow[MT7996_MAX_STA_TWT_AGRT];
@@ -213,15 +265,22 @@ struct mt7996_phy {
 
 	struct ieee80211_vif *monitor_vif;
 
+	/* Initial txpower, from EEPROM I suppose. */
+	struct mt7996_mcu_txpower_event *default_txpower;
+
 	struct thermal_cooling_device *cdev;
 	u8 cdev_state;
 	u8 throttle_state;
 	u32 throttle_temp[2]; /* 0: critical high, 1: maximum */
 
+	u32 mac80211_rxfilter_flags;
+	u8 monitor_enabled;
 	u32 rxfilter;
 	u64 omac_mask;
 
 	u16 noise;
+	s8 tx_front_end_loss;
+	s8 tx_front_end_loss_acquired;
 
 	s16 coverage_class;
 	u8 slottime;
@@ -236,7 +295,29 @@ struct mt7996_phy {
 	struct mt76_mib_stats mib;
 	struct mt76_channel_state state_ts;
 
+	bool sku_limit_en;
+	bool sku_path_en;
 	bool has_aux_rx;
+	bool adjust_txp_by_loss; /* adjust txpower higher based on path-loss reported by radio */
+	bool sr_enable;
+	bool enhanced_sr_enable;
+	u8 pp_mode;
+	u16 punct_bitmap;
+
+#ifdef CONFIG_NL80211_TESTMODE
+	struct {
+		u32 *reg_backup;
+
+		s32 last_freq_offset;
+		u8 last_rcpi[4];
+		s8 last_rssi[4];
+		s8 last_ib_rssi[4];
+		s8 last_wb_rssi[4];
+		u8 last_snr;
+
+		u8 spe_idx;
+	} test;
+#endif
 };
 
 struct mt7996_dev {
@@ -258,9 +339,17 @@ struct mt7996_dev {
 	struct cfg80211_chan_def rdd2_chandef;
 	struct mt7996_phy *rdd2_phy;
 
+	u8 chip_sku;
+	u8 fem_type;
+
 	u16 chainmask;
 	u8 chainshift[__MT_MAX_BAND];
 	u32 hif_idx;
+
+	/* Should we enable group-5 rx descriptor logic?  This may decrease RX
+	 * throughput, but will give per skb rx rate information..
+	 */
+	bool rx_group_5_enable;
 
 	struct work_struct init_work;
 	struct work_struct rc_work;
@@ -288,6 +377,7 @@ struct mt7996_dev {
 	struct list_head twt_list;
 
 	u32 hw_pattern;
+	u32 ignore_radar; /* skip propagating up the stack, for debugging */
 
 	bool flash_mode:1;
 	bool has_eht:1;
@@ -311,6 +401,8 @@ struct mt7996_dev {
 		struct list_head poll_list;
 		spinlock_t lock;
 	} wed_rro;
+
+	bool testmode_enable;
 
 	bool ibf;
 	u8 fw_debug_wm;
@@ -406,8 +498,7 @@ mt7996_band_valid(struct mt7996_dev *dev, u8 band)
 		return band <= MT_BAND1;
 
 	/* tri-band support */
-	if (band <= MT_BAND2 &&
-	    mt76_get_field(dev, MT_PAD_GPIO, MT_PAD_GPIO_ADIE_COMB) <= 1)
+	if (band <= MT_BAND2 && dev->chip_sku)
 		return true;
 
 	return band == MT_BAND0 || band == MT_BAND2;
@@ -416,6 +507,7 @@ mt7996_band_valid(struct mt7996_dev *dev, u8 band)
 extern const struct ieee80211_ops mt7996_ops;
 extern struct pci_driver mt7996_pci_driver;
 extern struct pci_driver mt7996_hif_driver;
+extern const struct mt76_testmode_ops mt7996_testmode_ops;
 
 struct mt7996_dev *mt7996_mmio_probe(struct device *pdev,
 				     void __iomem *mem_base, u32 device_id);
@@ -425,6 +517,7 @@ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif *mvif);
 int mt7996_register_device(struct mt7996_dev *dev);
 void mt7996_unregister_device(struct mt7996_dev *dev);
 int mt7996_eeprom_init(struct mt7996_dev *dev);
+int mt7996_eeprom_check_fw_mode(struct mt7996_dev *dev);
 int mt7996_eeprom_parse_hw_cap(struct mt7996_dev *dev, struct mt7996_phy *phy);
 int mt7996_eeprom_get_target_power(struct mt7996_dev *dev,
 				   struct ieee80211_channel *chan);
@@ -438,6 +531,7 @@ int mt7996_init_tx_queues(struct mt7996_phy *phy, int idx,
 			  int n_desc, int ring_base, struct mtk_wed_device *wed);
 void mt7996_init_txpower(struct mt7996_phy *phy);
 int mt7996_txbf_init(struct mt7996_dev *dev);
+int mt7996_get_chip_sku(struct mt7996_dev *dev);
 void mt7996_reset(struct mt7996_dev *dev);
 int mt7996_run(struct ieee80211_hw *hw);
 int mt7996_mcu_init(struct mt7996_dev *dev);
@@ -476,7 +570,7 @@ int mt7996_mcu_set_fixed_rate_ctrl(struct mt7996_dev *dev,
 int mt7996_mcu_set_fixed_field(struct mt7996_dev *dev, struct ieee80211_vif *vif,
 			       struct ieee80211_sta *sta, void *data, u32 field);
 int mt7996_mcu_set_eeprom(struct mt7996_dev *dev);
-int mt7996_mcu_get_eeprom(struct mt7996_dev *dev, u32 offset);
+int mt7996_mcu_get_eeprom(struct mt7996_dev *dev, u32 offset, u8 *read_buf);
 int mt7996_mcu_get_eeprom_free_block(struct mt7996_dev *dev, u8 *block_num);
 int mt7996_mcu_get_chip_config(struct mt7996_dev *dev, u32 *cap);
 int mt7996_mcu_set_ser(struct mt7996_dev *dev, u8 action, u8 set, u8 band);
@@ -511,6 +605,7 @@ void mt7996_mcu_rx_event(struct mt7996_dev *dev, struct sk_buff *skb);
 void mt7996_mcu_exit(struct mt7996_dev *dev);
 int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag);
 int mt7996_mcu_wed_rro_reset_sessions(struct mt7996_dev *dev, u16 id);
+int mt7996_mcu_set_tx_power_ctrl(struct mt7996_phy *phy, u8 power_ctrl_id, u8 data);
 
 static inline u8 mt7996_max_interface_num(struct mt7996_dev *dev)
 {
@@ -603,6 +698,8 @@ void mt7996_set_stream_he_eht_caps(struct mt7996_phy *phy);
 void mt7996_set_stream_vht_txbf_caps(struct mt7996_phy *phy);
 void mt7996_update_channel(struct mt76_phy *mphy);
 int mt7996_init_debugfs(struct mt7996_phy *phy);
+int mt7996_mcu_set_tx_power_ctrl(struct mt7996_phy *phy, u8 power_ctrl_id, u8 data);
+int mt7996_mcu_get_tx_power_info(struct mt7996_phy *phy, u8 category, void *event);
 void mt7996_debugfs_rx_fw_monitor(struct mt7996_dev *dev, const void *data, int len);
 bool mt7996_debugfs_rx_log(struct mt7996_dev *dev, const void *data, int len);
 int mt7996_mcu_add_key(struct mt76_dev *dev, struct ieee80211_vif *vif,
@@ -614,6 +711,7 @@ int mt7996_mcu_wtbl_update_hdr_trans(struct mt7996_dev *dev,
 				     struct ieee80211_vif *vif,
 				     struct ieee80211_sta *sta);
 int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode);
+int mt7996_mcu_set_pp_en(struct mt7996_phy *phy, u8 mode, u16 bitmap);
 #ifdef CONFIG_MAC80211_DEBUGFS
 void mt7996_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			    struct ieee80211_sta *sta, struct dentry *dir);
@@ -622,9 +720,12 @@ int mt7996_mmio_wed_init(struct mt7996_dev *dev, void *pdev_ptr,
 			 bool hif2, int *irq);
 u32 mt7996_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
 
-#ifdef CONFIG_MTK_DEBUG
-int mt7996_mtk_init_debugfs(struct mt7996_phy *phy, struct dentry *dir);
-#endif
+int mt7996_mcu_set_sr_enable(struct mt7996_phy *phy, u8 action, u64 val, bool set);
+void mt7996_mcu_rx_sr_event(struct mt7996_dev *dev, struct sk_buff *skb);
+
+int mt7996_mcu_get_tx_power_info(struct mt7996_phy *phy, u8 category, void *event);
+int mt7996_mcu_set_lpi_psd(struct mt7996_phy *phy, u8 enable);
+int mt7996_mcu_set_sniffer_mode(struct mt7996_phy *phy, bool enabled);
 
 #ifdef CONFIG_NET_MEDIATEK_SOC_WED
 int mt7996_dma_rro_init(struct mt7996_dev *dev);

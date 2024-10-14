@@ -2234,7 +2234,7 @@ ath10k_wmi_tlv_op_gen_vdev_start(struct ath10k *ar,
 	tlv->tag = __cpu_to_le16(WMI_TLV_TAG_STRUCT_CHANNEL);
 	tlv->len = __cpu_to_le16(sizeof(*ch));
 	ch = (void *)tlv->value;
-	ath10k_wmi_put_wmi_channel(ar, ch, &arg->channel);
+	ath10k_wmi_put_wmi_channel(ar, ch, &arg->channel, arg->vdev_id);
 
 	ptr += sizeof(*tlv);
 	ptr += sizeof(*ch);
@@ -2874,7 +2874,7 @@ ath10k_wmi_tlv_op_gen_scan_chan_list(struct ath10k *ar,
 		tlv->len = __cpu_to_le16(sizeof(*ci));
 		ci = (void *)tlv->value;
 
-		ath10k_wmi_put_wmi_channel(ar, ci, ch);
+		ath10k_wmi_put_wmi_channel(ar, ci, ch, 0xFFFFFFFF);
 
 		chans += sizeof(*tlv);
 		chans += sizeof(*ci);
@@ -2988,7 +2988,7 @@ ath10k_wmi_tlv_op_gen_pdev_set_wmm(struct ath10k *ar,
 }
 
 static struct sk_buff *
-ath10k_wmi_tlv_op_gen_request_stats(struct ath10k *ar, u32 stats_mask)
+ath10k_wmi_tlv_op_gen_request_stats(struct ath10k *ar, u32 stats_mask, u32 specifier)
 {
 	struct wmi_request_stats_cmd *cmd;
 	struct wmi_tlv *tlv;
@@ -3605,7 +3605,7 @@ ath10k_wmi_tlv_op_gen_tdls_peer_update(struct ath10k *ar,
 		tlv->tag = __cpu_to_le16(WMI_TLV_TAG_STRUCT_CHANNEL);
 		tlv->len = __cpu_to_le16(sizeof(*chan));
 		chan = (void *)tlv->value;
-		ath10k_wmi_put_wmi_channel(ar, chan, &chan_arg[i]);
+		ath10k_wmi_put_wmi_channel(ar, chan, &chan_arg[i], arg->vdev_id);
 
 		ptr += sizeof(*tlv);
 		ptr += sizeof(*chan);

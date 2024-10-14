@@ -34,15 +34,16 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	if (sta) {
 		struct mt792x_sta *msta = (struct mt792x_sta *)sta->drv_priv;
 
-		if (time_after(jiffies, msta->deflink.last_txs + HZ / 4)) {
+		if (dev->mt76.txs_for_all_enabled ||
+		    time_after(jiffies, msta->deflink.last_txs + HZ / 4)) {
 			info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 			msta->deflink.last_txs = jiffies;
 		}
 	}
 
 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
-	mt76_connac2_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
-				    pid, qid, 0);
+	mt7921_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, pid, key,
+			      qid, 0);
 
 	txp = (struct mt76_connac_hw_txp *)(txwi + MT_TXD_SIZE);
 	memset(txp, 0, sizeof(struct mt76_connac_hw_txp));
@@ -76,7 +77,7 @@ int mt7921e_mac_reset(struct mt792x_dev *dev)
 	napi_disable(&dev->mt76.napi[MT_RXQ_MCU_WA]);
 	napi_disable(&dev->mt76.tx_napi);
 
-	mt76_connac2_tx_token_put(&dev->mt76);
+	mt76_connac2_tx_token_put(&dev->mt76, &dev->phy.mib);
 	idr_init(&dev->mt76.token);
 
 	mt792x_wpdma_reset(dev, true);

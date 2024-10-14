@@ -299,6 +299,7 @@ struct iwl_probe_resp_data {
  * @active: indicates the link is active in FW (for sanity checking)
  * @cab_queue: content-after-beacon (multicast) queue
  * @listen_lmac: indicates this link is allocated to the listen LMAC
+ * @csa_block_tx: we got CSA with mode=1
  * @mcast_sta: multicast station
  * @phy_ctxt: phy context allocated to this link, if any
  * @bf_data: beacon filtering data
@@ -324,6 +325,7 @@ struct iwl_mvm_vif_link_info {
 	bool he_ru_2mhz_block;
 	bool active;
 	bool listen_lmac;
+	bool csa_block_tx;
 
 	u16 cab_queue;
 	/* Assigned while mac80211 has the link in a channel context,
@@ -368,6 +370,8 @@ struct iwl_mvm_vif_link_info {
  *	preventing the enablement of EMLSR
  * @IWL_MVM_ESR_EXIT_CSA: CSA happened, so exit EMLSR
  * @IWL_MVM_ESR_EXIT_LINK_USAGE: Exit EMLSR due to low tpt on secondary link
+ * @IWL_MVM_ESR_EXIT_BAND: Exit EMLSR due to incompatible Bands
+ * @IWL_MVM_ESR_EXIT_FAIL_ENTRY: Exit EMLSR due to entry failure
  */
 enum iwl_mvm_esr_state {
 	IWL_MVM_ESR_BLOCKED_PREVENTION	= 0x1,
@@ -382,6 +386,8 @@ enum iwl_mvm_esr_state {
 	IWL_MVM_ESR_EXIT_BANDWIDTH	= 0x80000,
 	IWL_MVM_ESR_EXIT_CSA		= 0x100000,
 	IWL_MVM_ESR_EXIT_LINK_USAGE	= 0x200000,
+	IWL_MVM_ESR_EXIT_BAND		= 0x400000,
+	IWL_MVM_ESR_EXIT_FAIL_ENTRY	= 0x800000,
 };
 
 #define IWL_MVM_BLOCK_ESR_REASONS 0xffff
@@ -684,6 +690,54 @@ struct iwl_mvm_cooling_device {
 };
 #endif
 
+struct iwl_mvm_ethtool_stats {
+	u64 tx_bytes_nic; /* successful tx bytes */
+
+	u64 tx_mpdu_attempts; /* counting any retries */
+	u64 tx_mpdu_fail; /* Failed even after retry */
+	u64 tx_mpdu_retry; /* Number of times frames were retried */
+
+	unsigned long txo_tx_mpdu_attempts; /* counting any retries, txo frames */
+	unsigned long txo_tx_mpdu_fail; /* frames that failed even after retry, txo frames */
+	unsigned long txo_tx_mpdu_ok; /* tx frames */
+	unsigned long txo_tx_mpdu_retry; /* number of times frames were retried, txo frames */
+
+	/* maps to iwl_tx_status enum
+	 * (TX_STATUS_INTERNAL_ABORT + 1) gathers all larger values.
+	 */
+	u64 tx_status_counts[TX_STATUS_INTERNAL_ABORT + 2];
+
+	u64 tx_cck;
+	u64 tx_ofdm;
+	u64 tx_ht;
+	u64 tx_vht;
+	u64 tx_he;
+	u64 tx_eht;
+
+	u64 tx_he_type[4]; /* su, ext_su, mu, trig */
+	u64 tx_ampdu_len[15];
+	u64 tx_bw[5]; /* 20, 40, 80, 160, 320 */
+	u64 tx_bw_106_tone;
+	u64 tx_mcs[14]; /* mcs 0 to mcs 13 */
+	u64 tx_nss[2]; /* tx nss histogram */
+
+	u64 rx_pkts; /* successful rx skb */
+	u64 rx_bytes_nic; /* successful tx bytes */
+	u64 rx_crc_err;
+	u64 rx_fifo_underrun;
+	u64 rx_failed_decrypt;
+	u64 rx_dup;
+	u64 rx_bad_header_len;
+
+	u64 rx_mode[6]; /* cck, ofdm, ht, vht, he, eht */
+	u64 rx_he_type[4]; /* su, ext_su, mu, trig */
+	u64 rx_bw[5]; /* 20, 40, 80, 160, 320 */
+	u64 rx_bw_he_ru;
+	u64 rx_mcs[14]; /* mcs 0 to mcs 13 */
+	u64 rx_ampdu_len[15];
+	u64 rx_nss[2]; /* rx nss histogram */
+};
+
 #define IWL_MVM_NUM_LAST_FRAMES_UCODE_RATES 8
 
 struct iwl_mvm_frame_stats {
@@ -770,7 +824,6 @@ struct iwl_mvm_tcm {
  * @num_stored: number of mpdus stored in the buffer
  * @queue: queue of this reorder buffer
  * @last_amsdu: track last ASMDU SN for duplication detection
- * @last_sub_index: track ASMDU sub frame index for duplication detection
  * @valid: reordering is valid for this queue
  * @lock: protect reorder buffer internal state
  */
@@ -779,7 +832,6 @@ struct iwl_mvm_reorder_buffer {
 	u16 num_stored;
 	int queue;
 	u16 last_amsdu;
-	u8 last_sub_index;
 	bool valid;
 	spinlock_t lock;
 } ____cacheline_aligned_in_smp;
@@ -985,6 +1037,25 @@ struct iwl_mvm_acs_survey {
 	struct iwl_mvm_acs_survey_channel channels[] __counted_by(n_channels);
 };
 
+struct iwl_txo_data {
+	struct rcu_head rcu_head;
+	u8 txo_active; /* tx overrides are active */
+	u8 txbw; /* specify TX bandwidth: 0 20Mhz, 1 40Mhz, 2 80Mhz, 3 160Mhz, 4 320Mhz */
+	/* SGI:  VHT and lower: 0 off, 1 on
+	 * HE-SU: 0 1xLTF+0.8us, 1 2xLTF+0.8us, 2 2xLTF+1.6us, 3 4xLTF+3.2us, 4 4xLTF+0.8us
+	 */
+	u8 tx_rate_sgi; /* and LTF for HE/EHT */
+	u8 tx_rate_mode; /* 0=cck, 1=ofdm, 2=HT, 3=VHT, 4=HE_SU, 5=EHT */
+	u8 tx_rate_idx;
+	u8 tx_rate_nss;
+
+	u8 tx_power;
+	u8 tx_xmit_count; /* 0 means no-ack, 1 means one transmit, etc */
+	u8 ldpc;
+	u8 stbc;
+	u8 beamforming; /* beamforming on or off */
+};
+
 struct iwl_mvm {
 	/* for logger access */
 	struct device *dev;
@@ -1011,6 +1082,7 @@ struct iwl_mvm {
 	unsigned long init_status;
 
 	unsigned long status;
+	unsigned long esr_tpt_ts; /* last time we compared tput for ESR */
 
 	u32 queue_sync_cookie;
 	unsigned long queue_sync_state;
@@ -1025,6 +1097,8 @@ struct iwl_mvm {
 
 	u8 cca_40mhz_workaround;
 
+	/* Accumulate the count for the number of frames in the ampdu */
+	u32 rx_this_ampdu_count;
 	u32 ampdu_ref;
 	bool ampdu_toggle;
 
@@ -1034,6 +1108,8 @@ struct iwl_mvm {
 		struct mvm_statistics_rx_v3 rx_stats_v3;
 		struct mvm_statistics_rx rx_stats;
 	};
+	struct iwl_mvm_ethtool_stats ethtool_stats;
+	struct iwl_txo_data __rcu *txo_data;
 
 	struct {
 		u64 rx_time;
@@ -1074,8 +1150,8 @@ struct iwl_mvm {
 
 	/* data related to data path */
 	struct iwl_rx_phy_info last_phy_info;
-	struct ieee80211_sta __rcu *fw_id_to_mac_id[IWL_MVM_STATION_COUNT_MAX];
-	struct ieee80211_link_sta __rcu *fw_id_to_link_sta[IWL_MVM_STATION_COUNT_MAX];
+	struct ieee80211_sta __rcu *fw_id_to_mac_id[IWL_STATION_COUNT_MAX];
+	struct ieee80211_link_sta __rcu *fw_id_to_link_sta[IWL_STATION_COUNT_MAX];
 	u8 rx_ba_sessions;
 
 	/* configured by mac80211 */
@@ -1164,7 +1240,7 @@ struct iwl_mvm {
 
 	struct ieee80211_vif __rcu *vif_id_to_mac[NUM_MAC_INDEX_DRIVER];
 
-	struct ieee80211_bss_conf __rcu *link_id_to_link_conf[IWL_MVM_FW_MAX_LINK_ID + 1];
+	struct ieee80211_bss_conf __rcu *link_id_to_link_conf[IWL_FW_MAX_LINK_ID + 1];
 
 	/* -1 for always, 0 for never, >0 for that many times */
 	s8 fw_restart;
@@ -1200,8 +1276,11 @@ struct iwl_mvm {
 
 	wait_queue_head_t rx_sync_waitq;
 
-	/* BT-Coex */
-	struct iwl_bt_coex_profile_notif last_bt_notif;
+	/* BT-Coex - only one of those will be used */
+	union {
+		struct iwl_bt_coex_prof_old_notif last_bt_notif;
+		struct iwl_bt_coex_profile_notif last_bt_wifi_loss;
+	};
 	struct iwl_bt_coex_ci_cmd last_bt_ci_cmd;
 
 	u8 bt_tx_prio;
@@ -1365,6 +1444,12 @@ struct iwl_mvm {
 	struct iwl_mvm_acs_survey *acs_survey;
 
 	bool statistics_clear;
+
+	u32 bios_enable_puncturing;
+
+#define IWL_MVM_BLOCK_TX 0x1
+#define IWL_MVM_BLOCK_RX 0x2
+	u8 block_traffic;
 };
 
 /* Extract MVM priv from op_mode and _hw */
@@ -1700,9 +1785,9 @@ static inline struct agg_tx_status *
 iwl_mvm_get_agg_status(struct iwl_mvm *mvm, void *tx_resp)
 {
 	if (iwl_mvm_has_new_tx_api(mvm))
-		return &((struct iwl_mvm_tx_resp *)tx_resp)->status;
+		return &((struct iwl_tx_resp *)tx_resp)->status;
 	else
-		return ((struct iwl_mvm_tx_resp_v3 *)tx_resp)->status;
+		return ((struct iwl_tx_resp_v3 *)tx_resp)->status;
 }
 
 static inline bool iwl_mvm_is_tt_in_fw(struct iwl_mvm *mvm)
@@ -1745,7 +1830,7 @@ static inline int iwl_mvm_max_active_links(struct iwl_mvm *mvm,
 	if (iwl_mvm_is_esr_supported(trans) ||
 	    (CSR_HW_RFID_TYPE(trans->hw_rf_id) == IWL_CFG_RF_TYPE_FM &&
 	     CSR_HW_RFID_IS_CDB(trans->hw_rf_id)))
-		return IWL_MVM_FW_MAX_ACTIVE_LINKS_NUM;
+		return IWL_FW_MAX_ACTIVE_LINKS_NUM;
 
 	return 1;
 }
@@ -1762,6 +1847,13 @@ static inline u8 iwl_mvm_mac_ac_to_tx_fifo(struct iwl_mvm *mvm,
 	if (iwl_mvm_has_new_tx_api(mvm))
 		return iwl_mvm_ac_to_gen2_tx_fifo[ac];
 	return iwl_mvm_ac_to_tx_fifo[ac];
+}
+
+static inline bool iwl_mvm_has_rlc_offload(struct iwl_mvm *mvm)
+{
+	return iwl_fw_lookup_cmd_ver(mvm->fw,
+				     WIDE_ID(DATA_PATH_GROUP, RLC_CONFIG_CMD),
+				     0) >= 3;
 }
 
 struct iwl_rate_info {
@@ -1786,7 +1878,8 @@ int iwl_mvm_legacy_hw_idx_to_mac80211_idx(u32 rate_n_flags,
 					  enum nl80211_band band);
 int iwl_mvm_legacy_rate_to_mac80211_idx(u32 rate_n_flags,
 					enum nl80211_band band);
-void iwl_mvm_hwrate_to_tx_rate(u32 rate_n_flags,
+void iwl_mvm_hwrate_to_tx_rate(struct iwl_mvm *mvm,
+			       u32 rate_n_flags,
 			       enum nl80211_band band,
 			       struct ieee80211_tx_rate *r);
 void iwl_mvm_hwrate_to_tx_rate_v1(u32 rate_n_flags,
@@ -1945,6 +2038,8 @@ int iwl_mvm_mac_setup_register(struct iwl_mvm *mvm);
 
 void iwl_mvm_mac_init_mvmvif(struct iwl_mvm *mvm, struct iwl_mvm_vif *mvmvif);
 
+void iwl_mvm_count_rx_histogram(struct iwl_mvm *mvm);
+
 /*
  * FW notifications / CMD responses handlers
  * Convention: iwl_mvm_rx_<NAME OF THE CMD>
@@ -2003,7 +2098,7 @@ int iwl_mvm_phy_send_rlc(struct iwl_mvm *mvm, struct iwl_mvm_phy_ctxt *ctxt,
 void iwl_mvm_prepare_mac_removal(struct iwl_mvm *mvm,
 				 struct ieee80211_vif *vif);
 void iwl_mvm_set_fw_basic_rates(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
-				struct ieee80211_bss_conf *link_conf,
+				struct iwl_mvm_vif_link_info *link_info,
 				__le32 *cck_rates, __le32 *ofdm_rates);
 void iwl_mvm_set_fw_protection_flags(struct iwl_mvm *mvm,
 				     struct ieee80211_vif *vif,
@@ -2062,6 +2157,8 @@ void iwl_mvm_rx_beacon_notif(struct iwl_mvm *mvm,
 			     struct iwl_rx_cmd_buffer *rxb);
 void iwl_mvm_rx_missed_beacons_notif(struct iwl_mvm *mvm,
 				     struct iwl_rx_cmd_buffer *rxb);
+void iwl_mvm_rx_missed_beacons_notif_legacy(struct iwl_mvm *mvm,
+					    struct iwl_rx_cmd_buffer *rxb);
 void iwl_mvm_rx_stored_beacon_notif(struct iwl_mvm *mvm,
 				    struct iwl_rx_cmd_buffer *rxb);
 void iwl_mvm_mu_mimo_grp_notif(struct iwl_mvm *mvm,
@@ -2322,6 +2419,8 @@ int iwl_mvm_send_proto_offload(struct iwl_mvm *mvm,
 
 /* BT Coex */
 int iwl_mvm_send_bt_init_conf(struct iwl_mvm *mvm);
+void iwl_mvm_rx_bt_coex_old_notif(struct iwl_mvm *mvm,
+				  struct iwl_rx_cmd_buffer *rxb);
 void iwl_mvm_rx_bt_coex_notif(struct iwl_mvm *mvm,
 			      struct iwl_rx_cmd_buffer *rxb);
 void iwl_mvm_bt_rssi_event(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
@@ -2570,8 +2669,7 @@ u8 iwl_mvm_tcm_load_percentage(u32 airtime, u32 elapsed);
 
 void iwl_mvm_nic_restart(struct iwl_mvm *mvm, bool fw_error);
 unsigned int iwl_mvm_get_wd_timeout(struct iwl_mvm *mvm,
-				    struct ieee80211_vif *vif,
-				    bool tdls, bool cmd_q);
+				    struct ieee80211_vif *vif);
 void iwl_mvm_connection_loss(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 			     const char *errmsg);
 void iwl_mvm_event_frame_timeout_callback(struct iwl_mvm *mvm,
@@ -2859,6 +2957,14 @@ int iwl_mvm_mac_ampdu_action(struct ieee80211_hw *hw,
 			     struct ieee80211_ampdu_params *params);
 int iwl_mvm_op_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant);
 int iwl_mvm_op_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant);
+int iwl_mvm_get_et_sset_count(struct ieee80211_hw *hw,
+			      struct ieee80211_vif *vif, int sset);
+void iwl_mvm_get_et_stats(struct ieee80211_hw *hw,
+			  struct ieee80211_vif *vif,
+			  struct ethtool_stats *stats, u64 *data);
+void iwl_mvm_get_et_strings(struct ieee80211_hw *hw,
+			    struct ieee80211_vif *vif,
+			    u32 sset, u8 *data);
 int iwl_mvm_mac_start(struct ieee80211_hw *hw);
 void iwl_mvm_mac_reconfig_complete(struct ieee80211_hw *hw,
 				   enum ieee80211_reconfig_type reconfig_type);
@@ -3021,9 +3127,39 @@ iwl_mvm_bt_coex_calculate_esr_mode(struct iwl_mvm *mvm,
 int iwl_mvm_esr_non_bss_link(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 			     unsigned int link_id, bool active);
 
-void
-iwl_mvm_send_ap_tx_power_constraint_cmd(struct iwl_mvm *mvm,
-					struct ieee80211_vif *vif,
-					struct ieee80211_bss_conf *bss_conf,
-					bool is_ap);
+static inline int iwl_mvm_sum_sigs_2(int a, int b)
+{
+       int diff;
+
+       /* S8_MIN means value-is-not-set */
+       if (b == S8_MIN)
+               return a;
+       if (a == S8_MIN)
+               return b;
+
+       if (a >= b) {
+               /* a is largest value, add to it. */
+               diff = a - b;
+               if (diff == 0)
+                       return a + 3;
+               else if (diff <= 2)
+                       return a + 2;
+               else if (diff <= 6)
+                       return a + 1;
+               return a;
+       } else {
+               /* b is largest value, add to it. */
+               diff = b - a;
+               if (diff == 0)
+                       return b + 3;
+               else if (diff <= 2)
+                       return b + 2;
+               else if (diff <= 6)
+                       return b + 1;
+               return b;
+       }
+}
+
+void iwl_mvm_mld_select_links(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+			      bool valid_links_changed);
 #endif /* __IWL_MVM_H__ */

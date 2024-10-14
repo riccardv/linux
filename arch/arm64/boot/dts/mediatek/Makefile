@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
+#
+DTC_FLAGS := -@
+
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt2712-evb.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt6755-evb.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt6779-evb.dtb
@@ -21,6 +24,25 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7986a-bananapi-bpi-r3-sd.dtbo
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt7986a-rfb.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt7986b-rfb.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-bananapi-bpi-r4.dtb
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-bananapi-bpi-r4-emmc.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-bananapi-bpi-r4-sd.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-bananapi-bpi-r4-wifi-mt7996a.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb.dtb
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-emmc.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth1-aqr.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth1-i2p5g-phy.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth1-mxl.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth1-sfp.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth2-aqr.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth2-mxl.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-eth2-sfp.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-sd.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-snfi-nand.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-spim-nand.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-rfb-spim-nor.dtbo
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-smartrg-SDG-8733.dtb
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-smartrg-SDG-8733v.dtb
+dtb-$(CONFIG_ARCH_MEDIATEK) += mt7988a-smartrg-SDG-8734v.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt8167-pumpkin.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt8173-elm.dtb
 dtb-$(CONFIG_ARCH_MEDIATEK) += mt8173-elm-hana.dtb

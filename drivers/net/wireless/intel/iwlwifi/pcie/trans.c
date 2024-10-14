@@ -33,6 +33,10 @@
 #define IWL_FW_MEM_EXTENDED_START	0x40000
 #define IWL_FW_MEM_EXTENDED_END		0x57FFF
 
+static uint fw_dbg_buffer_order = 19; /* 512KB of logs in crash dump */
+module_param_named(fw_dbg_buffer_order, fw_dbg_buffer_order, uint, 0644);
+MODULE_PARM_DESC(fw_dbg_buffer_order, "2^[power] for firmware crash dump logs buffer size, default is 19");
+
 void iwl_trans_pcie_dump_regs(struct iwl_trans *trans)
 {
 #define PCI_DUMP_SIZE		352
@@ -184,8 +188,8 @@ static void iwl_pcie_alloc_fw_monitor_block(struct iwl_trans *trans,
 			continue;
 
 		IWL_INFO(trans,
-			 "Allocated 0x%08x bytes for firmware monitor.\n",
-			 size);
+			 "Allocated 0x%08x bytes for firmware monitor, max_power: %d  power: %d.\n",
+			 size, max_power, power);
 		break;
 	}
 
@@ -205,6 +209,8 @@ static void iwl_pcie_alloc_fw_monitor_block(struct iwl_trans *trans,
 
 void iwl_pcie_alloc_fw_monitor(struct iwl_trans *trans, u8 max_power)
 {
+	pr_err("iwl_pcie_alloc_fw_monitor, monitor size max_power requested: %d\n",
+	       max_power);
 	if (!max_power) {
 		/* default max_power is maximum */
 		max_power = 26;
@@ -216,6 +222,13 @@ void iwl_pcie_alloc_fw_monitor(struct iwl_trans *trans, u8 max_power)
 		 "External buffer size for monitor is too big %d, check the FW TLV\n",
 		 max_power))
 		return;
+
+	/* Try to use less memory, there are other things in the system as well! */
+	if (max_power > fw_dbg_buffer_order) {
+		pr_err("iwl_pcie_alloc_fw_monitor, decreasing max-power from %d to %d to save memory.\n",
+		       max_power, fw_dbg_buffer_order);
+		max_power = fw_dbg_buffer_order;
+	}
 
 	iwl_pcie_alloc_fw_monitor_block(trans, max_power);
 }
@@ -1967,7 +1980,6 @@ void iwl_trans_pcie_configure(struct iwl_trans *trans,
 
 	trans_pcie->txqs.cmd.q_id = trans_cfg->cmd_queue;
 	trans_pcie->txqs.cmd.fifo = trans_cfg->cmd_fifo;
-	trans_pcie->txqs.cmd.wdg_timeout = trans_cfg->cmd_q_wdg_timeout;
 	trans_pcie->txqs.page_offs = trans_cfg->cb_data_offs;
 	trans_pcie->txqs.dev_cmd_offs = trans_cfg->cb_data_offs + sizeof(void *);
 	trans_pcie->txqs.queue_alloc_cmd_ver = trans_cfg->queue_alloc_cmd_ver;
@@ -3070,6 +3082,12 @@ void iwl_trans_pcie_dbgfs_register(struct iwl_trans *trans)
 	DEBUGFS_ADD_FILE(rfkill, dir, 0600);
 	DEBUGFS_ADD_FILE(monitor_data, dir, 0400);
 	DEBUGFS_ADD_FILE(rf, dir, 0400);
+
+	/* Triggers a false fw timeout, then sabotages the recovery effort.
+	 * Requires a reboot to recover the driver.
+	 */
+	debugfs_create_bool("fw_trigger_timeout", 0600, dir,
+			    &trans->dbg.fake_double_fault);
 }
 
 void iwl_trans_pcie_debugfs_cleanup(struct iwl_trans *trans)
@@ -3566,6 +3584,9 @@ struct iwl_trans *iwl_trans_pcie_alloc(struct pci_dev *pdev,
 		trans_pcie->txqs.tfd.size = sizeof(struct iwl_tfd);
 	}
 	trans->max_skb_frags = IWL_TRANS_PCIE_MAX_FRAGS(trans_pcie);
+
+	/* Set a short watchdog for the command queue */
+	trans_pcie->txqs.cmd.wdg_timeout = IWL_DEF_WD_TIMEOUT;
 
 	trans_pcie->txqs.tso_hdr_page = alloc_percpu(struct iwl_tso_hdr_page);
 	if (!trans_pcie->txqs.tso_hdr_page) {

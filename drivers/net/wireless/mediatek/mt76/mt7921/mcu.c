@@ -23,16 +23,47 @@ int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 	int ret = 0;
 
 	if (!skb) {
-		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
-			cmd, seq);
+		const char* first = "Secondary";
+
+		if (!mdev->first_failed_mcu_cmd)
+			first = "Initial";
+
+		dev_err(mdev->dev, "MCU: %s Failure: Message %08x (cid %lx ext_cid: %lx seq %d) timeout.  Last successful cmd: 0x%x\n",
+			first,
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq,
+			mdev->last_successful_mcu_cmd);
+
+		if (!mdev->first_failed_mcu_cmd)
+			mdev->first_failed_mcu_cmd = cmd;
+
 		mt792x_reset(mdev);
 
 		return -ETIMEDOUT;
 	}
 
+	mdev->last_successful_mcu_cmd = cmd;
+
+	if (mdev->first_failed_mcu_cmd) {
+		dev_err(mdev->dev, "MCU: First success after failure: Message %08x (cid %lx ext_cid: %lx seq %d)\n",
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq);
+		mdev->first_failed_mcu_cmd = 0;
+	}
+	else {
+		/* verbose debugging
+		dev_err(mdev->dev, "MCU: OK response to message %08x (cid %lx ext_cid: %lx seq %d)\n",
+			cmd, FIELD_GET(__MCU_CMD_FIELD_ID, cmd),
+			FIELD_GET(__MCU_CMD_FIELD_EXT_ID, cmd), seq);
+		*/
+	}
+
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
-	if (seq != rxd->seq)
+	if (seq != rxd->seq) {
+		dev_err(mdev->dev, "ERROR: MCU:  Sequence mismatch in response, seq: %d  rxd->seq: %d cmd: %0x\n",
+			seq, rxd->seq, cmd);
 		return -EAGAIN;
+	}
 
 	if (cmd == MCU_CMD(PATCH_SEM_CONTROL) ||
 	    cmd == MCU_CMD(PATCH_FINISH_REQ)) {
@@ -1277,8 +1308,8 @@ mt7921_mcu_uni_add_beacon_offload(struct mt792x_dev *dev,
 		return -EINVAL;
 	}
 
-	mt76_connac2_mac_write_txwi(&dev->mt76, (__le32 *)(req.beacon_tlv.pkt),
-				    skb, wcid, NULL, 0, 0, BSS_CHANGED_BEACON);
+	mt7921_mac_write_txwi(&dev->mt76, (__le32 *)(req.beacon_tlv.pkt),
+			      skb, wcid, 0, NULL, 0, BSS_CHANGED_BEACON);
 	memcpy(req.beacon_tlv.pkt + MT_TXD_SIZE, skb->data, skb->len);
 	req.beacon_tlv.pkt_len = cpu_to_le16(MT_TXD_SIZE + skb->len);
 	req.beacon_tlv.tim_ie_pos = cpu_to_le16(MT_TXD_SIZE + offs.tim_offset);

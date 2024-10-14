@@ -291,6 +291,9 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
 	int i, idx = -1;
 	u32 ctrl, next;
 
+	mtk_dbg(dev, TXV, "mt76-dma-add-buf, txwi: %p nbufs: %d q->queued: %d\n",
+		txwi, nbufs, q->queued);
+
 	if (txwi) {
 		q->entry[q->head].txwi = DMA_DUMMY_DATA;
 		q->entry[q->head].skip_buf0 = true;
@@ -347,6 +350,9 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
 	q->entry[idx].skb = skb;
 	q->entry[idx].wcid = 0xffff;
 
+	mtk_dbg(dev, TXV, "mt76-dma-add-buf, at end, idx: %d  skb: %p  txwi: %p  q->queued: %d\n",
+		idx, skb, txwi, q->queued);
+
 	return idx;
 }
 
@@ -375,6 +381,8 @@ static void
 mt76_dma_kick_queue(struct mt76_dev *dev, struct mt76_queue *q)
 {
 	wmb();
+	mtk_dbg(dev, TXV, "mt76-dma-kick-queue, q: %p\n",
+		q);
 	Q_WRITE(q, cpu_idx, q->head);
 }
 
@@ -383,6 +391,9 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 {
 	struct mt76_queue_entry entry;
 	int last;
+
+	mtk_dbg(dev, TXV, "mt76-dma-tx-cleanup, q: %p flush: %d\n",
+		q, flush);
 
 	if (!q || !q->ndesc)
 		return;
@@ -393,6 +404,8 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 	else
 		last = Q_READ(q, dma_idx);
 
+	mtk_dbg(dev, TXV, "mt76-dma-tx-cleanup, queued: %d  last: 0x%x  q->tail: 0x%x\n",
+		q->queued, last, q->tail);
 	while (q->queued > 0 && q->tail != last) {
 		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
 		mt76_queue_tx_complete(dev, q, &entry);
@@ -478,6 +491,9 @@ mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
 {
 	int idx = q->tail;
 
+	mtk_dbg(dev, RXV, "mt76-dma-dequeue, tail-idx: %d queued: %d\n",
+		idx, q->queued);
+
 	*more = false;
 	if (!q->queued)
 		return NULL;
@@ -505,16 +521,34 @@ mt76_dma_tx_queue_skb_raw(struct mt76_dev *dev, struct mt76_queue *q,
 	struct mt76_queue_buf buf = {};
 	dma_addr_t addr;
 
+	/* control msg path, not data frames */
+
 	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
 		goto error;
+
+	/* Check for non responsive radios.  Better to just stop sending it messages
+	 * than continuously block the OS (since rtnl and similar are often held while
+	 * the timeout is happening).
+	 */
+	if (dev->mcu_timeouts > MAX_MCU_TIMEOUTS) {
+		static unsigned long last_log = 0;
+
+		if (time_after(jiffies, last_log + 5 * HZ)) {
+			last_log = jiffies;
+			mtk_dbg(dev, WRN, "mt76-dma-tx-queue-skb-raw, too many timeouts, msg is dropped.\n");
+		}
+		goto error;
+	}
 
 	if (q->queued + 1 >= q->ndesc - 1)
 		goto error;
 
 	addr = dma_map_single(dev->dma_dev, skb->data, skb->len,
 			      DMA_TO_DEVICE);
-	if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
+	if (unlikely(dma_mapping_error(dev->dma_dev, addr))) {
+		mtk_dbg(dev, WRN, "mt76-dma-tx-queue-skb-raw, dma mapping error\n");
 		goto error;
+	}
 
 	buf.addr = addr;
 	buf.len = skb->len;
@@ -554,8 +588,16 @@ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
 		goto free_skb;
 
 	t = mt76_get_txwi(dev);
+
+	mtk_dbg(dev, TXV, "mt76-dma-tx-queue-skb, txwi: %p\n",
+		t);
 	if (!t)
 		goto free_skb;
+
+	if (unlikely(dev->block_traffic & MT_BLOCK_TX)) {
+		ret = 0;
+		goto free_skb;
+	}
 
 	txwi = mt76_get_txwi_ptr(dev, t);
 
@@ -627,6 +669,8 @@ free_skb:
 	spin_lock_bh(&dev->rx_lock);
 	ieee80211_tx_status_ext(hw, &status);
 	spin_unlock_bh(&dev->rx_lock);
+
+	mtk_dbg(dev, TXV, "mt76-dma-tx-queue-skb failed, ret: %d\n", ret);
 
 	return ret;
 }

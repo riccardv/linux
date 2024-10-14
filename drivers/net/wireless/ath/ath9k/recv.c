@@ -917,11 +917,23 @@ static int ath9k_rx_skb_preprocess(struct ath_softc *sc,
 		/*
 		 * No valid hardware bitrate found -- we should not get here
 		 * because hardware has already validated this frame as OK.
+		 * But, we can get here if something (buggy ath10k-wave-1, for instance)
+		 * is tranmitting CCK on 5Ghz.
 		 */
-		ath_dbg(common, ANY, "unsupported hw bitrate detected 0x%02x using 1 Mbit\n",
-			rx_stats->rs_rate);
+		static unsigned long next_jiffies = 0;
+		if (next_jiffies == 0 || time_after(jiffies, next_jiffies)) {
+			ath_dbg(common, ANY, "unsupported hw bitrate detected 0x%02x (%s)\n",
+				rx_stats->rs_rate,
+				(rx_stats->rs_rate == 0x1b) ? "1Mbps" :
+				(rx_stats->rs_rate == 0x1a) ? "2Mbps" :
+				(rx_stats->rs_rate == 0x19) ? "5.5Mbps" :
+				(rx_stats->rs_rate == 0x18) ? "11Mbps" : "Unknown");
+			next_jiffies = jiffies + HZ;
+		}
 		RX_STAT_INC(sc, rx_rate_err);
-		return -EINVAL;
+		/* Let frame be received up the stack, good for sniffing if nothing else, and really,
+		 * if it is otherwise OK, might as well accept CCK up the stack in 5Ghz.
+		 */
 	}
 
 	if (ath9k_is_chanctx_enabled()) {
@@ -1075,6 +1087,7 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
 	dma_addr_t new_buf_addr;
 	unsigned int budget = 512;
 	struct ieee80211_hdr *hdr;
+	unsigned long expires_jiffies = jiffies + 5;
 
 	if (edma)
 		dma_type = DMA_BIDIRECTIONAL;
@@ -1175,7 +1188,10 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
 		if (sc->rx.frag) {
 			int space = skb->len - skb_tailroom(hdr_skb);
 
-			if (pskb_expand_head(hdr_skb, 0, space, GFP_ATOMIC) < 0) {
+			WARN_ON_ONCE(space < 0);
+
+			if (space > 0 &&
+			    pskb_expand_head(hdr_skb, 0, space, GFP_ATOMIC) < 0) {
 				dev_kfree_skb(skb);
 				RX_STAT_INC(sc, rx_oom_err);
 				goto requeue_drop_frag;
@@ -1228,6 +1244,9 @@ requeue:
 		}
 
 		if (!budget--)
+			break;
+
+		if (time_is_before_jiffies(expires_jiffies))
 			break;
 	} while (1);
 

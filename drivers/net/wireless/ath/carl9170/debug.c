@@ -181,7 +181,7 @@ static const struct carl9170_debugfs_fops carl_debugfs_##name ##_ops = {\
 	},								\
 }
 
-#define DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize, _attr)	\
+#define DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize, _attr) \
 	__DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize,	\
 			       _attr, CARL9170_STARTED)			\
 
@@ -718,6 +718,32 @@ static ssize_t carl9170_debugfs_erp_write(struct ar9170 *ar, const char *buf,
 
 DEBUGFS_DECLARE_RW_FILE(erp, 80);
 
+static char *carl9170_debugfs_pattern_mode_read(struct ar9170 *ar, char *buf,
+					      size_t bufsize, ssize_t *ret)
+{
+	ADD(buf, *ret, bufsize, "pattern-mode: %d\n", ar->pattern_mode);
+	return buf;
+}
+
+static ssize_t carl9170_debugfs_pattern_mode_write(struct ar9170 *ar,
+						   const char *buf,
+						   size_t count)
+{
+	int res, val;
+
+	if (count < 1)
+		return -EINVAL;
+
+	res = sscanf(buf, "%d", &val);
+	if (res != 1)
+		return -EINVAL;
+
+	ar->pattern_mode = val;
+	return count;
+}
+
+__DEBUGFS_DECLARE_RW_FILE(pattern_mode, 80, CARL9170_STOPPED);
+
 static ssize_t carl9170_debugfs_hw_iowrite32_write(struct ar9170 *ar,
 	const char *buf, size_t count)
 {
@@ -736,14 +762,16 @@ static ssize_t carl9170_debugfs_hw_iowrite32_write(struct ar9170 *ar,
 		goto out;
 	}
 
-	if (reg <= 0x100000 || reg >= 0x280000) {
-		err = -EADDRNOTAVAIL;
-		goto out;
-	}
+	if (!(reg & 0x80000000)) { /* allow some hacks, user beware! */
+		if (reg <= 0x100000 || reg >= 0x280000) {
+			err = -EADDRNOTAVAIL;
+			goto out;
+		}
 
-	if (reg & 3) {
-		err = -EINVAL;
-		goto out;
+		if (reg & 3) {
+			err = -EINVAL;
+			goto out;
+		}
 	}
 
 	err = carl9170_write_reg(ar, reg, val);
@@ -809,6 +837,7 @@ DEBUGFS_READONLY_FILE(ampdu_density, 20, "%d",
 
 DEBUGFS_READONLY_FILE(beacon_int, 20, "%d TU", ar->global_beacon_int);
 DEBUGFS_READONLY_FILE(pretbtt, 20, "%d TU", ar->global_pretbtt);
+DEBUGFS_READONLY_FILE(fw_features, 20, "0x%x", ar->fw.feature_set);
 
 void carl9170_debugfs_register(struct ar9170 *ar)
 {
@@ -871,11 +900,14 @@ void carl9170_debugfs_register(struct ar9170 *ar)
 	DEBUGFS_ADD(bug);
 
 	DEBUGFS_ADD(erp);
+	DEBUGFS_ADD(pattern_mode);
 
 	DEBUGFS_ADD(vif_dump);
 
 	DEBUGFS_ADD(beacon_int);
 	DEBUGFS_ADD(pretbtt);
+
+	DEBUGFS_ADD(fw_features);
 
 #undef DEBUGFS_ADD
 }

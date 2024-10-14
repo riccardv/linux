@@ -247,6 +247,64 @@ mt7915_muru_debug_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(fops_muru_debug, mt7915_muru_debug_get,
 			 mt7915_muru_debug_set, "%lld\n");
 
+static ssize_t
+mt7915_he_monitor_set(struct file *file, const char __user *user_buf,
+		      size_t count, loff_t *ppos)
+{
+	struct mt7915_phy *phy = file->private_data;
+	char buf[64] = {0};
+	u32 aid, bss_color, uldl, enables;
+	int ret;
+	struct mt7915_dev *dev = phy->dev;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, user_buf, count))
+		return -EFAULT;
+
+	ret = sscanf(buf, "%x %x %x %x",
+		     &aid, &bss_color, &uldl, &enables);
+	if (ret != 4)
+		return -EINVAL;
+
+	phy->monitor_cur_aid = aid;
+	phy->monitor_cur_color = bss_color;
+	phy->monitor_cur_uldl = uldl;
+	phy->monitor_cur_enables = enables;
+
+	mutex_lock(&dev->mt76.mutex);
+	mt7915_check_apply_monitor_config(phy);
+	mutex_unlock(&dev->mt76.mutex);
+
+	return count;
+}
+
+static ssize_t
+mt7915_he_monitor_get(struct file *file, char __user *user_buf,
+		      size_t count, loff_t *ppos)
+{
+	struct mt7915_phy *phy = file->private_data;
+	u8 buf[128];
+	int len;
+
+	len = scnprintf(buf, sizeof(buf),
+			"aid: 0x%x bss-color: 0x%x  uldl: 0x%x  enables: 0x%x\n"
+			"  ULDL:  0 is download, 1 is upload\n"
+			"  Enable-bits: 1: AID  2: Color  4: ULDL\n",
+			phy->monitor_cur_aid, phy->monitor_cur_color,
+			phy->monitor_cur_uldl, phy->monitor_cur_enables);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations mt7915_he_sniffer_ops = {
+	.write = mt7915_he_monitor_set,
+	.read = mt7915_he_monitor_get,
+	.open = simple_open,
+	.llseek = default_llseek,
+};
+
 static int mt7915_muru_stats_show(struct seq_file *file, void *data)
 {
 	struct mt7915_phy *phy = file->private;
@@ -485,15 +543,9 @@ static int
 mt7915_fw_debug_wm_set(void *data, u64 val)
 {
 	struct mt7915_dev *dev = data;
-	enum {
-		DEBUG_TXCMD = 62,
-		DEBUG_CMD_RPT_TX,
-		DEBUG_CMD_RPT_TRIG,
-		DEBUG_SPL,
-		DEBUG_RPT_RX,
-	} debug;
 	bool tx, rx, en;
 	int ret;
+	enum mt_debug debug;
 
 	dev->fw.debug_wm = val ? MCU_FW_LOG_TO_HOST : 0;
 
@@ -677,6 +729,303 @@ mt7915_fw_util_wa_show(struct seq_file *file, void *data)
 }
 
 DEFINE_SHOW_ATTRIBUTE(mt7915_fw_util_wa);
+
+struct mt7915_txo_worker_info {
+	char *buf;
+	int sofar;
+	int size;
+};
+
+static void mt7915_txo_worker(void *wi_data, struct ieee80211_sta *sta)
+{
+	struct mt7915_txo_worker_info *wi = wi_data;
+	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+	struct mt76_testmode_data *td = &msta->test;
+	struct ieee80211_vif *vif;
+	struct wireless_dev *wdev;
+
+	if (wi->sofar >= wi->size)
+		return; /* buffer is full */
+
+	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+	wdev = ieee80211_vif_to_wdev(vif);
+
+	wi->sofar += scnprintf(wi->buf + wi->sofar, wi->size - wi->sofar,
+			       "vdev (%s) active=%d tpc=%d sgi=%d mcs=%d nss=%d"
+			       " pream=%d retries=%d dynbw=%d bw=%d stbc=%d ldpc=%d\n",
+			       wdev->netdev->name,
+			       td->txo_active, td->tx_power[0],
+			       td->tx_rate_sgi, td->tx_rate_idx,
+			       td->tx_rate_nss, td->tx_rate_mode,
+			       td->tx_xmit_count, td->tx_dynbw,
+			       td->txbw, td->tx_rate_stbc, td->tx_rate_ldpc);
+}
+
+static ssize_t mt7915_read_set_rate_override(struct file *file,
+					     char __user *user_buf,
+					     size_t count, loff_t *ppos)
+{
+	struct mt7915_dev *dev = file->private_data;
+	struct ieee80211_hw *hw = dev->mphy.hw;
+	char *buf2;
+	int size = 8000;
+	int rv, sofar;
+	struct mt7915_txo_worker_info wi;
+	const char buf[] =
+		"This allows specify specif tx rate parameters for all DATA"
+		" frames on a vdev\n"
+		"To set a value, you specify the dev-name and key-value pairs:\n"
+		"tpc=10 sgi=1 mcs=x nss=x pream=x retries=x dynbw=0|1 bw=x enable=0|1\n"
+		"pream: 0=cck, 1=ofdm, 2=HT, 3=VHT, 4=HE_SU\n"
+		"cck-mcs: 0=1Mbps, 1=2Mbps, 3=5.5Mbps, 3=11Mbps\n"
+		"ofdm-mcs: 0=6Mbps, 1=9Mbps, 2=12Mbps, 3=18Mbps, 4=24Mbps, 5=36Mbps,"
+		" 6=48Mbps, 7=54Mbps\n"
+		"sgi: HT/VHT: 0 | 1, HE 0: 1xLTF+0.8us, 1: 2xLTF+0.8us, 2: 2xLTF+1.6us, 3: 4xLTF+3.2us, 4: 4xLTF+0.8us\n"
+		"tpc: adjust power from defaults, in 1/2 db units 0 - 31, 16 is default\n"
+		"bw is 0-3 for 20-160\n"
+		"stbc: 0 off, 1 on\n"
+		"ldpc: 0 off, 1 on\n"
+		" For example, wlan0:\n"
+		"echo \"wlan0 tpc=255 sgi=1 mcs=0 nss=1 pream=3 retries=1 dynbw=0 bw=0"
+		" active=1\" > ...mt76/set_rate_override\n";
+
+	buf2 = kzalloc(size, GFP_KERNEL);
+	if (!buf2)
+		return -ENOMEM;
+	strcpy(buf2, buf);
+	sofar = strlen(buf2);
+
+	wi.sofar = sofar;
+	wi.buf = buf2;
+	wi.size = size;
+
+	ieee80211_iterate_stations_atomic(hw, mt7915_txo_worker, &wi);
+
+	rv = simple_read_from_buffer(user_buf, count, ppos, buf2, wi.sofar);
+	kfree(buf2);
+	return rv;
+}
+
+/* Set the rates for specific types of traffic.
+ */
+static ssize_t mt7915_write_set_rate_override(struct file *file,
+					      const char __user *user_buf,
+					      size_t count, loff_t *ppos)
+{
+	struct mt7915_dev *dev = file->private_data;
+	struct mt7915_sta *msta;
+	struct ieee80211_vif *vif;
+	struct mt76_testmode_data *td = NULL;
+	struct wireless_dev *wdev;
+	struct mt76_wcid *wcid;
+	struct mt76_phy *mphy = &dev->mt76.phy;
+	char buf[180];
+	char tmp[20];
+	char *tok;
+	int ret, i, j;
+	unsigned int vdev_id = 0xFFFF;
+	char *bufptr = buf;
+	long rc;
+	char dev_name_match[IFNAMSIZ + 2];
+
+	memset(buf, 0, sizeof(buf));
+
+	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
+
+	/* make sure that buf is null terminated */
+	buf[sizeof(buf) - 1] = 0;
+
+#define MT7915_PARSE_LTOK(a, b)						\
+	do {								\
+		tok = strstr(bufptr, " " #a "=");			\
+		if (tok) {						\
+			char *tspace;					\
+			tok += 1; /* move past initial space */		\
+			strncpy(tmp, tok + strlen(#a "="), sizeof(tmp) - 1); \
+			tmp[sizeof(tmp) - 1] = 0;			\
+			tspace = strstr(tmp, " ");			\
+			if (tspace)					\
+				*tspace = 0;				\
+			if (kstrtol(tmp, 0, &rc) != 0)			\
+				dev_info(dev->mt76.dev,			\
+					 "mt7915: set-rate-override: " #a \
+					 "= could not be parsed, tmp: %s\n", \
+					 tmp);				\
+			else						\
+				td->b = rc;				\
+		}							\
+	} while (0)
+
+
+	/* drop the possible '\n' from the end */
+	if (buf[count - 1] == '\n')
+		buf[count - 1] = 0;
+
+	mutex_lock(&mphy->dev->mutex);
+
+	/* Ignore empty lines, 'echo' appends them sometimes at least. */
+	if (buf[0] == 0) {
+		ret = count;
+		goto exit;
+	}
+
+	/* String starts with vdev name, ie 'wlan0'  Find the proper vif that
+	 * matches the name.
+	 */
+	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid_mask); i++) {
+		u32 mask = dev->mt76.wcid_mask[i];
+		u32 phy_mask = dev->mt76.wcid_phy_mask[i];
+
+		if (!mask)
+			continue;
+
+		for (j = i * 32; mask; j++, mask >>= 1, phy_mask >>= 1) {
+			if (!(mask & 1))
+				continue;
+
+			rcu_read_lock();
+			wcid = rcu_dereference(dev->mt76.wcid[j]);
+			if (!wcid) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			msta = container_of(wcid, struct mt7915_sta, wcid);
+
+			if (!msta->vif) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+
+			wdev = ieee80211_vif_to_wdev(vif);
+
+			if (!wdev || !wdev->netdev) {
+				rcu_read_unlock();
+				continue;
+			}
+
+			//pr_err("j: %d wcid: %p  msta: %p  msta->vif: %p vif: %p  wdev: %p\n",
+			//	j, wcid, msta, msta->vif, vif, wdev);
+			//pr_err("checking name, wdev->netdev: %p\n", wdev->netdev);
+
+			snprintf(dev_name_match, sizeof(dev_name_match) - 1, "%s ",
+				 wdev->netdev->name);
+
+			if (strncmp(dev_name_match, buf, strlen(dev_name_match)) == 0) {
+				vdev_id = j;
+				td = &msta->test;
+				bufptr = buf + strlen(dev_name_match) - 1;
+
+				/* For VAP, we may end up here multiple times... */
+				MT7915_PARSE_LTOK(tpc, tx_power[0]);
+				MT7915_PARSE_LTOK(sgi, tx_rate_sgi);
+				MT7915_PARSE_LTOK(mcs, tx_rate_idx);
+				MT7915_PARSE_LTOK(nss, tx_rate_nss);
+				MT7915_PARSE_LTOK(pream, tx_rate_mode);
+				MT7915_PARSE_LTOK(retries, tx_xmit_count);
+				MT7915_PARSE_LTOK(dynbw, tx_dynbw);
+				MT7915_PARSE_LTOK(ldpc, tx_rate_ldpc);
+				MT7915_PARSE_LTOK(stbc, tx_rate_stbc);
+				MT7915_PARSE_LTOK(bw, txbw);
+				MT7915_PARSE_LTOK(active, txo_active);
+
+				/* To match Intel's API
+				 * HE 0: 1xLTF+0.8us, 1: 2xLTF+0.8us, 2: 2xLTF+1.6us, 3: 4xLTF+3.2us, 4: 4xLTF+0.8us
+				 */
+				if (td->tx_rate_mode >= 4) {
+					if (td->tx_rate_sgi == 0) {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 0;
+					} else if (td->tx_rate_sgi == 1) {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 1;
+					} else if (td->tx_rate_sgi == 2) {
+						td->tx_rate_sgi = 1;
+						td->tx_ltf = 1;
+					} else if (td->tx_rate_sgi == 3) {
+						td->tx_rate_sgi = 2;
+						td->tx_ltf = 2;
+					}
+					else {
+						td->tx_rate_sgi = 0;
+						td->tx_ltf = 2;
+					}
+				}
+				//td->tx_ltf = 1; /* 0: HTLTF 3.2us, 1: HELTF, 6.4us, 2 HELTF 12,8us */
+
+				dev_info(dev->mt76.dev,
+					 "mt7915: set-rate-overrides, vdev %i(%s) active=%d tpc=%d sgi=%d ltf=%d mcs=%d"
+					 " nss=%d pream=%d retries=%d dynbw=%d bw=%d ldpc=%d stbc=%d\n",
+					 vdev_id, dev_name_match,
+					 td->txo_active, td->tx_power[0], td->tx_rate_sgi, td->tx_ltf, td->tx_rate_idx,
+					 td->tx_rate_nss, td->tx_rate_mode, td->tx_xmit_count, td->tx_dynbw,
+					 td->txbw, td->tx_rate_ldpc, td->tx_rate_stbc);
+			}
+			rcu_read_unlock();
+		}
+	}
+
+	if (vdev_id == 0xFFFF) {
+		if (strstr(buf, "active=0")) {
+			/* Ignore, we are disabling it anyway */
+			ret = count;
+			goto exit;
+		} else {
+			dev_info(dev->mt76.dev,
+				 "mt7915: set-rate-override, unknown netdev name: %s\n", buf);
+		}
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	ret = count;
+
+exit:
+	mutex_unlock(&mphy->dev->mutex);
+	return ret;
+}
+
+static const struct file_operations fops_set_rate_override = {
+	.read = mt7915_read_set_rate_override,
+	.write = mt7915_write_set_rate_override,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static int
+mt7915_rx_group_5_enable_set(void *data, u64 val)
+{
+	struct mt7915_dev *dev = data;
+
+	mutex_lock(&dev->mt76.mutex);
+
+	dev->rx_group_5_enable = !!val;
+
+	/* Enabled if we requested enabled OR if monitor mode is enabled. */
+	mt76_rmw_field(dev, MT_DMA_DCR0(0), MT_DMA_DCR0_RXD_G5_EN,
+		       dev->rx_group_5_enable);
+	mt76_testmode_reset(dev->phy.mt76, true);
+
+	mutex_unlock(&dev->mt76.mutex);
+
+	return 0;
+}
+
+static int
+mt7915_rx_group_5_enable_get(void *data, u64 *val)
+{
+	struct mt7915_dev *dev = data;
+
+	*val = dev->rx_group_5_enable;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_rx_group_5_enable, mt7915_rx_group_5_enable_get,
+			 mt7915_rx_group_5_enable_set, "%lld\n");
 
 static void
 mt7915_ampdu_stat_read_phy(struct mt7915_phy *phy,
@@ -951,9 +1300,9 @@ mt7915_xmit_queues_show(struct seq_file *file, void *data)
 
 DEFINE_SHOW_ATTRIBUTE(mt7915_xmit_queues);
 
-#define mt7915_txpower_puts(rate)						\
+#define mt7915_txpower_puts(rate, _len)						\
 ({										\
-	len += scnprintf(buf + len, sz - len, "%-16s:", #rate " (TMAC)");	\
+	len += scnprintf(buf + len, sz - len, "%-*s:", _len, #rate " (TMAC)");	\
 	for (i = 0; i < mt7915_sku_group_len[SKU_##rate]; i++, offs++)		\
 		len += scnprintf(buf + len, sz - len, " %6d", txpwr[offs]);	\
 	len += scnprintf(buf + len, sz - len, "\n");				\
@@ -991,47 +1340,54 @@ mt7915_rate_txpower_get(struct file *file, char __user *user_buf,
 	if (ret)
 		goto out;
 
+	len += scnprintf(buf + len, sz - len,
+			 "Per-chain txpower in 1/2 db units.\n");
+
 	/* Txpower propagation path: TMAC -> TXV -> BBP */
 	len += scnprintf(buf + len, sz - len,
 			 "\nPhy%d Tx power table (channel %d)\n",
 			 phy != &dev->phy, phy->mt76->chandef.chan->hw_value);
-	len += scnprintf(buf + len, sz - len, "%-16s  %6s %6s %6s %6s\n",
+	len += scnprintf(buf + len, sz - len, "%-23s  %6s %6s %6s %6s\n",
 			 " ", "1m", "2m", "5m", "11m");
-	mt7915_txpower_puts(CCK);
+	mt7915_txpower_puts(CCK, 23);
 
 	len += scnprintf(buf + len, sz - len,
-			 "%-16s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 "%-23s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
 			 " ", "6m", "9m", "12m", "18m", "24m", "36m", "48m",
 			 "54m");
-	mt7915_txpower_puts(OFDM);
+	mt7915_txpower_puts(OFDM, 23);
 
 	len += scnprintf(buf + len, sz - len,
-			 "%-16s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 "%-23s  %6s %6s %6s %6s %6s %6s %6s %6s\n",
 			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4",
 			 "mcs5", "mcs6", "mcs7");
-	mt7915_txpower_puts(HT_BW20);
+	mt7915_txpower_puts(HT_BW20, 23);
 
 	len += scnprintf(buf + len, sz - len,
-			 "%-16s  %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 "%-23s  %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
 			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4", "mcs5",
 			 "mcs6", "mcs7", "mcs32");
-	mt7915_txpower_puts(HT_BW40);
+	mt7915_txpower_puts(HT_BW40, 23);
 
 	len += scnprintf(buf + len, sz - len,
-			 "%-16s  %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
+			 "%-23s  %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s\n",
 			 " ", "mcs0", "mcs1", "mcs2", "mcs3", "mcs4", "mcs5",
 			 "mcs6", "mcs7", "mcs8", "mcs9", "mcs10", "mcs11");
-	mt7915_txpower_puts(VHT_BW20);
-	mt7915_txpower_puts(VHT_BW40);
-	mt7915_txpower_puts(VHT_BW80);
-	mt7915_txpower_puts(VHT_BW160);
-	mt7915_txpower_puts(HE_RU26);
-	mt7915_txpower_puts(HE_RU52);
-	mt7915_txpower_puts(HE_RU106);
-	mt7915_txpower_puts(HE_RU242);
-	mt7915_txpower_puts(HE_RU484);
-	mt7915_txpower_puts(HE_RU996);
-	mt7915_txpower_puts(HE_RU2x996);
+	mt7915_txpower_puts(VHT_BW20, 23);
+	mt7915_txpower_puts(VHT_BW40, 23);
+	mt7915_txpower_puts(VHT_BW80, 23);
+	mt7915_txpower_puts(VHT_BW160, 23);
+	mt7915_txpower_puts(HE_RU26, 23);
+	mt7915_txpower_puts(HE_RU52, 23);
+	mt7915_txpower_puts(HE_RU106, 23);
+	len += scnprintf(buf + len, sz - len, "BW20/");
+	mt7915_txpower_puts(HE_RU242, 18);
+	len += scnprintf(buf + len, sz - len, "BW40/");
+	mt7915_txpower_puts(HE_RU484, 18);
+	len += scnprintf(buf + len, sz - len, "BW80/");
+	mt7915_txpower_puts(HE_RU996, 18);
+	len += scnprintf(buf + len, sz - len, "BW160/");
+	mt7915_txpower_puts(HE_RU2x996, 17);
 
 	reg = is_mt7915(&dev->mt76) ? MT_WF_PHY_TPC_CTRL_STAT(band) :
 	      MT_WF_PHY_TPC_CTRL_STAT_MT7916(band);
@@ -1204,6 +1560,39 @@ mt7915_rf_regval_set(void *data, u64 val)
 DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
 			 mt7915_rf_regval_set, "0x%08llx\n");
 
+
+static int mt7915_muru_onoff_get(void *data, u64 *val)
+{
+       struct mt7915_dev *dev = data;
+
+       *val = dev->dbg.muru_onoff;
+
+       printk("mumimo ul:%d, mumimo dl:%d, ofdma ul:%d, ofdma dl:%d\n",
+               !!(dev->dbg.muru_onoff & MUMIMO_UL),
+               !!(dev->dbg.muru_onoff & MUMIMO_DL),
+               !!(dev->dbg.muru_onoff & OFDMA_UL),
+               !!(dev->dbg.muru_onoff & OFDMA_DL));
+
+       return 0;
+}
+
+static int mt7915_muru_onoff_set(void *data, u64 val)
+{
+       struct mt7915_dev *dev = data;
+
+       if (val > 15) {
+               printk("Wrong value! The value is between 0 ~ 15.\n");
+               goto exit;
+       }
+
+       dev->dbg.muru_onoff = val;
+exit:
+       return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_muru_onoff, mt7915_muru_onoff_get,
+                       mt7915_muru_onoff_set, "%llx\n");
+
 int mt7915_init_debugfs(struct mt7915_phy *phy)
 {
 	struct mt7915_dev *dev = phy->dev;
@@ -1223,6 +1612,8 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
 	debugfs_create_file("tx_stats", 0400, dir, phy, &mt7915_tx_stats_fops);
 	debugfs_create_file("sys_recovery", 0600, dir, phy,
 			    &mt7915_sys_recovery_ops);
+	debugfs_create_file("he_sniffer_params", 0600, dir, phy,
+			    &mt7915_he_sniffer_ops);
 	debugfs_create_file("fw_debug_wm", 0600, dir, dev, &fops_fw_debug_wm);
 	debugfs_create_file("fw_debug_wa", 0600, dir, dev, &fops_fw_debug_wa);
 	debugfs_create_file("fw_debug_bin", 0600, dir, dev, &fops_fw_debug_bin);
@@ -1230,6 +1621,7 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
 			    &mt7915_fw_util_wm_fops);
 	debugfs_create_file("fw_util_wa", 0400, dir, dev,
 			    &mt7915_fw_util_wa_fops);
+	debugfs_create_file("rx_group_5_enable", 0600, dir, dev, &fops_rx_group_5_enable);
 	debugfs_create_file("implicit_txbf", 0600, dir, dev,
 			    &fops_implicit_txbf);
 	debugfs_create_file("txpower_sku", 0400, dir, phy,
@@ -1246,6 +1638,11 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
 		debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
 					    mt7915_rdd_monitor);
 	}
+	debugfs_create_u32("ignore_radar", 0600, dir,
+			   &dev->ignore_radar);
+	debugfs_create_file("set_rate_override", 0600, dir,
+			    dev, &fops_set_rate_override);
+	debugfs_create_file("muru_onoff", 0600, dir, dev, &fops_muru_onoff);
 
 	if (!ext_phy)
 		dev->debugfs_dir = dir;
@@ -1387,7 +1784,6 @@ mt7915_queues_show(struct seq_file *s, void *data)
 
 	return 0;
 }
-
 DEFINE_SHOW_ATTRIBUTE(mt7915_queues);
 
 void mt7915_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,

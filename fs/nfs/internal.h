@@ -70,9 +70,11 @@ struct nfs_client_initdata {
 	unsigned long init_flags;
 	const char *hostname;			/* Hostname of the server */
 	const struct sockaddr_storage *addr;	/* Address of the server */
+	const struct sockaddr *srcaddr;
 	const char *nodename;			/* Hostname of the client */
 	const char *ip_addr;			/* IP address of the client */
 	size_t addrlen;
+	size_t srcaddrlen;
 	struct nfs_subversion *nfs_mod;
 	int proto;
 	u32 minorversion;
@@ -120,6 +122,14 @@ struct nfs_fs_context {
 			struct sockaddr_storage	_address;
 		};
 		size_t			addrlen;
+	} srcaddr;
+
+	struct {
+		union {
+			struct sockaddr address;
+			struct sockaddr_storage _address;
+		};
+		size_t                  addrlen;
 		char			*hostname;
 		u32			version;
 		int			port;
@@ -192,6 +202,7 @@ static inline struct nfs_fs_context *nfs_fc2context(const struct fs_context *fc)
 /* mount_clnt.c */
 struct nfs_mount_request {
 	struct sockaddr_storage	*sap;
+	struct sockaddr         *srcaddr;
 	size_t			salen;
 	char			*hostname;
 	char			*dirpath;
@@ -227,8 +238,10 @@ extern void nfs_put_client(struct nfs_client *);
 extern void nfs_free_client(struct nfs_client *);
 extern struct nfs_client *nfs4_find_client_ident(struct net *, int);
 extern struct nfs_client *
-nfs4_find_client_sessionid(struct net *, const struct sockaddr *,
-				struct nfs4_sessionid *, u32);
+nfs4_find_client_sessionid(struct net *,
+			   const struct sockaddr *srcaddr,
+			   const struct sockaddr *addr,
+			   struct nfs4_sessionid *, u32);
 extern struct nfs_server *nfs_create_server(struct fs_context *);
 extern void nfs4_server_set_init_caps(struct nfs_server *);
 extern struct nfs_server *nfs4_create_server(struct fs_context *);

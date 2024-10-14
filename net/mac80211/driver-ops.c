@@ -54,6 +54,15 @@ void drv_stop(struct ieee80211_local *local, bool suspend)
 	local->started = false;
 }
 
+int drv_consume_block_ack(struct ieee80211_local *local,
+			  struct ieee80211_sub_if_data *sdata, struct sk_buff *skb)
+{
+	/*pr_warn("consume-block-ack: %p\n", local->ops->consume_block_ack);*/
+	if (local->ops->consume_block_ack)
+		return local->ops->consume_block_ack(&local->hw, &sdata->vif, skb);
+	return -EINVAL;
+}
+
 int drv_add_interface(struct ieee80211_local *local,
 		      struct ieee80211_sub_if_data *sdata)
 {
@@ -121,6 +130,9 @@ void drv_remove_interface(struct ieee80211_local *local,
 	trace_drv_remove_interface(local, sdata);
 	local->ops->remove_interface(&local->hw, &sdata->vif);
 	trace_drv_return_void(local);
+
+	/* Clear private driver data in case of reuse */
+	memset(sdata->vif.drv_priv, 0, local->hw.vif_data_size);
 }
 
 __must_check

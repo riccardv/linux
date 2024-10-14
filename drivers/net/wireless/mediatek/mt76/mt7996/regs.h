@@ -133,6 +133,9 @@ enum offs_rev {
 #define MT_MDP_BASE				0x820cc000
 #define MT_MDP(ofs)				(MT_MDP_BASE + (ofs))
 
+/* Default: F0003, enable tx checksum: F0001 */
+#define MT_MDP_TX_CTRL				MT_MDP(0x040)
+
 #define MT_MDP_DCR2				MT_MDP(0x8e8)
 #define MT_MDP_DCR2_RX_TRANS_SHORT		BIT(2)
 
@@ -350,7 +353,17 @@ enum offs_rev {
 #define MT_WF_RFCR_DROP_OTHER_UC		BIT(18)
 #define MT_WF_RFCR_DROP_OTHER_TIM		BIT(19)
 #define MT_WF_RFCR_DROP_NDPA			BIT(20)
-#define MT_WF_RFCR_DROP_UNWANTED_CTL		BIT(21)
+#define MT_WF_RFCR_RX_UNWANTED_CTL		BIT(21)
+#define MT_WF_RFCR_IND_FILTER_EN_OF_31_23_BIT      BIT(22)
+#define MT_WF_RFCR_SECOND_BCN_EN                   BIT(23)
+#define MT_WF_RFCR_RX_MGMT_FRAME_CTRL              BIT(24)
+#define MT_WF_RFCR_RX_DATA_FRAME_CTRL              BIT(25)
+#define MT_WF_RFCR_RX_SAMEBSSIDPRORESP_CTRL        BIT(26)
+#define MT_WF_RFCR_RX_DIFFBSSIDPRORESP_CTRL        BIT(27)
+#define MT_WF_RFCR_RX_SAMEBSSIDBCN_CTRL            BIT(28)
+#define MT_WF_RFCR_RX_SAMEBSSIDNULL_CTRL           BIT(29)
+#define MT_WF_RFCR_RX_DIFFBSSIDNULL_CTRL           BIT(30)
+#define MT_WF_RFCR_DROP_DIFFBSSIDMGT_CTRL          BIT(31)
 
 #define MT_WF_RFCR1(_band)			MT_WF_RMAC(_band, 0x004)
 #define MT_WF_RFCR1_DROP_ACK			BIT(4)
@@ -358,6 +371,11 @@ enum offs_rev {
 #define MT_WF_RFCR1_DROP_BA			BIT(6)
 #define MT_WF_RFCR1_DROP_CFEND			BIT(7)
 #define MT_WF_RFCR1_DROP_CFACK			BIT(8)
+#define MT_WF_RFCR1_DROP_RCPI_LT_THR		BIT(21)
+#define MT_WF_RFCR1_DROP_NO2ME_TF		BIT(22)
+#define MT_WF_RFCR1_DROP_NON_MUBAR_TF		BIT(23)
+#define MT_WF_RFCR1_DROP_RXS_BRP		BIT(25)
+#define MT_WF_RFCR1_DROP_TF_BFRP		BIT(30)
 
 #define MT_WF_RMAC_MIB_AIRTIME0(_band)		MT_WF_RMAC(_band, 0x0380)
 #define MT_WF_RMAC_MIB_RXTIME_CLR		BIT(31)
@@ -662,6 +680,14 @@ enum offs_rev {
 
 #define MT_PAD_GPIO				0x700056f0
 #define MT_PAD_GPIO_ADIE_COMB			GENMASK(16, 15)
+#define MT_PAD_GPIO_2ADIE_TBTC			BIT(19)
+#define MT_PAD_GPIO_ADIE_COMB_7992		GENMASK(17, 16)
+#define MT_PAD_GPIO_ADIE_NUM_7992		BIT(15)
+
+/* ADIE */
+#define MT_ADIE_CHIP_ID(_idx)                  (0x0f00002c + ((_idx) << 28))
+#define MT_ADIE_VERSION_MASK                   GENMASK(15, 0)
+#define MT_ADIE_CHIP_ID_MASK                   GENMASK(31, 16)
 
 #define MT_HW_REV				0x70010204
 #define MT_HW_REV1				0x8a00
@@ -685,24 +711,35 @@ enum offs_rev {
 						 ((_wf) << 16) + (ofs))
 #define MT_WF_PHYRX_CSD_IRPI(_band, _wf)	MT_WF_PHYRX_CSD(_band, _wf, 0x1000)
 
-/* PHYRX CTRL */
-#define MT_WF_PHYRX_BAND_BASE			0x83080000
-#define MT_WF_PHYRX_BAND(_band, ofs)		(MT_WF_PHYRX_BAND_BASE + \
+/* PHYDFE CTRL */
+#define MT_WF_PHYDFE_TSSI_TXCTRL01(_band)	MT_WF_PHYRX_CSD(_band, 0, 0xc718)
+#define MT_WF_PHYDFE_TSSI_TXCTRL_POWER_TMAC	GENMASK(31, 24)
+
+/* PHY CTRL */
+#define MT_WF_PHY_BAND_BASE			0x83080000
+#define MT_WF_PHY_BAND(_band, ofs)		(MT_WF_PHY_BAND_BASE + \
 						 ((_band) << 20) + (ofs))
 
-#define MT_WF_PHYRX_BAND_GID_TAB_VLD0(_band)	MT_WF_PHYRX_BAND(_band, 0x1054)
-#define MT_WF_PHYRX_BAND_GID_TAB_VLD1(_band)	MT_WF_PHYRX_BAND(_band, 0x1058)
-#define MT_WF_PHYRX_BAND_GID_TAB_POS0(_band)	MT_WF_PHYRX_BAND(_band, 0x105c)
-#define MT_WF_PHYRX_BAND_GID_TAB_POS1(_band)	MT_WF_PHYRX_BAND(_band, 0x1060)
-#define MT_WF_PHYRX_BAND_GID_TAB_POS2(_band)	MT_WF_PHYRX_BAND(_band, 0x1064)
-#define MT_WF_PHYRX_BAND_GID_TAB_POS3(_band)	MT_WF_PHYRX_BAND(_band, 0x1068)
+#define MT_WF_PHYRX_BAND_GID_TAB_VLD0(_band)	MT_WF_PHY_BAND(_band, 0x1054)
+#define MT_WF_PHYRX_BAND_GID_TAB_VLD1(_band)	MT_WF_PHY_BAND(_band, 0x1058)
+#define MT_WF_PHYRX_BAND_GID_TAB_POS0(_band)	MT_WF_PHY_BAND(_band, 0x105c)
+#define MT_WF_PHYRX_BAND_GID_TAB_POS1(_band)	MT_WF_PHY_BAND(_band, 0x1060)
+#define MT_WF_PHYRX_BAND_GID_TAB_POS2(_band)	MT_WF_PHY_BAND(_band, 0x1064)
+#define MT_WF_PHYRX_BAND_GID_TAB_POS3(_band)	MT_WF_PHY_BAND(_band, 0x1068)
 
-#define MT_WF_PHYRX_BAND_RX_CTRL1(_band)	MT_WF_PHYRX_BAND(_band, 0x2004)
+/* PHYRX CTRL */
+#define MT_WF_PHYRX_BAND_RX_CTRL1(_band)	MT_WF_PHY_BAND(_band, 0x2004)
 #define MT_WF_PHYRX_BAND_RX_CTRL1_IPI_EN	GENMASK(2, 0)
 #define MT_WF_PHYRX_BAND_RX_CTRL1_STSCNT_EN	GENMASK(11, 9)
 
+/* PHYDFE CTRL */
+#define MT_WF_PHYDFE_BAND_TPC_CTRL_STAT0(_phy)	MT_WF_PHY_BAND(_phy, 0xe7a0)
+#define MT_WF_PHY_TPC_POWER_TMAC		GENMASK(15, 8)
+#define MT_WF_PHY_TPC_POWER_RMAC		GENMASK(23, 16)
+#define MT_WF_PHY_TPC_POWER_TSSI		GENMASK(31, 24)
+
 /* PHYRX CSD BAND */
-#define MT_WF_PHYRX_CSD_BAND_RXTD12(_band)		MT_WF_PHYRX_BAND(_band, 0x8230)
+#define MT_WF_PHYRX_CSD_BAND_RXTD12(_band)		MT_WF_PHY_BAND(_band, 0x8230)
 #define MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR_ONLY	BIT(18)
 #define MT_WF_PHYRX_CSD_BAND_RXTD12_IRPI_SW_CLR		BIT(29)
 

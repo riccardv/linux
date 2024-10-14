@@ -10,6 +10,9 @@
 #include "../mt76_connac2_mac.h"
 #include "mcu.h"
 
+extern bool mt7921_disable_pm;
+extern bool mt7921_disable_deep_sleep;
+
 static ssize_t mt7921_thermal_temp_show(struct device *dev,
 					struct device_attribute *attr,
 					char *buf)
@@ -70,6 +73,9 @@ mt7921_regd_channel_update(struct wiphy *wiphy, struct mt792x_dev *dev)
 	struct device_node *np, *band_np;
 	struct ieee80211_channel *ch;
 	int i, cfreq;
+
+	if (!(dev->phy.chip_cap & MT792x_CHIP_CAP_CLC_EVT_EN))
+		dev->phy.clc_chan_conf = 0xff;
 
 	np = mt76_find_power_limits_node(mdev);
 
@@ -160,6 +166,9 @@ int mt7921_mac_init(struct mt792x_dev *dev)
 	/* enable hardware rx header translation */
 	mt76_set(dev, MT_MDP_DCR0, MT_MDP_DCR0_RX_HDR_TRANS_EN);
 
+	/* disable Tx latency report to enable Tx count in txfree path */
+	mt76_clear(dev, MT_PLE_HOST_RPT0, MT_PLE_HOST_RPT0_TX_LATENCY);
+
 	for (i = 0; i < MT792x_WTBL_SIZE; i++)
 		mt7921_mac_wtbl_update(dev, i,
 				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
@@ -208,11 +217,38 @@ static int mt7921_init_hardware(struct mt792x_dev *dev)
 	}
 
 	if (i == MT792x_MCU_INIT_RETRY_COUNT) {
-		dev_err(dev->mt76.dev, "hardware init failed\n");
+		dev_err(dev->mt76.dev, "hardware init failed %i/%i\n",
+			i, MT792x_MCU_INIT_RETRY_COUNT);
 		return ret;
+	}
+	else if (i != 0) {
+		dev_err(dev->mt76.dev, "hardware init success on try %i/%i\n",
+			i, MT792x_MCU_INIT_RETRY_COUNT);
 	}
 
 	return 0;
+}
+
+void mt7921_set_stream_vht_txbf_caps(struct mt792x_phy *phy)
+{
+	int sts;
+	u32 *cap;
+
+	if (!phy->mt76->cap.has_5ghz)
+		return;
+
+	sts = hweight8(phy->mt76->chainmask);
+	cap = &phy->mt76->sband_5g.sband.vht_cap.cap;
+
+	*cap &= ~(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK |
+		  IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK |
+		  IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
+		  IEEE80211_VHT_CAP_MU_BEAMFORMER_CAPABLE);
+
+	*cap |= IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
+		IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE |
+		FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK,
+			   sts - 1);
 }
 
 static void mt7921_init_work(struct work_struct *work)
@@ -226,6 +262,7 @@ static void mt7921_init_work(struct work_struct *work)
 		return;
 
 	mt76_set_stream_caps(&dev->mphy, true);
+	mt7921_set_stream_vht_txbf_caps(&dev->phy);
 	mt7921_set_stream_he_caps(&dev->phy);
 
 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
@@ -234,6 +271,7 @@ static void mt7921_init_work(struct work_struct *work)
 		dev_err(dev->mt76.dev, "register device failed\n");
 		return;
 	}
+	dev->hw_registered = true;
 
 	ret = mt7921_init_debugfs(dev);
 	if (ret) {
@@ -294,9 +332,9 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	dev->pm.stats.last_doze_event = jiffies;
 	if (!mt76_is_usb(&dev->mt76)) {
 		dev->pm.enable_user = true;
-		dev->pm.enable = true;
+		dev->pm.enable = !mt7921_disable_pm;
 		dev->pm.ds_enable_user = true;
-		dev->pm.ds_enable = true;
+		dev->pm.ds_enable = !mt7921_disable_deep_sleep;
 	}
 
 	if (!mt76_is_mmio(&dev->mt76))

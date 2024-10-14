@@ -86,6 +86,11 @@ enum hwsim_tx_control_flags {
  *	with %HWSIM_CMD_REPORT_PMSR.
  * @HWSIM_CMD_ABORT_PMSR: Abort previously started peer measurement.
  * @HWSIM_CMD_REPORT_PMSR: Report peer measurement data.
+ * @HWSIM_CMD_NOTIFY: notify user-space about driver changes.  This is
+ * designed to help the user-space app better emulate radio hardware.
+ * This command uses:
+ *      %HWSIM_ATTR_FREQ # Notify current operating center frequency.
+ *      %HWSIM_ATTR_ADDR_TRANSMITTER # ID which radio we are notifying about.
  * @__HWSIM_CMD_MAX: enum limit
  */
 enum hwsim_commands {
@@ -101,6 +106,7 @@ enum hwsim_commands {
 	HWSIM_CMD_START_PMSR,
 	HWSIM_CMD_ABORT_PMSR,
 	HWSIM_CMD_REPORT_PMSR,
+	HWSIM_CMD_NOTIFY,
 	__HWSIM_CMD_MAX,
 };
 #define HWSIM_CMD_MAX (_HWSIM_CMD_MAX - 1)
@@ -160,6 +166,7 @@ enum hwsim_commands {
  * @HWSIM_ATTR_MULTI_RADIO: Register multiple wiphy radios (flag).
  *	Adds one radio for each band. Number of supported channels will be set for
  *	each radio instead of for the wiphy.
+ * @HWSIM_ATTR_RX_INFO: hwsim_rx_info
  * @__HWSIM_ATTR_MAX: enum limit
  */
 enum hwsim_attrs {
@@ -193,6 +200,7 @@ enum hwsim_attrs {
 	HWSIM_ATTR_PMSR_REQUEST,
 	HWSIM_ATTR_PMSR_RESULT,
 	HWSIM_ATTR_MULTI_RADIO,
+	HWSIM_ATTR_RX_INFO,
 	__HWSIM_ATTR_MAX,
 };
 #define HWSIM_ATTR_MAX (__HWSIM_ATTR_MAX - 1)
@@ -340,5 +348,21 @@ enum hwsim_rate_info_attributes {
 	NUM_HWSIM_RATE_INFO_ATTRS,
 	HWSIM_RATE_INFO_ATTR_MAX = NUM_HWSIM_RATE_INFO_ATTRS - 1
 };
+
+/**
+ * This relates to the ieee80211_rx_status struct in mac80211.h
+ * @rx_flags: %RX_FLAG_* (see  mac80211_rx_flags)
+ * @vht_flags: %RX_VHT_FLAG_*
+ * @vht_nss: number of streams (VHT only)
+ * @ampdu_reference: A-MPDU reference number, must be a different value for
+ *	each A-MPDU but the same for each subframe within one A-MPDU
+ */
+struct hwsim_rx_info {
+	u32 rx_flags;
+	u8 vht_flags;
+	u8 vht_nss;
+	u16 unused_pad; /* pad to 32-bits, and space for growth */
+	u32 ampdu_reference;
+} __packed;
 
 #endif /* __MAC80211_HWSIM_H */

@@ -11,7 +11,7 @@
  */
 
 #include <linux/ethtool.h>
-#include <uapi/linux/rfkill.h>
+#include <linux/rfkill.h>
 #include <linux/netdevice.h>
 #include <linux/debugfs.h>
 #include <linux/list.h>
@@ -1375,6 +1375,7 @@ struct cfg80211_beacon_data {
 	struct cfg80211_mbssid_elems *mbssid_ies;
 	struct cfg80211_rnr_elems *rnr_ies;
 	s8 ftm_responder;
+	u8 he_ofdma_disable; /* should we try to disable ofdma? */
 
 	size_t head_len, tail_len;
 	size_t beacon_ies_len;
@@ -2606,6 +2607,28 @@ struct cfg80211_ssid {
 };
 
 /**
+ * enum cfg80211_probe_req_flags - Part of Candela hack around for faking
+ *				   station lower hardware capabilities
+ */
+enum cfg80211_probe_req_mode_disable {
+	IEEE80211_PROBE_REQ_DISABLE_HT  = BIT(0),
+	IEEE80211_PROBE_REQ_DISABLE_VHT = BIT(1),
+	IEEE80211_PROBE_REQ_DISABLE_HE  = BIT(2),
+	IEEE80211_PROBE_REQ_DISABLE_EHT = BIT(3),
+};
+
+/**
+ * struct cfg80211_probe_request_config - For Candela probe request formation
+ *					  hacks
+ *
+ * @mode_disable - follows the structure of cfg80211_probve_req_mode_disable
+ */
+struct cfg80211_probe_req_config {
+	bool is_advert_bitmask;
+	u8 mode_disable;
+};
+
+/**
  * struct cfg80211_scan_info - information about completed scan
  * @scan_start_tsf: scan start time in terms of the TSF of the BSS that the
  *	wireless device that requested the scan is connected to. If this
@@ -3090,6 +3113,11 @@ struct cfg80211_assoc_link {
  *	Drivers shall disable MLO features for the current association if this
  *	flag is not set.
  * @ASSOC_REQ_SPP_AMSDU: SPP A-MSDUs will be used on this connection (if any)
+ * @ASSOC_REQ_DISABLE_TWT:  Disable TWT
+ * @ASSOC_REQ_DISABLE_160:  Disable 160Mhz
+ * @ASSOC_REQ_DISABLE_OFDMA:  Disable OFDMA
+ * @ASSOC_REQ_DISABLE_320:  Disable 320Mhz
+ * @ASSOC_REQ_IGNORE_EDCA:  Ignore EDCA info
  */
 enum cfg80211_assoc_req_flags {
 	ASSOC_REQ_DISABLE_HT			= BIT(0),
@@ -3100,6 +3128,11 @@ enum cfg80211_assoc_req_flags {
 	ASSOC_REQ_DISABLE_EHT			= BIT(5),
 	CONNECT_REQ_MLO_SUPPORT			= BIT(6),
 	ASSOC_REQ_SPP_AMSDU			= BIT(7),
+	ASSOC_REQ_DISABLE_TWT                   = BIT(8),
+	ASSOC_REQ_DISABLE_160			= BIT(9),
+	ASSOC_REQ_DISABLE_OFDMA			= BIT(10),
+	ASSOC_REQ_DISABLE_320			= BIT(11),
+	ASSOC_REQ_IGNORE_EDCA			= BIT(12),
 };
 
 /**
@@ -4748,7 +4781,8 @@ struct cfg80211_ops {
 				    struct net_device *dev,
 				    unsigned int link_id,
 				    const u8 *peer,
-				    const struct cfg80211_bitrate_mask *mask);
+				    const struct cfg80211_bitrate_mask *mask,
+				    const struct cfg80211_probe_req_config *pr_conf);
 
 	int	(*dump_survey)(struct wiphy *wiphy, struct net_device *netdev,
 			int idx, struct survey_info *info);

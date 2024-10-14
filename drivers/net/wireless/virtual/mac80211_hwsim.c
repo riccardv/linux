@@ -1507,6 +1507,52 @@ static inline u16 trans_tx_rate_flags_ieee2hwsim(struct ieee80211_tx_rate *rate)
 	return result;
 }
 
+static void mac80211_hwsim_check_nl_notify(struct mac80211_hwsim_data *data)
+{
+	struct sk_buff *skb;
+	u32 center_freq = 0;
+	u32 _portid;
+	void *msg_head;
+
+	/* wmediumd mode check */
+	_portid = READ_ONCE(data->wmediumd);
+
+	if (!_portid)
+		return;
+
+	skb = genlmsg_new(GENLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+	if (skb == NULL)
+		goto err_print;
+
+	msg_head = genlmsg_put(skb, 0, 0, &hwsim_genl_family, 0,
+			       HWSIM_CMD_NOTIFY);
+	if (msg_head == NULL) {
+		printk(KERN_DEBUG "mac80211_hwsim: problem with msg_head, notify\n");
+		goto nla_put_failure;
+	}
+
+	if (nla_put(skb, HWSIM_ATTR_ADDR_TRANSMITTER,
+		    ETH_ALEN, data->addresses[1].addr))
+		goto nla_put_failure;
+
+	if (data->channel)
+		center_freq = data->channel->center_freq;
+
+	if (nla_put_u32(skb, HWSIM_ATTR_FREQ, center_freq))
+		goto nla_put_failure;
+
+	genlmsg_end(skb, msg_head);
+	if (genlmsg_unicast(&init_net, skb, _portid))
+		goto err_print;
+
+	return;
+
+nla_put_failure:
+	nlmsg_free(skb);
+err_print:
+	printk(KERN_DEBUG "mac80211_hwsim: error occurred in %s\n", __func__);
+}
+
 static void mac80211_hwsim_tx_frame_nl(struct ieee80211_hw *hw,
 				       struct sk_buff *my_skb,
 				       int dst_portid,
@@ -2387,7 +2433,7 @@ static int mac80211_hwsim_config(struct ieee80211_hw *hw, u32 changed)
 
 	if (conf->chandef.chan)
 		wiphy_dbg(hw->wiphy,
-			  "%s (freq=%d(%d - %d)/%s idle=%d ps=%d smps=%s)\n",
+			  "%s (chandef-chan freq=%d(%d - %d)/%s idle=%d ps=%d smps=%s)\n",
 			  __func__,
 			  conf->chandef.chan->center_freq,
 			  conf->chandef.center_freq1,
@@ -2398,7 +2444,7 @@ static int mac80211_hwsim_config(struct ieee80211_hw *hw, u32 changed)
 			  smps_modes[conf->smps_mode]);
 	else
 		wiphy_dbg(hw->wiphy,
-			  "%s (freq=0 idle=%d ps=%d smps=%s)\n",
+			  "%s (no-chandef-chan freq=0 idle=%d ps=%d smps=%s)\n",
 			  __func__,
 			  !!(conf->flags & IEEE80211_CONF_IDLE),
 			  !!(conf->flags & IEEE80211_CONF_PS),
@@ -2452,6 +2498,8 @@ static int mac80211_hwsim_config(struct ieee80211_hw *hw, u32 changed)
 				      HRTIMER_MODE_REL_SOFT);
 		}
 	}
+
+	mac80211_hwsim_check_nl_notify(data);
 
 	return 0;
 }
@@ -5835,28 +5883,44 @@ static int hwsim_cloned_frame_received_nl(struct sk_buff *skb_2,
 	if (!info->attrs[HWSIM_ATTR_ADDR_RECEIVER] ||
 	    !info->attrs[HWSIM_ATTR_FRAME] ||
 	    !info->attrs[HWSIM_ATTR_RX_RATE] ||
-	    !info->attrs[HWSIM_ATTR_SIGNAL])
+	    !info->attrs[HWSIM_ATTR_SIGNAL]) {
+		if (net_ratelimit())
+			printk(KERN_DEBUG " hwsim rx-nl: Missing required attribute\n");
 		goto out;
+	}
 
 	dst = (void *)nla_data(info->attrs[HWSIM_ATTR_ADDR_RECEIVER]);
 	frame_data_len = nla_len(info->attrs[HWSIM_ATTR_FRAME]);
 	frame_data = (void *)nla_data(info->attrs[HWSIM_ATTR_FRAME]);
 
 	if (frame_data_len < sizeof(struct ieee80211_hdr_3addr) ||
-	    frame_data_len > IEEE80211_MAX_DATA_LEN)
-		goto err;
+	    frame_data_len > IEEE80211_MAX_DATA_LEN) {
+		if (net_ratelimit())
+			printk(KERN_DEBUG " hwsim rx-nl: data lenth error: %d  max: %d\n",
+			       frame_data_len, IEEE80211_MAX_DATA_LEN);
+		goto out;
+	}
 
 	/* Allocate new skb here */
 	skb = alloc_skb(frame_data_len, GFP_KERNEL);
-	if (skb == NULL)
-		goto err;
+	if (skb == NULL) {
+		if (net_ratelimit())
+			printk(KERN_DEBUG " hwsim rx-nl: skb alloc failed, len: %d\n",
+			       frame_data_len);
+		goto out;
+	}
 
 	/* Copy the data */
 	skb_put_data(skb, frame_data, frame_data_len);
 
 	data2 = get_hwsim_data_ref_from_addr(dst);
-	if (!data2)
+
+	if (!data2) {
+		if (net_ratelimit())
+			printk(KERN_DEBUG " hwsim rx-nl: Cannot find radio %pM\n",
+			       dst);
 		goto out;
+	}
 
 	if (data2->use_chanctx) {
 		if (data2->tmp_chan)
@@ -5870,14 +5934,25 @@ static int hwsim_cloned_frame_received_nl(struct sk_buff *skb_2,
 		    data2->netgroup)
 			goto out;
 
-		if (info->snd_portid != data2->wmediumd)
+		if (info->snd_portid != data2->wmediumd) {
+			if (net_ratelimit())
+				printk(KERN_DEBUG " hwsim rx-nl: portid mismatch, snd_portid: %d  portid %d\n",
+				       info->snd_portid, data2->wmediumd);
 			goto out;
+		}
 	}
 
 	/* check if radio is configured properly */
 
-	if ((data2->idle && !data2->tmp_chan) || !data2->started)
+	if ((data2->idle && !data2->tmp_chan) || !data2->started) {
+		static unsigned int cnt = 0;
+		/* This is fairly common, and usually not a bug.  So, print errors
+		   rarely. */
+		if (((cnt++ & 0x3FF) == 0x3FF) && net_ratelimit())
+			printk(KERN_DEBUG " hwsim rx-nl: radio %pM idle: %d or not started: %d cnt: %d\n",
+			       dst, data2->idle, !data2->started, cnt);
 		goto out;
+	}
 
 	/* A frame is received from user space */
 	memset(&rx_status, 0, sizeof(rx_status));
@@ -5925,11 +6000,87 @@ static int hwsim_cloned_frame_received_nl(struct sk_buff *skb_2,
 	    ieee80211_is_probe_resp(hdr->frame_control))
 		rx_status.boottime_ns = ktime_get_boottime_ns();
 
+	if (info->attrs[HWSIM_ATTR_RX_INFO]) {
+		struct hwsim_rx_info *r;
+		int i;
+
+		r = (struct hwsim_rx_info *)nla_data(
+			info->attrs[HWSIM_ATTR_RX_INFO]);
+		/* Convert from 4.9-era flags to new way of doing things. */
+		if (r->rx_flags & BIT(8))
+			rx_status.enc_flags |= RX_ENC_FLAG_SHORTPRE;
+		if (r->rx_flags & BIT(9))
+			rx_status.encoding = RX_ENC_HT;
+		if (r->rx_flags & BIT(10))
+			rx_status.bw = RATE_INFO_BW_40;
+		if (r->rx_flags & BIT(11))
+			rx_status.enc_flags |= RX_ENC_FLAG_SHORT_GI;
+		if (r->rx_flags & BIT(13))
+			rx_status.enc_flags |= RX_ENC_FLAG_HT_GF;
+		if (r->rx_flags & BIT(22))
+			rx_status.encoding = RX_ENC_VHT;
+		{
+			/* stbc mask */
+			unsigned tmp = 0;
+			if (r->rx_flags & BIT(26))
+				tmp |= 1;
+			if (r->rx_flags & BIT(27))
+				tmp |= 2;
+			tmp <<= RX_ENC_FLAG_STBC_SHIFT;
+			rx_status.enc_flags |= tmp;
+		}
+		if (r->rx_flags & BIT(23))
+			rx_status.enc_flags |= RX_ENC_FLAG_LDPC;
+		if (r->rx_flags & BIT(28))
+			rx_status.bw = RATE_INFO_BW_10;
+		if (r->rx_flags & BIT(29))
+			rx_status.bw = RATE_INFO_BW_5;
+
+		if (r->vht_flags & BIT(0))
+			rx_status.bw = RATE_INFO_BW_80;
+		if (r->vht_flags & BIT(1))
+			rx_status.bw = RATE_INFO_BW_160;
+		if (r->vht_flags & BIT(2))
+			rx_status.enc_flags |= RX_ENC_FLAG_BF;
+
+		for (i = 0; i<8; i++) {
+			if (r->rx_flags & BIT(i))
+				rx_status.flag |= BIT(i);
+		}
+		if (r->rx_flags & BIT(12))
+			rx_status.flag |= RX_FLAG_NO_SIGNAL_VAL;
+		if (r->rx_flags & BIT(14))
+			rx_status.flag |= RX_FLAG_AMPDU_DETAILS;
+		if (r->rx_flags & BIT(15))
+			rx_status.flag |= RX_FLAG_PN_VALIDATED;
+		if (r->rx_flags & BIT(16))
+			rx_status.flag |= RX_FLAG_DUP_VALIDATED;
+		if (r->rx_flags & BIT(17))
+			rx_status.flag |= RX_FLAG_AMPDU_LAST_KNOWN;
+		if (r->rx_flags & BIT(18))
+			rx_status.flag |= RX_FLAG_AMPDU_IS_LAST;
+		if (r->rx_flags & BIT(19))
+			rx_status.flag |= RX_FLAG_AMPDU_DELIM_CRC_ERROR;
+		if (r->rx_flags & BIT(20))
+			rx_status.flag |= RX_FLAG_AMPDU_DELIM_CRC_KNOWN;
+		if (r->rx_flags & BIT(21))
+			rx_status.flag |= RX_FLAG_MACTIME_END;
+		if (r->rx_flags & BIT(24))
+			rx_status.flag |= RX_FLAG_ONLY_MONITOR;
+		if (r->rx_flags & BIT(25))
+			rx_status.flag |= RX_FLAG_SKIP_MONITOR;
+		if (r->rx_flags & BIT(30))
+			rx_status.flag |= RX_FLAG_AMSDU_MORE;
+		/* MIC_STRIPPED, ALLOW_SAME_PN, ICV_STRIPPED not supported by hwsim api currently */
+
+		rx_status.nss = r->vht_nss;
+		rx_status.ampdu_reference = r->ampdu_reference;
+	}
+
 	mac80211_hwsim_rx(data2, &rx_status, skb);
 
 	return 0;
-err:
-	pr_debug("mac80211_hwsim: error occurred in %s\n", __func__);
+
 out:
 	dev_kfree_skb(skb);
 	return -EINVAL;

@@ -165,7 +165,9 @@ struct ath_txq {
 	spinlock_t axq_lock;
 	u32 axq_depth;
 	u32 axq_ampdu_depth;
-	bool axq_tx_inprogress;
+	u8 axq_tx_inprogress;
+	bool stopped;
+	bool clear_pending_frames_on_flush;
 	struct list_head txq_fifo[ATH_TXFIFO_DEPTH];
 	u8 txq_headidx;
 	u8 txq_tailidx;
@@ -599,7 +601,7 @@ void ath_assign_seq(struct ath_common *common, struct sk_buff *skb);
 int ath_tx_start(struct ieee80211_hw *hw, struct sk_buff *skb,
 		 struct ath_tx_control *txctl);
 void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-		 struct sk_buff *skb);
+		 const int slotwidth);
 void ath_tx_tasklet(struct ath_softc *sc);
 void ath_tx_edma_tasklet(struct ath_softc *sc);
 int ath_tx_aggr_start(struct ath_softc *sc, struct ieee80211_sta *sta,
@@ -635,6 +637,7 @@ struct ath_vif {
 	struct ieee80211_vif *vif;
 	struct ath_node mcast_node;
 	int av_bslot;
+	bool multicastWakeup;
 	__le64 tsf_adjust; /* TSF adjustment for staggered beacons */
 	struct ath_buf *av_bcbuf;
 	struct ath_chanctx *chanctx;
@@ -688,7 +691,7 @@ void ath9k_set_txpower(struct ath_softc *sc, struct ieee80211_vif *vif);
  * number of beacon intervals, the game's up.
  */
 #define BSTUCK_THRESH           	9
-#define	ATH_BCBUF               	8
+#define	ATH_BCBUF               	32
 #define ATH_DEFAULT_BINTVAL     	100 /* TU */
 #define ATH_DEFAULT_BMISS_LIMIT 	10
 
@@ -718,7 +721,7 @@ struct ath_beacon {
 void ath9k_beacon_tasklet(struct tasklet_struct *t);
 void ath9k_beacon_config(struct ath_softc *sc, struct ieee80211_vif *main_vif,
 			 bool beacons);
-void ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
+bool ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
 void ath9k_beacon_remove_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
 void ath9k_beacon_ensure_primary_slot(struct ath_softc *sc);
 void ath9k_set_beacon(struct ath_softc *sc);
@@ -986,7 +989,7 @@ struct ath_softc {
 	struct device *dev;
 
 	struct survey_info *cur_survey;
-	struct survey_info survey[ATH9K_NUM_CHANNELS];
+	struct survey_info survey[ATH9K_MAX_NUM_CHANNELS];
 
 	spinlock_t intr_lock;
 	struct tasklet_struct intr_tq;

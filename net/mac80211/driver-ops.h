@@ -63,10 +63,15 @@ static inline void drv_get_et_strings(struct ieee80211_sub_if_data *sdata,
 
 static inline void drv_get_et_stats(struct ieee80211_sub_if_data *sdata,
 				    struct ethtool_stats *stats,
-				    u64 *data)
+				    u64 *data, u32 level)
 {
 	struct ieee80211_local *local = sdata->local;
-	if (local->ops->get_et_stats) {
+	if (local->ops->get_et_stats2) {
+		trace_drv_get_et_stats(local);
+		local->ops->get_et_stats2(&local->hw, &sdata->vif, stats, data, level);
+		trace_drv_return_void(local);
+	}
+	else if (local->ops->get_et_stats) {
 		trace_drv_get_et_stats(local);
 		local->ops->get_et_stats(&local->hw, &sdata->vif, stats, data);
 		trace_drv_return_void(local);
@@ -132,6 +137,9 @@ static inline void drv_set_wakeup(struct ieee80211_local *local,
 	trace_drv_return_void(local);
 }
 #endif
+
+int drv_consume_block_ack(struct ieee80211_local *local,
+			  struct ieee80211_sub_if_data *sdata, struct sk_buff *skb);
 
 int drv_add_interface(struct ieee80211_local *local,
 		      struct ieee80211_sub_if_data *sdata);
@@ -693,7 +701,7 @@ static inline void drv_rfkill_poll(struct ieee80211_local *local)
 
 static inline void drv_flush(struct ieee80211_local *local,
 			     struct ieee80211_sub_if_data *sdata,
-			     u32 queues, bool drop)
+			     unsigned long *queues, bool drop)
 {
 	struct ieee80211_vif *vif;
 
@@ -706,9 +714,16 @@ static inline void drv_flush(struct ieee80211_local *local,
 	if (sdata && !check_sdata_in_driver(sdata))
 		return;
 
-	trace_drv_flush(local, queues, drop);
+	trace_drv_flush(local, queues[0], drop);
+	/* NOTE:  Only ath10k might want more queues than fits in 32-bits,
+	 * and currently it pays no attention to the queues argument.  So,
+	 * just passing first value here is safe.  If other drivers ever
+	 * do need to see the array, then can create a flushA member
+	 * and use it if it exists, falling back to old flush() for
+	 * other drivers.
+	 */
 	if (local->ops->flush)
-		local->ops->flush(&local->hw, vif, queues, drop);
+		local->ops->flush(&local->hw, vif, queues[0], drop);
 	trace_drv_return_void(local);
 }
 
@@ -854,8 +869,10 @@ static inline int drv_set_bitrate_mask(struct ieee80211_local *local,
 	might_sleep();
 	lockdep_assert_wiphy(local->hw.wiphy);
 
-	if (!check_sdata_in_driver(sdata))
+	if (!check_sdata_in_driver(sdata)) {
+		pr_err("drv-set-bitrate-mask, sdata is not in driver!\n");
 		return -EIO;
+	}
 
 	trace_drv_set_bitrate_mask(local, sdata, mask);
 	if (local->ops->set_bitrate_mask)

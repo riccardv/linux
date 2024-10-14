@@ -230,11 +230,14 @@ struct mt76_queue {
 };
 
 struct mt76_mcu_ops {
+	unsigned int max_retry;
 	u32 headroom;
 	u32 tailroom;
 
 	int (*mcu_send_msg)(struct mt76_dev *dev, int cmd, const void *data,
 			    int len, bool wait_resp);
+	int (*mcu_skb_prepare_msg)(struct mt76_dev *dev, struct sk_buff *skb,
+				   int cmd, int *seq);
 	int (*mcu_skb_send_msg)(struct mt76_dev *dev, struct sk_buff *skb,
 				int cmd, int *seq);
 	int (*mcu_parse_response)(struct mt76_dev *dev, int cmd,
@@ -297,18 +300,39 @@ enum mt76_phy_type {
 struct mt76_sta_stats {
 	u64 tx_mode[__MT_PHY_TYPE_MAX];
 	u64 tx_bw[5];		/* 20, 40, 80, 160, 320 */
+	/* frames that succeeded, perhaps after retry */
+	unsigned long tx_mpdu_ok; /* all frames */
+
+	unsigned long txo_tx_mpdu_attempts; /* counting any retries, txo frames */
+	unsigned long txo_tx_mpdu_fail; /* frames that failed even after retry, txo frames */
+	unsigned long txo_tx_mpdu_ok; /* tx frames */
+	unsigned long txo_tx_mpdu_retry; /* number of times frames were retried, txo frames */
+
 	u64 tx_nss[4];		/* 1, 2, 3, 4 */
 	u64 tx_mcs[16];		/* mcs idx */
 	u64 tx_bytes;
+
 	/* WED TX */
-	u32 tx_packets;		/* unit: MSDU */
-	u32 tx_retries;
-	u32 tx_failed;
+	unsigned long tx_attempts; /* Counting any retries. unit: MSDU (all frames) */
+	unsigned long tx_retries; /* number of times frames were retried (all frames) */
+	unsigned long tx_failed; /* failed even after retries (all frames) */
 	/* WED RX */
 	u64 rx_bytes;
 	u32 rx_packets;
 	u32 rx_errors;
 	u32 rx_drops;
+	/* This section requires group-5 in rxd to be enabled for 7915. */
+	unsigned long rx_nss[4]; /* rx-nss histogram */
+	unsigned long rx_mode[__MT_PHY_TYPE_MAX]; /* rx mode histogram */
+	unsigned long rx_bw_20;
+	unsigned long rx_bw_40;
+	unsigned long rx_bw_80;
+	unsigned long rx_bw_160;
+	unsigned long rx_bw_320;
+	unsigned long rx_bw_he_ru;
+	unsigned long rx_ru_106;
+	unsigned long rx_rate_idx[14];
+	unsigned long rx_ampdu_len[15];
 };
 
 enum mt76_wcid_flags {
@@ -339,8 +363,13 @@ struct mt76_wcid {
 	struct ewma_signal rssi;
 	int inactive_count;
 
+	/* cached rate, updated from mac_sta_poll() and from TXS callback logic,
+	 * in 7915 at least.
+	 */
 	struct rate_info rate;
 	unsigned long ampdu_state;
+	bool rate_short_gi; /* cached HT/VHT short_gi, from mac_sta_poll() */
+	u8 rate_he_gi; /* cached HE GI, from mac_sta_poll() */
 
 	u16 idx;
 	u8 hw_key_idx;
@@ -358,6 +387,7 @@ struct mt76_wcid {
 
 	u32 tx_info;
 	bool sw_iv;
+	u16 ampdu_chain; /* rx ampdu chain count, for stats */
 
 	struct list_head tx_list;
 	struct sk_buff_head tx_pending;
@@ -370,6 +400,7 @@ struct mt76_wcid {
 	struct list_head poll_list;
 
 	struct mt76_wcid *def_wcid;
+	unsigned long last_idr_check_at; /* in jiffies */
 };
 
 struct mt76_txq {
@@ -421,9 +452,18 @@ struct mt76_rx_tid {
 	struct sk_buff *reorder_buf[] __counted_by(size);
 };
 
+/**
+ * Flags for the SKB CB.
+ *
+ * MT_TX_CB_DMA_DONE: Indicates that tx DMA has been completed.
+ * MT_TX_CB_TXS_DONE: Indicates that tx status has been handled.
+ * MT_TX_CB_TXS_FAILED: Indicates failure for tx status.
+ * MT_TX_CB_TXO_USED: Indicates that tx overrides have been used for this tx.
+ */
 #define MT_TX_CB_DMA_DONE		BIT(0)
 #define MT_TX_CB_TXS_DONE		BIT(1)
 #define MT_TX_CB_TXS_FAILED		BIT(2)
+#define MT_TX_CB_TXO_USED		BIT(3)
 
 #define MT_PACKET_ID_MASK		GENMASK(6, 0)
 #define MT_PACKET_ID_NO_ACK		0
@@ -437,7 +477,7 @@ struct mt76_rx_tid {
  * long after that for firmware to send the TXS callback if it is going
  * to do so.)
  */
-#define MT_TX_STATUS_SKB_TIMEOUT	(HZ / 4)
+#define MT_TX_STATUS_SKB_TIMEOUT_DFLT	(HZ / 4)
 
 struct mt76_tx_cb {
 	unsigned long jiffies;
@@ -698,13 +738,21 @@ struct mt76_testmode_ops {
 	int (*set_params)(struct mt76_phy *phy, struct nlattr **tb,
 			  enum mt76_testmode_state new_state);
 	int (*dump_stats)(struct mt76_phy *phy, struct sk_buff *msg);
+	void (*reset_rx_stats)(struct mt76_phy *phy);
+	void (*tx_stop)(struct mt76_phy *phy);
+	int (*set_eeprom)(struct mt76_phy *phy, u32 offset, u8 *val, u8 action);
 };
+
+#define MT_TM_FW_RX_COUNT	BIT(0)
 
 struct mt76_testmode_data {
 	enum mt76_testmode_state state;
+	u8 txo_active; /* tx overrides are active */
 
 	u32 param_set[DIV_ROUND_UP(NUM_MT76_TM_ATTRS, 32)];
 	struct sk_buff *tx_skb;
+
+	u8 sku_en;
 
 	u32 tx_count;
 	u16 tx_mpdu_len;
@@ -715,7 +763,11 @@ struct mt76_testmode_data {
 	u8 tx_rate_sgi;
 	u8 tx_rate_ldpc;
 	u8 tx_rate_stbc;
+	u16 tx_preamble_puncture;
 	u8 tx_ltf;
+	u8 txbw; /* specify TX bandwidth: 0 20Mhz, 1 40Mhz, 2 80Mhz, 3 160Mhz */
+	u8 tx_xmit_count; /* 0 means no-ack, 1 means one transmit, etc */
+	u8 tx_dynbw; /* 0:  dynamic bw disabled, 1: dynamic bw enabled */
 
 	u8 tx_antenna_mask;
 	u8 tx_spe_idx;
@@ -723,6 +775,9 @@ struct mt76_testmode_data {
 	u8 tx_duty_cycle;
 	u32 tx_time;
 	u32 tx_ipg;
+
+	bool ibf;
+	bool ebf;
 
 	u32 freq_offset;
 
@@ -738,7 +793,16 @@ struct mt76_testmode_data {
 	struct {
 		u64 packets[__MT_RXQ_MAX];
 		u64 fcs_error[__MT_RXQ_MAX];
+		u64 len_mismatch;
 	} rx_stats;
+	u8 flag;
+
+	struct {
+		u8 type;
+		u8 enable;
+	} cfg;
+
+	u8 aid;
 };
 
 struct mt76_vif {
@@ -753,6 +817,14 @@ struct mt76_vif {
 	u8 beacon_rates_idx;
 	struct ieee80211_chanctx_conf *ctx;
 };
+
+struct rdd_cmd_msg {
+	u8 ctrl;
+	u8 rdd_idx;
+	u8 rdd_rx_sel;
+	u8 val;
+	u8 rsv[4];
+} __packed;
 
 struct mt76_phy {
 	struct ieee80211_hw *hw;
@@ -783,6 +855,7 @@ struct mt76_phy {
 	u8 macaddr[ETH_ALEN];
 
 	int txpower_cur;
+	u8 sku_idx;
 	u8 antenna_mask;
 	u16 chainmask;
 
@@ -820,6 +893,7 @@ struct mt76_dev {
 	spinlock_t cc_lock;
 
 	u32 cur_cc_bss_rx;
+	u32 debug_lvl;
 
 	struct mt76_rx_status rx_ampdu_status;
 	u32 rx_ampdu_len;
@@ -834,6 +908,11 @@ struct mt76_dev {
 	struct device *dma_dev;
 
 	struct mt76_mcu mcu;
+	u32 first_failed_mcu_cmd; /* for debugging */
+	u32 last_successful_mcu_cmd; /* for debugging */
+	u32 mcu_timeouts; /* sequential timeout counter */
+	#define MAX_MCU_TIMEOUTS 3
+
 
 	struct net_device *napi_dev;
 	struct net_device *tx_napi_dev;
@@ -887,6 +966,10 @@ struct mt76_dev {
 	struct debugfs_blob_wrapper eeprom;
 	struct debugfs_blob_wrapper otp;
 
+	/* Store last-set rdd cmds for debugging cac/radar. */
+	struct rdd_cmd_msg debug_mcu_rdd_cmd[3];
+	int debug_mcu_rdd_cmd_rv[3];
+
 	char alpha2[3];
 	enum nl80211_dfs_regions region;
 
@@ -894,7 +977,37 @@ struct mt76_dev {
 
 	u8 csa_complete;
 
+#define MT_BLOCK_TX 0x1
+#define MT_BLOCK_RX 0x2
+
+	u8 block_traffic;
+
+	/* Should we request TXS for MT_PACKET_ID_NO_SKB?  Doing so gives better
+	 * costs but causes a great deal more TXS packet processing by driver and
+	 * creation by firmware, so may be a performance drag.
+	 */
+	bool txs_for_no_skb_enabled;
+
+	/* Should we request TXS for all skbs (and properly map to skb)
+	  * Very likely this reduces performance.
+	  */
+	bool txs_for_all_enabled;
+	bool lpi_psd;
+	bool lpi_bcn_enhance;
+	bool mgmt_pwr_enhance;
+
 	u32 rxfilter;
+	u32 stale_skb_status_check;
+	u32 stale_skb_status_timeout;
+
+	struct {
+		u32 hw_sw_ver;
+		char build_date[16];
+		char wm_fw_ver[12];
+		char wm_build_date[16];
+		char wa_fw_ver[12];
+		char wa_build_date[16];
+	} fw;
 
 #ifdef CONFIG_NL80211_TESTMODE
 	const struct mt76_testmode_ops *test_ops;
@@ -914,6 +1027,12 @@ struct mt76_dev {
 
 /* per-phy stats.  */
 struct mt76_mib_stats {
+	/* phy wide driver stats */
+	unsigned long tx_pkts_nic; /* tx OK skb */
+	unsigned long tx_bytes_nic; /* tx OK bytes */
+	unsigned long rx_pkts_nic; /* rx OK skb */
+	unsigned long rx_bytes_nic; /* rx OK bytes */
+
 	u32 ack_fail_cnt;
 	u32 fcs_err_cnt;
 	u32 rts_cnt;
@@ -948,9 +1067,17 @@ struct mt76_mib_stats {
 
 	u32 tx_rwp_fail_cnt;
 	u32 tx_rwp_need_cnt;
+	u32 tx_mgt_frame_cnt;
+	u32 tx_mgt_frame_retry_cnt;
+	u32 tx_data_frame_retry_cnt;
+	u32 tx_drop_rts_retry_fail_cnt;
+	u32 tx_drop_mpdu_retry_fail_cnt;
+	u32 tx_drop_lto_limit_fail_cnt;
+	u32 tx_dbnss_cnt;
 
 	/* rx stats */
 	u32 rx_fifo_full_cnt;
+	u32 rx_oor_cnt;
 	u32 channel_idle_cnt;
 	u32 primary_cca_busy_time;
 	u32 secondary_cca_busy_time;
@@ -970,9 +1097,23 @@ struct mt76_mib_stats {
 	u32 rx_pfdrop_cnt;
 	u32 rx_vec_queue_overflow_drop_cnt;
 	u32 rx_ba_cnt;
+	u32 rx_partial_beacon_cnt;
+	u32 rx_oppo_ps_rx_dis_drop_cnt;
+	u32 rx_fcs_ok_cnt;
 
 	u32 tx_amsdu[8];
 	u32 tx_amsdu_cnt;
+
+	/* rx stats from the driver */
+	unsigned long rx_d_skb; /* total skb received in rx path */
+	u32 rx_d_rxd2_amsdu_err;
+	u32 rx_d_null_channels;
+	u32 rx_d_max_len_err;
+	u32 rx_d_too_short;
+	u32 rx_d_bad_ht_rix;
+	u32 rx_d_bad_vht_rix;
+	u32 rx_d_bad_mode;
+	u32 rx_d_bad_bw;
 
 	/* mcu_muru_stats */
 	u32 dl_cck_cnt;
@@ -1007,6 +1148,25 @@ struct mt76_mib_stats {
 	u32 ul_hetrig_4mu_cnt;
 };
 
+enum MTK_DEUBG {
+	MTK_DEBUG_TX		= 0x00000001, /* tx path */
+	MTK_DEBUG_TXV		= 0x00000002, /* verbose tx path */
+	MTK_DEBUG_FATAL		= 0x00000004,
+	MTK_DEBUG_WRN		= 0x00000008,
+	MTK_DEBUG_MSG		= 0x00000010, /* messages to/from firmware */
+	MTK_DEBUG_CFG		= 0x00000020, /* Configuration related */
+	MTK_DEBUG_BA		= 0x00000040, /* block-ack and aggregation related */
+	MTK_DEBUG_RXV		= 0x00000080, /* verbose rx path */
+	MTK_DEBUG_ANY		= 0xffffffff
+};
+
+#define mtk_dbg(mt76, dbg_mask, fmt, ...)				\
+	do {								\
+		if ((mt76)->debug_lvl & MTK_DEBUG_##dbg_mask)		\
+			dev_info((mt76)->dev, fmt, ##__VA_ARGS__); \
+	} while (0)
+
+
 struct mt76_power_limits {
 	s8 cck[4];
 	s8 ofdm[8];
@@ -1015,12 +1175,87 @@ struct mt76_power_limits {
 	s8 eht[16][16];
 };
 
+struct mt76_power_path_limits {
+       s8 cck[5];
+       s8 ofdm[5];
+       s8 ofdm_bf[4];
+       s8 ru[16][15];
+       s8 ru_bf[16][15];
+};
+
+static inline const char *mt76_bus_str(enum mt76_bus_type bus)
+{
+	switch (bus) {
+	case MT76_BUS_MMIO:
+		return "mmio";
+	case MT76_BUS_USB:
+		return "usb";
+	case MT76_BUS_SDIO:
+		return "sdio";
+	}
+
+	return "unknown";
+}
+
+static inline
+void mt76_inc_ampdu_bucket(int ampdu_len, struct mt76_sta_stats *stats)
+{
+	/*   "rx_ampdu_len:0-1",
+	     "rx_ampdu_len:2-10",
+	     "rx_ampdu_len:11-19",
+	     "rx_ampdu_len:20-28",
+	     "rx_ampdu_len:29-37",
+	     "rx_ampdu_len:38-46",
+	     "rx_ampdu_len:47-55",
+	     "rx_ampdu_len:56-79",
+	     "rx_ampdu_len:80-103",
+	     "rx_ampdu_len:104-127",
+	     "rx_ampdu_len:128-151",
+	     "rx_ampdu_len:152-175",
+	     "rx_ampdu_len:176-199",
+	     "rx_ampdu_len:200-223",
+	     "rx_ampdu_len:224-247",
+	*/
+
+	if (ampdu_len <= 1)
+		stats->rx_ampdu_len[0]++;
+	else if (ampdu_len <= 10)
+		stats->rx_ampdu_len[1]++;
+	else if (ampdu_len <= 19)
+		stats->rx_ampdu_len[2]++;
+	else if (ampdu_len <= 28)
+		stats->rx_ampdu_len[3]++;
+	else if (ampdu_len <= 37)
+		stats->rx_ampdu_len[4]++;
+	else if (ampdu_len <= 46)
+		stats->rx_ampdu_len[5]++;
+	else if (ampdu_len <= 55)
+		stats->rx_ampdu_len[6]++;
+	else if (ampdu_len <= 79)
+		stats->rx_ampdu_len[7]++;
+	else if (ampdu_len <= 103)
+		stats->rx_ampdu_len[8]++;
+	else if (ampdu_len <= 127)
+		stats->rx_ampdu_len[9]++;
+	else if (ampdu_len <= 151)
+		stats->rx_ampdu_len[10]++;
+	else if (ampdu_len <= 175)
+		stats->rx_ampdu_len[11]++;
+	else if (ampdu_len <= 199)
+		stats->rx_ampdu_len[12]++;
+	else if (ampdu_len <= 223)
+		stats->rx_ampdu_len[13]++;
+	else
+		stats->rx_ampdu_len[14]++;
+}
+
 struct mt76_ethtool_worker_info {
 	u64 *data;
 	int idx;
 	int initial_stat_idx;
 	int worker_stat_count;
 	int sta_count;
+	bool has_eht;
 };
 
 #define CCK_RATE(_idx, _rate) {					\
@@ -1126,6 +1361,11 @@ static inline int mt76_wed_dma_setup(struct mt76_dev *dev, struct mt76_queue *q,
 }
 #endif /* CONFIG_NET_MEDIATEK_SOC_WED */
 
+static inline int mt76_vif_count(struct mt76_dev *dev)
+{
+	return hweight_long(dev->vif_mask);
+}
+
 #define mt76xx_chip(dev) mt76_chip(&((dev)->mt76))
 #define mt76xx_rev(dev) mt76_rev(&((dev)->mt76))
 
@@ -1171,6 +1411,7 @@ void mt76_seq_puts_array(struct seq_file *file, const char *str,
 
 int mt76_eeprom_init(struct mt76_dev *dev, int len);
 void mt76_eeprom_override(struct mt76_phy *phy);
+int mt76_get_of_data_from_file(struct mt76_dev *dev, void *eep, u32 offset, int len);
 int mt76_get_of_data_from_mtd(struct mt76_dev *dev, void *eep, int offset, int len);
 int mt76_get_of_data_from_nvmem(struct mt76_dev *dev, void *eep,
 				const char *cell_name, int len);
@@ -1446,6 +1687,24 @@ int mt76_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *skb,
 int mt76_testmode_set_state(struct mt76_phy *phy, enum mt76_testmode_state state);
 int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len);
 
+static inline void
+mt76_testmode_param_set(struct mt76_testmode_data *td, u16 idx)
+{
+#ifdef CONFIG_NL80211_TESTMODE
+	td->param_set[idx / 32] |= BIT(idx % 32);
+#endif
+}
+
+static inline bool
+mt76_testmode_param_present(struct mt76_testmode_data *td, u16 idx)
+{
+#ifdef CONFIG_NL80211_TESTMODE
+	return td->param_set[idx / 32] & BIT(idx % 32);
+#else
+	return false;
+#endif
+}
+
 static inline void mt76_testmode_reset(struct mt76_phy *phy, bool disable)
 {
 #ifdef CONFIG_NL80211_TESTMODE
@@ -1613,6 +1872,7 @@ mt76_find_channel_node(struct device_node *np, struct ieee80211_channel *chan);
 s8 mt76_get_rate_power_limits(struct mt76_phy *phy,
 			      struct ieee80211_channel *chan,
 			      struct mt76_power_limits *dest,
+			      struct mt76_power_path_limits *dest_path,
 			      s8 target_power);
 
 static inline bool mt76_queue_is_rx(struct mt76_dev *dev, struct mt76_queue *q)

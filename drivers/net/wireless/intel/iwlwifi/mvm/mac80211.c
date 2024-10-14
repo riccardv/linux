@@ -165,12 +165,8 @@ struct ieee80211_regdomain *iwl_mvm_get_regdomain(struct wiphy *wiphy,
 	mvm->lar_regdom_set = true;
 	mvm->mcc_src = src_id;
 
-	/* Some kind of regulatory mess means we need to currently disallow
-	 * puncturing in the US and Canada. Do that here, at least until we
-	 * figure out the new chanctx APIs for puncturing.
-	 */
-	if (resp->mcc == cpu_to_le16(IWL_MCC_US) ||
-	    resp->mcc == cpu_to_le16(IWL_MCC_CANADA))
+	if (!iwl_puncturing_is_allowed_in_bios(mvm->bios_enable_puncturing,
+					       le16_to_cpu(resp->mcc)))
 		ieee80211_hw_set(mvm->hw, DISALLOW_PUNCTURING);
 	else
 		__clear_bit(IEEE80211_HW_DISALLOW_PUNCTURING, mvm->hw->flags);
@@ -313,10 +309,12 @@ int iwl_mvm_op_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant)
 {
 	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
 
+#if 0
 	/* This has been tested on those devices only */
 	if (mvm->trans->trans_cfg->device_family != IWL_DEVICE_FAMILY_9000 &&
 	    mvm->trans->trans_cfg->device_family != IWL_DEVICE_FAMILY_22000)
 		return -EOPNOTSUPP;
+#endif
 
 	if (!mvm->nvm_data)
 		return -EBUSY;
@@ -639,9 +637,14 @@ int iwl_mvm_mac_setup_register(struct iwl_mvm *mvm)
 			       NL80211_FEATURE_LOW_PRIORITY_SCAN |
 			       NL80211_FEATURE_P2P_GO_OPPPS |
 			       NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE |
-			       NL80211_FEATURE_DYNAMIC_SMPS |
-			       NL80211_FEATURE_STATIC_SMPS |
 			       NL80211_FEATURE_SUPPORTS_WMM_ADMISSION;
+
+	/* when firmware supports RLC/SMPS offload, do not set these
+	 * driver features, since it's no longer supported by driver.
+	 */
+	if (!iwl_mvm_has_rlc_offload(mvm))
+		hw->wiphy->features |= NL80211_FEATURE_STATIC_SMPS |
+				       NL80211_FEATURE_DYNAMIC_SMPS;
 
 	if (fw_has_capa(&mvm->fw->ucode_capa,
 			IWL_UCODE_TLV_CAPA_TXPOWER_INSERTION_SUPPORT))
@@ -1293,6 +1296,9 @@ int iwl_mvm_mac_start(struct ieee80211_hw *hw)
 	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
 	int ret;
 
+	if (mvm->trans->dbg.fake_double_fault)
+		return -EIO;
+
 	mutex_lock(&mvm->mutex);
 
 	/* we are starting the mac not in error flow, and restart is enabled */
@@ -1470,19 +1476,33 @@ int iwl_mvm_set_tx_power(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 {
 	u32 cmd_id = REDUCE_TX_POWER_CMD;
 	int len;
-	struct iwl_dev_tx_power_cmd cmd = {
+	struct iwl_dev_tx_power_cmd_v3_v8 cmd = {
 		.common.set_mode = cpu_to_le32(IWL_TX_POWER_MODE_SET_MAC),
 		.common.mac_context_id =
 			cpu_to_le32(iwl_mvm_vif_from_mac80211(vif)->id),
-		.common.pwr_restriction = cpu_to_le16(8 * tx_power),
 	};
-	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, cmd_id,
-					   IWL_FW_CMD_VER_UNKNOWN);
+	struct iwl_dev_tx_power_cmd cmd_v9_v10;
+	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, cmd_id, 3);
+	u16 u_tx_power = tx_power == IWL_DEFAULT_MAX_TX_POWER ?
+		IWL_DEV_MAX_TX_POWER : 8 * tx_power;
+	void *cmd_data = &cmd;
 
-	if (tx_power == IWL_DEFAULT_MAX_TX_POWER)
-		cmd.common.pwr_restriction = cpu_to_le16(IWL_DEV_MAX_TX_POWER);
+	cmd.common.pwr_restriction = cpu_to_le16(u_tx_power);
 
-	if (cmd_ver == 8)
+	if (cmd_ver > 8) {
+		/* Those fields sit on the same place for v9 and v10 */
+		cmd_v9_v10.common.set_mode = cpu_to_le32(IWL_TX_POWER_MODE_SET_MAC);
+		cmd_v9_v10.common.mac_context_id =
+			cpu_to_le32(iwl_mvm_vif_from_mac80211(vif)->id);
+		cmd_v9_v10.common.pwr_restriction = cpu_to_le16(u_tx_power);
+		cmd_data = &cmd_v9_v10;
+	}
+
+	if (cmd_ver == 10)
+		len = sizeof(cmd_v9_v10.v10);
+	else if (cmd_ver == 9)
+		len = sizeof(cmd_v9_v10.v9);
+	else if (cmd_ver == 8)
 		len = sizeof(cmd.v8);
 	else if (cmd_ver == 7)
 		len = sizeof(cmd.v7);
@@ -1497,10 +1517,14 @@ int iwl_mvm_set_tx_power(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 	else
 		len = sizeof(cmd.v3);
 
-	/* all structs have the same common part, add it */
+	/* all structs have the same common part, add its length */
 	len += sizeof(cmd.common);
 
-	return iwl_mvm_send_cmd_pdu(mvm, cmd_id, 0, len, &cmd);
+	if (cmd_ver < 9)
+		len += sizeof(cmd.per_band);
+
+	return iwl_mvm_send_cmd_pdu(mvm, cmd_id, 0, len, cmd_data);
+
 }
 
 static void iwl_mvm_post_csa_tx(void *data, struct ieee80211_sta *sta)
@@ -1549,9 +1573,11 @@ int iwl_mvm_post_channel_switch(struct ieee80211_hw *hw,
 
 		if (!fw_has_capa(&mvm->fw->ucode_capa,
 				 IWL_UCODE_TLV_CAPA_CHANNEL_SWITCH_CMD)) {
-			ret = iwl_mvm_enable_beacon_filter(mvm, vif);
-			if (ret)
-				goto out_unlock;
+			if (mvmvif->bf_enabled) {
+				ret = iwl_mvm_enable_beacon_filter(mvm, vif);
+				if (ret)
+					goto out_unlock;
+			}
 
 			iwl_mvm_stop_session_protection(mvm, vif);
 		}
@@ -2666,6 +2692,9 @@ static void iwl_mvm_cfg_he_sta(struct iwl_mvm *mvm,
 		sta_ctxt_cmd_v2.reserved3 = 0;
 	}
 
+	IWL_ERR(mvm, "cfg-he-sta, bss_conf.nontransmitted: %d  ref-bssid-addr: %pM  idx: %d\n",
+		vif->bss_conf.nontransmitted, sta_ctxt_cmd.ref_bssid_addr, sta_ctxt_cmd.bssid_index);
+
 	if (iwl_mvm_send_cmd_pdu(mvm, cmd_id, 0, size, cmd))
 		IWL_ERR(mvm, "Failed to config FW to work HE!\n");
 }
@@ -2749,7 +2778,8 @@ iwl_mvm_bss_info_changed_station_common(struct iwl_mvm *mvm,
 		iwl_mvm_stop_session_protection(mvm, vif);
 
 		iwl_mvm_sf_update(mvm, vif, false);
-		WARN_ON(iwl_mvm_enable_beacon_filter(mvm, vif));
+		if (mvmvif->bf_enabled)
+			WARN_ON(iwl_mvm_enable_beacon_filter(mvm, vif));
 	}
 
 	if (changes & (BSS_CHANGED_PS | BSS_CHANGED_P2P_PS | BSS_CHANGED_QOS |
@@ -2783,13 +2813,6 @@ iwl_mvm_bss_info_changed_station_common(struct iwl_mvm *mvm,
 
 	if (changes & BSS_CHANGED_BANDWIDTH)
 		iwl_mvm_update_link_smps(vif, link_conf);
-
-	if (changes & BSS_CHANGED_TPE) {
-		IWL_DEBUG_CALIB(mvm, "Changing TPE\n");
-		iwl_mvm_send_ap_tx_power_constraint_cmd(mvm, vif,
-							link_conf,
-							false);
-	}
 }
 
 static void iwl_mvm_bss_info_changed_station(struct iwl_mvm *mvm,
@@ -3974,7 +3997,8 @@ iwl_mvm_sta_state_assoc_to_authorized(struct iwl_mvm *mvm,
 					   NL80211_TDLS_ENABLE_LINK);
 	} else {
 		/* enable beacon filtering */
-		WARN_ON(iwl_mvm_enable_beacon_filter(mvm, vif));
+		if (mvmvif->bf_enabled)
+			WARN_ON(iwl_mvm_enable_beacon_filter(mvm, vif));
 
 		mvmvif->authorized = 1;
 
@@ -5189,10 +5213,6 @@ static int __iwl_mvm_assign_vif_chanctx(struct iwl_mvm *mvm,
 		}
 
 		iwl_mvm_update_quotas(mvm, false, NULL);
-
-		iwl_mvm_send_ap_tx_power_constraint_cmd(mvm, vif,
-							link_conf,
-							false);
 	}
 
 	goto out;
@@ -6199,9 +6219,32 @@ void iwl_mvm_mac_sta_statistics(struct ieee80211_hw *hw,
 	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
 	int i;
 
-	if (mvmsta->deflink.avg_energy) {
-		sinfo->signal_avg = -(s8)mvmsta->deflink.avg_energy;
+	if (iwl_mvm_has_new_rx_api(mvm)) { /* rxmq logic */
+		/* Grab chain signal avg, mac80211 cannot do it because
+		 * this driver uses RSS.  Grab signal_avg here too because firmware
+		 * appears go not do DB summing and/or has other bugs. --Ben
+		 */
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+		sinfo->signal_avg = -ewma_signal_read(&mvmsta->rx_avg_signal);
+
+		if (!mvmvif->bf_enabled) {
+			/* The firmware reliably reports different signal (2db weaker in my case)
+			 * than if I calculate it from the rx-status.  So, fill that here.
+			 * Beacons are only received if you turn off beacon filtering, however.
+			 */
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_SIGNAL_AVG);
+			sinfo->rx_beacon_signal_avg = -ewma_signal_read(&mvmsta->rx_avg_beacon_signal);
+		}
+
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL_AVG);
+		sinfo->chain_signal_avg[0] = -ewma_signal_read(&mvmsta->rx_avg_chain_signal[0]);
+		sinfo->chain_signal_avg[1] = -ewma_signal_read(&mvmsta->rx_avg_chain_signal[1]);
+	}
+	else {
+		if (mvmsta->deflink.avg_energy) {
+			sinfo->signal_avg = -(s8)mvmsta->deflink.avg_energy;
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+		}
 	}
 
 	if (iwl_mvm_has_tlc_offload(mvm)) {
@@ -6232,11 +6275,14 @@ void iwl_mvm_mac_sta_statistics(struct ieee80211_hw *hw,
 			mvmvif->link[i]->beacon_stats.accu_num_beacons;
 
 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_RX);
-	if (mvmvif->deflink.beacon_stats.avg_signal) {
-		/* firmware only reports a value after RXing a few beacons */
-		sinfo->rx_beacon_signal_avg =
-			mvmvif->deflink.beacon_stats.avg_signal;
-		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_SIGNAL_AVG);
+
+	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_BEACON_SIGNAL_AVG))) {
+		if (mvmvif->deflink.beacon_stats.avg_signal) {
+			/* firmware only reports a value after RXing a few beacons */
+			sinfo->rx_beacon_signal_avg =
+				mvmvif->deflink.beacon_stats.avg_signal;
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_SIGNAL_AVG);
+		}
 	}
 }
 
@@ -6519,12 +6565,305 @@ int iwl_mvm_set_hw_timestamp(struct ieee80211_hw *hw,
 	return iwl_mvm_time_sync_config(mvm, hwts->macaddr, protocols);
 }
 
+static const char iwl_mvm_gstrings_stats[][ETH_GSTRING_LEN] = {
+	"tx_pkts_nic", /* from driver, phy tx-ok skb */
+	"tx_bytes_nic", /* from driver, phy tx-ok bytes */
+	"rx_pkts_nic", /* from driver, phy rx OK skb */
+	"rx_bytes_nic", /* from driver, phy rx OK bytes */
+
+	"tx_mpdu_attempts", /* counting any retries */
+	"tx_mpdu_fail",  /* frames that failed even after retry */
+	"tx_mpdu_retry", /* number of times frames were retried */
+
+	"txo_tx_mpdu_attempts", /* counting any retries, txo frames */
+	"txo_tx_mpdu_fail",  /* frames that failed even after retry, txo frames */
+	"txo_tx_mpdu_retry", /* number of times frames were retried, txo frames */
+	"txo_tx_mpdu_ok", /* frames that succeeded, perhaps after retry, txo frames */
+
+	"esr_disabled_reasons", /* Bitfield for why ESR is disabled (0 means not disabled) */
+	"esr_active", /* Attempting to do ESR or not? */
+	"esr_last_exit_reason", /* Why we exited ESR last */
+
+	"tx_direct_done",
+	"tx_postpone_delay",
+	"tx_postpone_few_bytes",
+	"tx_postpone_bt_prio",
+	"tx_postpone_quiet_period",
+	"tx_postpone_calc_ttak",
+	"tx_fail_internal_x_retry",
+	"tx_fail_short_limit",
+	"tx_fail_long_limit",
+	"tx_fail_underrun",
+	"tx_fail_drain_flow",
+	"tx_fail_rfkill_flush",
+	"tx_fail_life_expire",
+	"tx_fail_dest_ps",
+	"tx_fail_host_aborted",
+	"tx_fail_bt_retry",
+	"tx_fail_sta_invalid",
+	"tx_fail_frag_dropped",
+	"tx_fail_tid_disable",
+	"tx_fail_fifo_flushed",
+	"tx_fail_small_cf_poll",
+	"tx_fail_fw_drop",
+	"tx_fail_color_mismatch",
+	"tx_fail_internal_abort",
+	"tx_fail_unknown_oor",
+
+	"tx_mode_cck",
+	"tx_mode_ofdm",
+	"tx_mode_ht",
+	"tx_mode_vht",
+	"tx_mode_he",
+	"tx_mode_eht",
+	"tx_mode_he_su",
+	"tx_mode_he_ext_su",
+	"tx_mode_he_mu",
+	"tx_mode_he_trig",
+
+	"tx_ampdu_len:0-1",
+	"tx_ampdu_len:2-10",
+	"tx_ampdu_len:11-19",
+	"tx_ampdu_len:20-28",
+	"tx_ampdu_len:29-37",
+	"tx_ampdu_len:38-46",
+	"tx_ampdu_len:47-55",
+	"tx_ampdu_len:56-79",
+	"tx_ampdu_len:80-103",
+	"tx_ampdu_len:104-127",
+	"tx_ampdu_len:128-151",
+	"tx_ampdu_len:152-175",
+	"tx_ampdu_len:176-199",
+	"tx_ampdu_len:200-223",
+	"tx_ampdu_len:224-247", /* and higher */
+
+	"tx_bw_20",
+	"tx_bw_40",
+	"tx_bw_80",
+	"tx_bw_160",
+	"tx_bw_320",
+	"tx_bw_106_tone",
+
+	"tx_mcs_0",
+	"tx_mcs_1",
+	"tx_mcs_2",
+	"tx_mcs_3",
+	"tx_mcs_4",
+	"tx_mcs_5",
+	"tx_mcs_6",
+	"tx_mcs_7",
+	"tx_mcs_8",
+	"tx_mcs_9",
+	"tx_mcs_10",
+	"tx_mcs_11",
+	"tx_mcs_12",
+	"tx_mcs_13",
+
+	"tx_nss_1",
+	"tx_nss_2",
+
+	/* rx stats */
+	"rx_crc_err",
+	"rx_fifo_underrun",
+	"rx_failed_decrypt",
+	"rx_dup",
+	"rx_bad_header_len",
+
+	"rx_mode_cck",
+	"rx_mode_ofdm",
+	"rx_mode_ht",
+	"rx_mode_vht",
+	"rx_mode_he",
+	"rx_mode_eht",
+
+	"rx_mode_he_su",
+	"rx_mode_he_ext_su",
+	"rx_mode_he_mu",
+	"rx_mode_he_trig",
+
+	"rx_bw_20",
+	"rx_bw_40",
+	"rx_bw_80",
+	"rx_bw_160",
+	"rx_bw_320",
+	"rx_bw_he_ru",
+
+	"rx_mcs_0",
+	"rx_mcs_1",
+	"rx_mcs_2",
+	"rx_mcs_3",
+	"rx_mcs_4",
+	"rx_mcs_5",
+	"rx_mcs_6",
+	"rx_mcs_7",
+	"rx_mcs_8",
+	"rx_mcs_9",
+	"rx_mcs_10",
+	"rx_mcs_11",
+	"rx_mcs_12",
+	"rx_mcs_13",
+
+	"rx_ampdu_len:0-1",
+	"rx_ampdu_len:2-10",
+	"rx_ampdu_len:11-19",
+	"rx_ampdu_len:20-28",
+	"rx_ampdu_len:29-37",
+	"rx_ampdu_len:38-46",
+	"rx_ampdu_len:47-55",
+	"rx_ampdu_len:56-79",
+	"rx_ampdu_len:80-103",
+	"rx_ampdu_len:104-127",
+	"rx_ampdu_len:128-151",
+	"rx_ampdu_len:152-175",
+	"rx_ampdu_len:176-199",
+	"rx_ampdu_len:200-223",
+	"rx_ampdu_len:224-247", /* and higher */
+
+	"rx_nss_1",
+	"rx_nss_2",
+};
+
+#define IWL_MVM_SSTATS_LEN ARRAY_SIZE(iwl_mvm_gstrings_stats)
+
+void iwl_mvm_get_et_strings(struct ieee80211_hw *hw,
+			    struct ieee80211_vif *vif,
+			    u32 sset, u8 *data)
+{
+	if (sset != ETH_SS_STATS)
+		return;
+
+	memcpy(data, *iwl_mvm_gstrings_stats, sizeof(iwl_mvm_gstrings_stats));
+}
+
+int iwl_mvm_get_et_sset_count(struct ieee80211_hw *hw,
+			      struct ieee80211_vif *vif, int sset)
+{
+	if (sset != ETH_SS_STATS)
+		return 0;
+
+	return IWL_MVM_SSTATS_LEN;
+}
+
+void iwl_mvm_get_et_stats(struct ieee80211_hw *hw,
+			  struct ieee80211_vif *vif,
+			  struct ethtool_stats *stats, u64 *data)
+{
+	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
+	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
+
+	int i, ei = 0;
+
+	/* driver phy-wide stats */
+	struct iwl_mvm_ethtool_stats *mib = &mvm->ethtool_stats;
+
+	data[ei++] = mib->tx_status_counts[TX_STATUS_SUCCESS];
+	data[ei++] = mib->tx_bytes_nic;
+	data[ei++] = mib->rx_pkts;
+	data[ei++] = mib->rx_bytes_nic;
+
+	data[ei++] = mib->tx_mpdu_attempts;
+	data[ei++] = mib->tx_mpdu_fail;
+	data[ei++] = mib->tx_mpdu_retry;
+
+	data[ei++] = mib->txo_tx_mpdu_attempts;
+	data[ei++] = mib->txo_tx_mpdu_fail;
+	data[ei++] = mib->txo_tx_mpdu_retry;
+	data[ei++] = mib->txo_tx_mpdu_ok;
+
+	data[ei++] = mvmvif->esr_disable_reason;
+	data[ei++] = mvmvif->esr_active;
+	data[ei++] = mvmvif->last_esr_exit.reason;
+
+	data[ei++] = mib->tx_status_counts[TX_STATUS_DIRECT_DONE];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_POSTPONE_DELAY];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_POSTPONE_FEW_BYTES];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_POSTPONE_BT_PRIO];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_POSTPONE_QUIET_PERIOD];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_POSTPONE_CALC_TTAK];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_INTERNAL_CROSSED_RETRY];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_SHORT_LIMIT];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_LONG_LIMIT];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_UNDERRUN];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_DRAIN_FLOW];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_RFKILL_FLUSH];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_LIFE_EXPIRE];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_DEST_PS];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_HOST_ABORTED];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_BT_RETRY];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_STA_INVALID];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_FRAG_DROPPED];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_TID_DISABLE];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_FIFO_FLUSHED];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_SMALL_CF_POLL];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_FW_DROP];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_FAIL_STA_COLOR_MISMATCH];
+	data[ei++] = mib->tx_status_counts[TX_STATUS_INTERNAL_ABORT];
+	/* Failed out-of-range */
+	data[ei++] = mib->tx_status_counts[TX_STATUS_INTERNAL_ABORT + 1];
+
+	data[ei++] = mib->tx_cck;
+	data[ei++] = mib->tx_ofdm;
+	data[ei++] = mib->tx_ht;
+	data[ei++] = mib->tx_vht;
+	data[ei++] = mib->tx_he;
+	data[ei++] = mib->tx_eht;
+
+	for (i = 0; i < ARRAY_SIZE(mib->tx_he_type); i++)
+		data[ei++] = mib->tx_he_type[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->tx_ampdu_len); i++)
+		data[ei++] = mib->tx_ampdu_len[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->tx_bw); i++)
+		data[ei++] = mib->tx_bw[i];
+	data[ei++] = mib->tx_bw_106_tone;
+
+	for (i = 0; i < ARRAY_SIZE(mib->tx_mcs); i++)
+		data[ei++] = mib->tx_mcs[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->tx_nss); i++)
+		data[ei++] = mib->tx_nss[i];
+
+	/* rx counters */
+	data[ei++] = mib->rx_crc_err;
+	data[ei++] = mib->rx_fifo_underrun;
+	data[ei++] = mib->rx_failed_decrypt;
+	data[ei++] = mib->rx_dup;
+	data[ei++] = mib->rx_bad_header_len;
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_mode); i++)
+		data[ei++] = mib->rx_mode[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_he_type); i++)
+		data[ei++] = mib->rx_he_type[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_bw); i++)
+		data[ei++] = mib->rx_bw[i];
+	data[ei++] = mib->rx_bw_he_ru;
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_mcs); i++)
+		data[ei++] = mib->rx_mcs[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_ampdu_len); i++)
+		data[ei++] = mib->rx_ampdu_len[i];
+
+	for (i = 0; i < ARRAY_SIZE(mib->rx_nss); i++)
+		data[ei++] = mib->rx_nss[i];
+
+	if (ei != IWL_MVM_SSTATS_LEN)
+		pr_err("ERROR: iwlwifi ethtool stats bug: ei: %d size: %d",
+		       ei, (int)(IWL_MVM_SSTATS_LEN));
+}
+
 const struct ieee80211_ops iwl_mvm_hw_ops = {
 	.tx = iwl_mvm_mac_tx,
 	.wake_tx_queue = iwl_mvm_mac_wake_tx_queue,
 	.ampdu_action = iwl_mvm_mac_ampdu_action,
 	.get_antenna = iwl_mvm_op_get_antenna,
 	.set_antenna = iwl_mvm_op_set_antenna,
+	.get_et_sset_count = iwl_mvm_get_et_sset_count,
+	.get_et_stats = iwl_mvm_get_et_stats,
+	.get_et_strings = iwl_mvm_get_et_strings,
 	.start = iwl_mvm_mac_start,
 	.reconfig_complete = iwl_mvm_mac_reconfig_complete,
 	.stop = iwl_mvm_mac_stop,

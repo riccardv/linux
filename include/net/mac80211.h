@@ -149,12 +149,14 @@ struct device;
  * enum ieee80211_max_queues - maximum number of queues
  *
  * @IEEE80211_MAX_QUEUES: Maximum number of regular device queues.
- * @IEEE80211_MAX_QUEUE_MAP: bitmap with maximum queues set
  */
 enum ieee80211_max_queues {
-	IEEE80211_MAX_QUEUES =		16,
-	IEEE80211_MAX_QUEUE_MAP =	BIT(IEEE80211_MAX_QUEUES) - 1,
+	IEEE80211_MAX_QUEUES =		65,
 };
+
+/* bitmap with maximum queues set */
+#define IEEE80211_MAX_QUEUE_MAP_CNT 3
+extern unsigned long IEEE80211_MAX_QUEUE_MAP[IEEE80211_MAX_QUEUE_MAP_CNT];
 
 #define IEEE80211_INVAL_HW_QUEUE	0xff
 
@@ -810,6 +812,7 @@ struct ieee80211_bss_conf {
 
 	u8 pwr_reduction;
 	bool eht_support;
+	bool he_ofdma_disable; /* Ask driver to disable OFDMA */
 
 	bool csa_active;
 
@@ -2386,6 +2389,38 @@ struct ieee80211_sta_aggregates {
 	u16 max_tid_amsdu_len[IEEE80211_NUM_TIDS];
 };
 
+enum ieee80211_conn_mode {
+	IEEE80211_CONN_MODE_S1G,
+	IEEE80211_CONN_MODE_LEGACY,
+	IEEE80211_CONN_MODE_HT,
+	IEEE80211_CONN_MODE_VHT,
+	IEEE80211_CONN_MODE_HE,
+	IEEE80211_CONN_MODE_EHT,
+};
+
+#define IEEE80211_CONN_MODE_HIGHEST	IEEE80211_CONN_MODE_EHT
+
+enum ieee80211_conn_bw_limit {
+	IEEE80211_CONN_BW_LIMIT_20,
+	IEEE80211_CONN_BW_LIMIT_40,
+	IEEE80211_CONN_BW_LIMIT_80,
+	IEEE80211_CONN_BW_LIMIT_160, /* also 80+80 */
+	IEEE80211_CONN_BW_LIMIT_320,
+};
+
+typedef u32 __bitwise ieee80211_conn_flags_t;
+
+enum ieee80211_conn_flags {
+	IEEE80211_CONN_DISABLE_TWT      = (__force ieee80211_conn_flags_t)BIT(0),
+	IEEE80211_CONN_DISABLE_OFDMA	= (__force ieee80211_conn_flags_t)BIT(1),
+};
+
+struct ieee80211_conn_settings {
+	enum ieee80211_conn_mode mode;
+	enum ieee80211_conn_bw_limit bw_limit;
+	enum ieee80211_conn_flags conn_flags;
+};
+
 /**
  * struct ieee80211_link_sta - station Link specific info
  * All link specific info for a STA link for a non MLD STA(single)
@@ -2425,12 +2460,15 @@ struct ieee80211_link_sta {
 	struct ieee80211_sta_he_cap he_cap;
 	struct ieee80211_he_6ghz_capa he_6ghz_capa;
 	struct ieee80211_sta_eht_cap eht_cap;
+	struct ieee80211_sta_eht_cap sta_eht_cap;
 
 	struct ieee80211_sta_aggregates agg;
 
 	u8 rx_nss;
 	enum ieee80211_sta_rx_bandwidth bandwidth;
 	struct ieee80211_sta_txpwr txpwr;
+	/* User-requested settings. */
+	struct ieee80211_conn_settings conn_settings;
 };
 
 /**
@@ -3069,14 +3107,25 @@ static inline void _ieee80211_hw_set(struct ieee80211_hw *hw,
 }
 #define ieee80211_hw_set(hw, flg)	_ieee80211_hw_set(hw, IEEE80211_HW_##flg)
 
+static inline void _ieee80211_hw_clear(struct ieee80211_hw *hw,
+				     enum ieee80211_hw_flags flg)
+{
+	return __clear_bit(flg, hw->flags);
+}
+#define ieee80211_hw_clear(hw, flg)	_ieee80211_hw_clear(hw, IEEE80211_HW_##flg)
+
 /**
  * struct ieee80211_scan_request - hw scan request
  *
  * @ies: pointers different parts of IEs (in req.ie)
+ * @disable_ht: Ensure nothing related to HT is in the probe request
+ * @disable_vht: Ensure nothing related to VHT is in the probe request
  * @req: cfg80211 request.
  */
 struct ieee80211_scan_request {
 	struct ieee80211_scan_ies ies;
+	bool disable_ht[NUM_NL80211_BANDS];
+	bool disable_vht[NUM_NL80211_BANDS];
 
 	/* Keep last */
 	struct cfg80211_scan_request req;
@@ -4227,6 +4276,8 @@ struct ieee80211_prep_tx_info {
  *
  * @get_et_stats:  Ethtool API to get a set of u64 stats.
  *
+ * @get_et_stats2:  Ethtool API to get a set of u64 stats, with level specified.
+ *
  * @get_et_strings:  Ethtool API to get a set of strings to describe stats
  *	and perhaps other supported types of ethtool data-sets.
  *	Note that the wiphy mutex is not held for this callback since it's
@@ -4382,6 +4433,14 @@ struct ieee80211_prep_tx_info {
  * @set_tid_config: Apply TID specific configurations. This callback may sleep.
  * @reset_tid_config: Reset TID specific configuration for the peer.
  *	This callback may sleep.
+ * @consume_block_ack: Offer block-ack management frames back to driver to see
+ *      if it wishes to consume it.  This can be useful for when firmware wants
+ *      to handle block-ack logic itself, but PMF is used and the firmware
+ *      cannot actually decode the block-ack frames itself.  So, firmware can
+ *      pass the encoded block-ack up the stack, and receive it through this
+ *      callback.  If return value is zero, the mac80211 stack will not further
+ *      process the skb.  skb will be freed by calling code, so driver must
+ *      make a copy of anything it needs in the skb before returning.
  * @update_vif_offload: Update virtual interface offload flags
  *	This callback may sleep.
  * @sta_set_4addr: Called to notify the driver when a station starts/stops using
@@ -4658,6 +4717,10 @@ struct ieee80211_ops {
 	void	(*get_et_stats)(struct ieee80211_hw *hw,
 				struct ieee80211_vif *vif,
 				struct ethtool_stats *stats, u64 *data);
+#define MAC80211_HAS_ET_STATS2 /* Make it easier for backporting drivers. */
+	void	(*get_et_stats2)(struct ieee80211_hw *hw,
+				 struct ieee80211_vif *vif,
+				 struct ethtool_stats *stats, u64 *data, u32 level);
 	void	(*get_et_strings)(struct ieee80211_hw *hw,
 				  struct ieee80211_vif *vif,
 				  u32 sset, u8 *data);
@@ -4755,6 +4818,9 @@ struct ieee80211_ops {
 	void (*del_nan_func)(struct ieee80211_hw *hw,
 			    struct ieee80211_vif *vif,
 			    u8 instance_id);
+#define HAS_CONSUME_BLOCK_ACK
+	int (*consume_block_ack)(struct ieee80211_hw *hw,
+				 struct ieee80211_vif *vif, struct sk_buff* skb);
 	bool (*can_aggregate_in_amsdu)(struct ieee80211_hw *hw,
 				       struct sk_buff *head,
 				       struct sk_buff *skb);
@@ -5635,6 +5701,12 @@ void ieee80211_beacon_set_cntdwn(struct ieee80211_vif *vif, u8 counter);
 void ieee80211_csa_finish(struct ieee80211_vif *vif, unsigned int link_id);
 
 /**
+ * ieee80211_del_all_station - request mac80211 to delete all stations
+ * @hw: pointer obtained from ieee80211_alloc_hw().
+ */
+void ieee80211_del_all_station(struct ieee80211_hw *hw);
+
+/**
  * ieee80211_beacon_cntdwn_is_complete - find out if countdown reached 1
  * @vif: &struct ieee80211_vif pointer from the add_interface callback.
  * @link_id: valid link_id during MLO or 0 for non-MLO
@@ -6243,6 +6315,24 @@ void ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw,
 				       void (*iterator)(void *data,
 						struct ieee80211_sta *sta),
 				       void *data);
+
+/**
+ * ieee80211_iterate_stations_mtx - iterate stations
+ *
+ * This function iterates over all stations associated with a given
+ * hardware that are currently uploaded to the driver and calls the callback
+ * function for them. This version can only be used while holding the wiphy
+ * mutex.
+ *
+ * @hw: the hardware struct of which the interfaces should be iterated over
+ * @iterator: the iterator function to call
+ * @data: first argument of the iterator function
+ */
+void ieee80211_iterate_stations_mtx(struct ieee80211_hw *hw,
+				    void (*iterator)(void *data,
+						     struct ieee80211_sta *sta),
+				    void *data);
+
 /**
  * ieee80211_queue_work - add work onto the mac80211 workqueue
  *
@@ -7151,13 +7241,13 @@ void ieee80211_enable_rssi_reports(struct ieee80211_vif *vif,
 void ieee80211_disable_rssi_reports(struct ieee80211_vif *vif);
 
 /**
- * ieee80211_ave_rssi - report the average RSSI for the specified interface
+ * ieee80211_ave_rssi - report the average beacon RSSI for the specified interface
  *
  * @vif: the specified virtual interface
  *
  * Note: This function assumes that the given vif is valid.
  *
- * Return: The average RSSI value for the requested interface, or 0 if not
+ * Return: The average beacon RSSI value for the requested interface, or 0 if not
  * applicable.
  */
 int ieee80211_ave_rssi(struct ieee80211_vif *vif);

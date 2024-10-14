@@ -17,7 +17,10 @@
 #include <linux/etherdevice.h>
 #include <linux/rcupdate.h>
 #include <linux/export.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 #include <linux/kcov.h>
+#endif
 #include <linux/bitops.h>
 #include <kunit/visibility.h>
 #include <net/mac80211.h>
@@ -33,6 +36,20 @@
 #include "tkip.h"
 #include "wme.h"
 #include "rate.h"
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,13,0)
+static inline void ieee80211_rx_stats(struct net_device *dev, u32 len)
+{
+       struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+
+       u64_stats_update_begin(&tstats->syncp);
+       tstats->rx_packets++;
+       tstats->rx_bytes += len;
+       u64_stats_update_end(&tstats->syncp);
+}
+#define dev_sw_netstats_rx_add ieee80211_rx_stats
+#endif
+
 
 /*
  * monitor mode reception
@@ -1734,6 +1751,83 @@ ieee80211_rx_h_uapsd_and_pspoll(struct ieee80211_rx_data *rx)
 	return RX_CONTINUE;
 }
 
+static void ieee80211_update_data_rx_stats(struct ieee80211_rx_data *rx,
+					   struct ieee80211_sta_rx_stats *stats,
+					   struct ieee80211_rx_status *status,
+					   int skb_len)
+{
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+	u8 nss;
+	u8 rix;
+#endif
+
+	stats->fragments++;
+	stats->packets++;
+	stats->last_rx = jiffies;
+	stats->last_rate = sta_stats_encode_rate(status);
+
+	/* The seqno index has the same property as needed
+	 * for the rx_msdu field, i.e. it is IEEE80211_NUM_TIDS
+	 * for non-QoS-data frames. Here we know it's a data
+	 * frame, so count MSDUs.
+	 */
+	u64_stats_update_begin(&stats->syncp);
+	stats->msdu[rx->seqno_idx]++;
+	stats->bytes += skb_len;
+	u64_stats_update_end(&stats->syncp);
+
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+	/* This code has a lot in common with ieee80211_add_rx_radiotap_header */
+	switch (status->bw) {
+	case RATE_INFO_BW_20:
+		stats->msdu_20++;
+		break;
+	case RATE_INFO_BW_40:
+		stats->msdu_40++;
+		break;
+	case RATE_INFO_BW_80:
+		stats->msdu_80++;
+		break;
+	case RATE_INFO_BW_160:
+		stats->msdu_160++;
+		break;
+	case RATE_INFO_BW_HE_RU:
+		stats->msdu_he_ru++;
+		stats->msdu_he_ru_alloc[status->he_ru]++;
+		break;
+	};
+
+	nss = status->nss - 1;
+	rix = status->rate_idx;
+
+	if (status->encoding == RX_ENC_HE) {
+		stats->msdu_he_tot++;
+	}
+	else if (status->encoding == RX_ENC_VHT) {
+		stats->msdu_vht++;
+	}
+	else if (status->encoding == RX_ENC_HT) {
+		stats->msdu_ht++;
+		/* Convert HT MCS to mimic what is done for VHT */
+		nss = status->rate_idx / 8;
+		rix = status->rate_idx - (status->rate_idx * 8);
+	}
+	else {
+		stats->msdu_legacy++;
+	}
+
+	if (nss >= (ARRAY_SIZE(stats->msdu_nss) - 1))
+		stats->msdu_nss[ARRAY_SIZE(stats->msdu_nss) - 1]++;
+	else
+		stats->msdu_nss[nss]++;
+
+	if (rix >= (ARRAY_SIZE(stats->msdu_rate_idx) - 1))
+		stats->msdu_rate_idx[ARRAY_SIZE(stats->msdu_rate_idx) - 1]++;
+	else
+		stats->msdu_rate_idx[rix]++;
+#endif
+}
+
 static ieee80211_rx_result debug_noinline
 ieee80211_rx_h_sta_process(struct ieee80211_rx_data *rx)
 {
@@ -1804,6 +1898,9 @@ ieee80211_rx_h_sta_process(struct ieee80211_rx_data *rx)
 					-signal);
 		}
 	}
+	/*pr_err("%s: sta-process, signal: %d(%d)  chains: 0x%x  chain[0]: %d  chain[1]: %d  chan[2]: %d  skb: %p  skb-len: %d\n",
+	       rx->sdata->name, status->signal, sta->rx_stats.last_signal,
+	       status->chains, status->chain_signal[0], status->chain_signal[1], status->chain_signal[2], skb, skb->len);*/
 
 	if (ieee80211_is_s1g_beacon(hdr->frame_control))
 		return RX_CONTINUE;
@@ -2670,7 +2767,7 @@ ieee80211_deliver_skb(struct ieee80211_rx_data *rx)
 
 	dev_sw_netstats_rx_add(dev, skb->len);
 
-	if (rx->sta) {
+	if (rx->link_sta) {
 		/* The seqno index has the same property as needed
 		 * for the rx_msdu field, i.e. it is IEEE80211_NUM_TIDS
 		 * for non-QoS-data frames. Here we know it's a data
@@ -3154,6 +3251,9 @@ ieee80211_rx_h_amsdu(struct ieee80211_rx_data *rx)
 		}
 	}
 
+	/* Note:  Packets are segmented and re-sent up the rx path,
+	 * any rx stats update will happen then.
+	 */
 	return __ieee80211_rx_h_amsdu(rx, 0);
 }
 
@@ -3234,6 +3334,13 @@ ieee80211_rx_h_data(struct ieee80211_rx_data *rx)
 	     !test_bit(SDATA_STATE_OFFCHANNEL, &sdata->state)))
 		mod_timer(&local->dynamic_ps_timer, jiffies +
 			  msecs_to_jiffies(local->hw.conf.dynamic_ps_timeout));
+
+
+	if (rx->sta) {
+		struct ieee80211_sta_rx_stats *stats = &rx->sta->deflink.rx_stats;
+		struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(rx->skb);
+		ieee80211_update_data_rx_stats(rx, stats, status, rx->skb->len);
+	}
 
 	ieee80211_deliver_skb(rx);
 
@@ -4455,8 +4562,18 @@ static bool ieee80211_accept_frame(struct ieee80211_rx_data *rx)
 			return false;
 		if (ieee80211_is_beacon(hdr->frame_control))
 			return true;
-		if (!ieee80211_bssid_match(bssid, sdata->u.ibss.bssid))
-			return false;
+		if (!ieee80211_bssid_match(bssid, sdata->u.ibss.bssid)) {
+			/*wiphy_debug(local->hw.wiphy, "bssid match failed, bssid: %pM  %pM\n",
+			 *       bssid, sdata->u.ibss.bssid); */
+			/** ath10k seems to zero the BSSID when using AMSDU sub-frames
+			 * As far as I can tell, this is a hardware issue and I see no way to resolve
+			 * it in firmware.
+			 * Allow these packets as work-around.
+			 * I am not sure whether this could cause problems in some setups or not.
+			 */
+			if (! is_zero_ether_addr(bssid))
+				return false;
+		}
 		if (!multicast &&
 		    !ether_addr_equal(sdata->vif.addr, hdr->addr1))
 			return false;
@@ -4555,7 +4672,9 @@ static bool ieee80211_accept_frame(struct ieee80211_rx_data *rx)
 		return ieee80211_is_public_action(hdr, skb->len) ||
 		       ieee80211_is_probe_req(hdr->frame_control) ||
 		       ieee80211_is_probe_resp(hdr->frame_control) ||
-		       ieee80211_is_beacon(hdr->frame_control);
+		       ieee80211_is_beacon(hdr->frame_control) ||
+		       (ieee80211_is_auth(hdr->frame_control) &&
+			ether_addr_equal(sdata->vif.addr, hdr->addr1));
 	case NL80211_IFTYPE_NAN:
 		/* Currently no frames on NAN interface are allowed */
 		return false;
@@ -4808,25 +4927,11 @@ static void ieee80211_rx_8023(struct ieee80211_rx_data *rx,
 	}
 	/* end of statistics */
 
-	stats->last_rx = jiffies;
-	stats->last_rate = sta_stats_encode_rate(status);
-
-	stats->fragments++;
-	stats->packets++;
+	ieee80211_update_data_rx_stats(rx, stats, status, orig_len);
 
 	skb->dev = fast_rx->dev;
 
 	dev_sw_netstats_rx_add(fast_rx->dev, skb->len);
-
-	/* The seqno index has the same property as needed
-	 * for the rx_msdu field, i.e. it is IEEE80211_NUM_TIDS
-	 * for non-QoS-data frames. Here we know it's a data
-	 * frame, so count MSDUs.
-	 */
-	u64_stats_update_begin(&stats->syncp);
-	stats->msdu[rx->seqno_idx]++;
-	stats->bytes += orig_len;
-	u64_stats_update_end(&stats->syncp);
 
 	if (fast_rx->internal_forward) {
 		struct sk_buff *xmit_skb = NULL;
@@ -5262,6 +5367,26 @@ static void __ieee80211_rx_handle_packet(struct ieee80211_hw *hw,
 
 		prev_sta = NULL;
 
+		/* Check for Station VIFS by hashing on the destination MAC
+		 * (ie, local sdata MAC).  This changes 'promisc' behaviour,
+		 * but not sure that is a bad thing.
+		 */
+		if ((!is_multicast_ether_addr(hdr->addr1)) &&
+		    (local->monitors == 0) && (local->cooked_mntrs == 0)) {
+			sta = sta_info_get_by_vif(local, hdr->addr1,
+						  hdr->addr2);
+			if (sta) {
+				rx.sdata = sta->sdata;
+				if (!ieee80211_rx_data_set_sta(&rx, sta, link_id))
+					goto out;
+
+				if (!status->link_valid && sta->sta.mlo)
+					goto out;
+
+				goto rx_and_done;
+			}
+		}
+
 		for_each_sta_info(local, hdr->addr2, sta, tmp) {
 			if (!prev_sta) {
 				prev_sta = sta;
@@ -5288,6 +5413,7 @@ static void __ieee80211_rx_handle_packet(struct ieee80211_hw *hw,
 			if (!status->link_valid && prev_sta->sta.mlo)
 				goto out;
 
+rx_and_done:
 			if (ieee80211_prepare_and_rx_handle(&rx, skb, true))
 				return;
 			goto out;
@@ -5372,7 +5498,7 @@ void ieee80211_rx_list(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 	 * The same happens when we're not even started,
 	 * but that's worth a warning.
 	 */
-	if (WARN_ON(!local->started))
+	if (WARN_ON_ONCE(!local->started))
 		goto drop;
 
 	if (likely(!(status->flag & RX_FLAG_FAILED_PLCP_CRC))) {
@@ -5441,7 +5567,9 @@ void ieee80211_rx_list(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 
 	status->rx_flags = 0;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 	kcov_remote_start_common(skb_get_kcov_handle(skb));
+#endif
 
 	/*
 	 * Frames with failed FCS/PLCP checksum are not returned,
@@ -5462,7 +5590,9 @@ void ieee80211_rx_list(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 			__ieee80211_rx_handle_packet(hw, pubsta, skb, list);
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 	kcov_remote_stop();
+#endif
 	return;
  drop:
 	kfree_skb(skb);

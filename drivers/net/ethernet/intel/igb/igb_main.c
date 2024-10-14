@@ -191,6 +191,10 @@ module_param(max_vfs, uint, 0444);
 MODULE_PARM_DESC(max_vfs, "Maximum number of virtual functions to allocate per physical function");
 #endif /* CONFIG_PCI_IOV */
 
+static unsigned int max_rss_qs;
+module_param(max_rss_qs, uint, 0);
+MODULE_PARM_DESC(max_rss_qs, "Maximum number of RSS queues.  Forcing lower will use less IRQ resources.");
+
 static pci_ers_result_t igb_io_error_detected(struct pci_dev *,
 		     pci_channel_state_t);
 static pci_ers_result_t igb_io_slot_reset(struct pci_dev *);
@@ -2455,7 +2459,7 @@ static int igb_set_features(struct net_device *netdev,
 	if (changed & NETIF_F_HW_VLAN_CTAG_RX)
 		igb_vlan_mode(netdev, features);
 
-	if (!(changed & (NETIF_F_RXALL | NETIF_F_NTUPLE)))
+	if (!(changed & (NETIF_F_RXALL | NETIF_F_RXFCS | NETIF_F_NTUPLE)))
 		return 0;
 
 	if (!(features & NETIF_F_NTUPLE)) {
@@ -3315,6 +3319,7 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	netdev->hw_features |= netdev->features |
 			       NETIF_F_HW_VLAN_CTAG_RX |
 			       NETIF_F_HW_VLAN_CTAG_TX |
+			       NETIF_F_RXFCS |
 			       NETIF_F_RXALL;
 
 	if (hw->mac.type >= e1000_i350)
@@ -3967,6 +3972,9 @@ unsigned int igb_get_max_rss_queues(struct igb_adapter *adapter)
 		break;
 	}
 
+	if (max_rss_qs && max_rss_qs < max_rss_queues)
+		max_rss_queues = max_rss_qs;
+
 	return max_rss_queues;
 }
 
@@ -4581,6 +4589,7 @@ static void igb_setup_mrqc(struct igb_adapter *adapter)
 void igb_setup_rctl(struct igb_adapter *adapter)
 {
 	struct e1000_hw *hw = &adapter->hw;
+	struct net_device *netdev = adapter->netdev;
 	u32 rctl;
 
 	rctl = rd32(E1000_RCTL);
@@ -4595,7 +4604,10 @@ void igb_setup_rctl(struct igb_adapter *adapter)
 	 * redirection as it did with e1000. Newer features require
 	 * that the HW strips the CRC.
 	 */
-	rctl |= E1000_RCTL_SECRC;
+	if (netdev->features & NETIF_F_RXFCS)
+		rctl &= ~E1000_RCTL_SECRC;
+	else
+		rctl |= E1000_RCTL_SECRC;
 
 	/* disable store bad packets and clear size bits. */
 	rctl &= ~(E1000_RCTL_SBP | E1000_RCTL_SZ_256);
@@ -8979,8 +8991,10 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 			continue;
 		}
 
-		/* probably a little skewed due to removing CRC */
-		total_bytes += skb->len;
+		if (unlikely(rx_ring->netdev->features & NETIF_F_RXFCS))
+			total_bytes += (skb->len - 4);
+		else
+			total_bytes += skb->len;
 
 		/* populate checksum, timestamp, VLAN, and protocol */
 		igb_process_skb_fields(rx_ring, rx_desc, skb);
@@ -9304,8 +9318,11 @@ int igb_set_spd_dplx(struct igb_adapter *adapter, u32 spd, u8 dplx)
 	/* Make sure dplx is at most 1 bit and lsb of speed is not set
 	 * for the switch() below to work
 	 */
-	if ((spd & 1) || (dplx & ~1))
+	if ((spd & 1) || (dplx & ~1)) {
+		dev_err(&pdev->dev, "Unsupported Speed/Duplex configuration, bit-mismatch, spd: 0x%x  dplx: 0x%x\n",
+			spd, dplx);
 		goto err_inval;
+	}
 
 	/* Fiber NIC's only allow 1000 gbps Full duplex
 	 * and 100Mbps Full duplex for 100baseFx sfp
@@ -9315,6 +9332,8 @@ int igb_set_spd_dplx(struct igb_adapter *adapter, u32 spd, u8 dplx)
 		case SPEED_10 + DUPLEX_HALF:
 		case SPEED_10 + DUPLEX_FULL:
 		case SPEED_100 + DUPLEX_HALF:
+			dev_err(&pdev->dev, "Unsupported Speed/Duplex configuration, fiber does not support HD, spd: 0x%x  dplx: 0x%x\n",
+				spd, dplx);
 			goto err_inval;
 		default:
 			break;
@@ -9339,9 +9358,16 @@ int igb_set_spd_dplx(struct igb_adapter *adapter, u32 spd, u8 dplx)
 		adapter->hw.phy.autoneg_advertised = ADVERTISE_1000_FULL;
 		break;
 	case SPEED_1000 + DUPLEX_HALF: /* not supported */
+		dev_err(&pdev->dev, "Unsupported Speed/Duplex configuration:  1Gbps HD not supported\n");
+		goto err_inval;
 	default:
+		dev_err(&pdev->dev, "Unsupported Speed/Duplex configuration, case not handled, spd: 0x%x  dplx: 0x%x\n",
+			spd, dplx);
 		goto err_inval;
 	}
+
+	dev_info(&pdev->dev, "Set Speed: %d  dplx: %d  autoneg: %d  forced-speed-duplex: %d\n",
+		 spd, dplx, mac->autoneg, mac->forced_speed_duplex);
 
 	/* clear MDI, MDI(-X) override is only allowed when autoneg enabled */
 	adapter->hw.phy.mdix = AUTO_ALL_MODES;
@@ -9349,7 +9375,6 @@ int igb_set_spd_dplx(struct igb_adapter *adapter, u32 spd, u8 dplx)
 	return 0;
 
 err_inval:
-	dev_err(&pdev->dev, "Unsupported Speed/Duplex configuration\n");
 	return -EINVAL;
 }
 

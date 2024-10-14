@@ -93,6 +93,7 @@ struct mt792x_link_sta {
 	unsigned long last_txs;
 
 	struct mt76_connac_sta_key_conf bip;
+	struct mt76_testmode_data test;
 
 	struct mt792x_sta *sta;
 
@@ -210,6 +211,7 @@ struct mt792x_dev {
 	struct mt792x_phy phy;
 
 	struct work_struct reset_work;
+	bool hw_registered:1;
 	bool hw_full_reset:1;
 	bool hw_init_done:1;
 	bool fw_assert:1;
@@ -407,7 +409,8 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw);
 struct ieee80211_ops *
 mt792x_get_mac80211_ops(struct device *dev,
 			const struct ieee80211_ops *mac80211_ops,
-			void *drv_data, u8 *fw_features);
+			void *drv_data, u8 *fw_features,
+			bool can_disable_fw_cap_cnm, bool reassign_ops);
 int mt792x_init_wcid(struct mt792x_dev *dev);
 int mt792x_mcu_drv_pmctrl(struct mt792x_dev *dev);
 int mt792x_mcu_fw_pmctrl(struct mt792x_dev *dev);

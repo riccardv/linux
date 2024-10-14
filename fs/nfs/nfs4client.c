@@ -529,11 +529,21 @@ static int nfs4_match_client(struct nfs_client  *pos,  struct nfs_client *new,
 			     struct nfs_client **prev, struct nfs_net *nn)
 {
 	int status;
+	const struct sockaddr *pos_sa;
+	const struct sockaddr *new_sa;
+	pos_sa = (const struct sockaddr *)&pos->srcaddr;
+	new_sa = (const struct sockaddr *)&new->srcaddr;
 
 	if (pos->rpc_ops != new->rpc_ops)
 		return 1;
 
 	if (pos->cl_minorversion != new->cl_minorversion)
+		return 1;
+
+	/* Check to make sure local-IP bindings match,
+	 * but just the IP-addr.
+	 */
+	if (!rpc_cmp_addr(pos_sa, new_sa))
 		return 1;
 
 	/* If "pos" isn't marked ready, we can't trust the
@@ -852,11 +862,13 @@ static bool nfs4_cb_match_client(const struct sockaddr *addr,
  * Returns NULL if no such client
  */
 struct nfs_client *
-nfs4_find_client_sessionid(struct net *net, const struct sockaddr *addr,
+nfs4_find_client_sessionid(struct net *net, const struct sockaddr *srcaddr,
+			   const struct sockaddr *addr,
 			   struct nfs4_sessionid *sid, u32 minorversion)
 {
 	struct nfs_client *clp;
 	struct nfs_net *nn = net_generic(net, nfs_net_id);
+	struct nfs_client *ok_fit = NULL;
 
 	spin_lock(&nn->nfs_client_lock);
 	list_for_each_entry(clp, &nn->nfs_client_list, cl_share_link) {
@@ -871,10 +883,31 @@ nfs4_find_client_sessionid(struct net *net, const struct sockaddr *addr,
 		    sid->data, NFS4_MAX_SESSIONID_LEN) != 0)
 			continue;
 
+		if (srcaddr) {
+			const struct sockaddr *sa;
+			sa = (const struct sockaddr *)&clp->cl_addr;
+			if (!rpc_cmp_addr(srcaddr, sa)) {
+				/* If clp doesn't bind to srcaddr, then
+				 * it is a potential match if we don't find
+				 * a better one.
+				 */
+				if (sa->sa_family == AF_UNSPEC && !ok_fit)
+					ok_fit = clp;
+				continue;
+			}
+		}
+
+	found_one:
 		refcount_inc(&clp->cl_count);
 		spin_unlock(&nn->nfs_client_lock);
 		return clp;
 	}
+
+	if (ok_fit) {
+		clp = ok_fit;
+		goto found_one;
+	}
+
 	spin_unlock(&nn->nfs_client_lock);
 	return NULL;
 }
@@ -882,7 +915,8 @@ nfs4_find_client_sessionid(struct net *net, const struct sockaddr *addr,
 #else /* CONFIG_NFS_V4_1 */
 
 struct nfs_client *
-nfs4_find_client_sessionid(struct net *net, const struct sockaddr *addr,
+nfs4_find_client_sessionid(struct net *net, const struct sockaddr *srcaddr,
+			   const struct sockaddr *addr,
 			   struct nfs4_sessionid *sid, u32 minorversion)
 {
 	return NULL;
@@ -897,6 +931,8 @@ static int nfs4_set_client(struct nfs_server *server,
 		const struct sockaddr_storage *addr,
 		const size_t addrlen,
 		const char *ip_addr,
+		const struct sockaddr *srcaddr,
+		const size_t srcaddrlen,
 		int proto, const struct rpc_timeout *timeparms,
 		u32 minorversion, unsigned int nconnect,
 		unsigned int max_connect,
@@ -915,6 +951,8 @@ static int nfs4_set_client(struct nfs_server *server,
 		.timeparms = timeparms,
 		.cred = server->cred,
 		.xprtsec = *xprtsec,
+		.srcaddr = srcaddr,
+		.srcaddrlen = srcaddrlen,
 	};
 	struct nfs_client *clp;
 
@@ -1173,6 +1211,8 @@ static int nfs4_init_server(struct nfs_server *server, struct fs_context *fc)
 				&ctx->nfs_server._address,
 				ctx->nfs_server.addrlen,
 				ctx->client_address,
+				&ctx->srcaddr.address,
+				ctx->srcaddr.addrlen,
 				ctx->nfs_server.protocol,
 				&timeparms,
 				ctx->minorversion,
@@ -1264,6 +1304,8 @@ struct nfs_server *nfs4_create_referral_server(struct fs_context *fc)
 				&ctx->nfs_server._address,
 				ctx->nfs_server.addrlen,
 				parent_client->cl_ipaddr,
+				(const struct sockaddr *)&parent_client->srcaddr,
+				parent_client->srcaddrlen,
 				XPRT_TRANSPORT_RDMA,
 				parent_server->client->cl_timeout,
 				parent_client->cl_mvops->minor_version,
@@ -1284,6 +1326,8 @@ struct nfs_server *nfs4_create_referral_server(struct fs_context *fc)
 				&ctx->nfs_server._address,
 				ctx->nfs_server.addrlen,
 				parent_client->cl_ipaddr,
+				(const struct sockaddr *)&parent_client->srcaddr,
+				parent_client->srcaddrlen,
 				proto,
 				parent_server->client->cl_timeout,
 				parent_client->cl_mvops->minor_version,
@@ -1348,6 +1392,7 @@ int nfs4_update_server(struct nfs_server *server, const char *hostname,
 	struct sockaddr *localaddr = (struct sockaddr *)&address;
 	int error;
 
+	/* TODO-BEN:  Not sure this is all just right when binding to source-addr. */
 	error = rpc_switch_client_transport(clnt, &xargs, clnt->cl_timeout);
 	if (error != 0)
 		return error;
@@ -1362,6 +1407,8 @@ int nfs4_update_server(struct nfs_server *server, const char *hostname,
 	nfs_server_remove_lists(server);
 	set_bit(NFS_MIG_TSM_POSSIBLE, &server->mig_status);
 	error = nfs4_set_client(server, hostname, sap, salen, buf,
+				(struct sockaddr *)(&clp->srcaddr),
+				clp->srcaddrlen,
 				clp->cl_proto, clnt->cl_timeout,
 				clp->cl_minorversion,
 				clp->cl_nconnect, clp->cl_max_connect,

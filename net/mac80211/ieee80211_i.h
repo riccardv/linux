@@ -372,30 +372,6 @@ enum ieee80211_sta_flags {
 	IEEE80211_STA_ENABLE_RRM	= BIT(15),
 };
 
-enum ieee80211_conn_mode {
-	IEEE80211_CONN_MODE_S1G,
-	IEEE80211_CONN_MODE_LEGACY,
-	IEEE80211_CONN_MODE_HT,
-	IEEE80211_CONN_MODE_VHT,
-	IEEE80211_CONN_MODE_HE,
-	IEEE80211_CONN_MODE_EHT,
-};
-
-#define IEEE80211_CONN_MODE_HIGHEST	IEEE80211_CONN_MODE_EHT
-
-enum ieee80211_conn_bw_limit {
-	IEEE80211_CONN_BW_LIMIT_20,
-	IEEE80211_CONN_BW_LIMIT_40,
-	IEEE80211_CONN_BW_LIMIT_80,
-	IEEE80211_CONN_BW_LIMIT_160, /* also 80+80 */
-	IEEE80211_CONN_BW_LIMIT_320,
-};
-
-struct ieee80211_conn_settings {
-	enum ieee80211_conn_mode mode;
-	enum ieee80211_conn_bw_limit bw_limit;
-};
-
 extern const struct ieee80211_conn_settings ieee80211_conn_settings_unlimited;
 
 struct ieee80211_mgd_auth_data {
@@ -441,7 +417,7 @@ struct ieee80211_mgd_assoc_data {
 	u8 ap_addr[ETH_ALEN] __aligned(2);
 
 	/* this is for a workaround, so we use it only for non-MLO */
-	const u8 *supp_rates;
+	u8 supp_rates[IEEE80211_MAX_SUPP_RATES];
 	u8 supp_rates_len;
 
 	unsigned long timeout;
@@ -1084,6 +1060,10 @@ struct ieee80211_link_data {
 
 struct ieee80211_sub_if_data {
 	struct list_head list;
+	struct ieee80211_sub_if_data *hnext; /* sdata hash list pointer */
+
+	/* Protected by wiphy mtx */
+	struct sta_info __rcu *sta_vhash[STA_HASH_SIZE]; /* By station addr */
 
 	struct wireless_dev wdev;
 
@@ -1150,6 +1130,15 @@ struct ieee80211_sub_if_data {
 	/* Beacon frame (non-MCS) rate (as a bitmap) */
 	u32 beacon_rateidx_mask[NUM_NL80211_BANDS];
 	bool beacon_rate_set;
+
+	/* Store bitrate mask configured from user-space.  This is for
+	 * rates that should be advertised in probe requests, etc.  This
+	 * is NOT directly related to the tx-rate-ctrl logic configuration.
+	 */
+	struct cfg80211_bitrate_mask cfg_advert_bitrate_mask;
+	bool cfg_advert_bitrate_mask_set; /* Has user set the mask? */
+
+	struct cfg80211_probe_req_config pr_conf;
 
 	union {
 		struct ieee80211_if_ap ap;
@@ -1480,6 +1469,8 @@ struct ieee80211_local {
 	u32 wep_iv;
 
 	/* see iface.c */
+	/* Hash interfaces by VIF mac addr */
+	struct ieee80211_sub_if_data __rcu *sdata_hash[STA_HASH_SIZE];
 	struct list_head interfaces;
 	struct list_head mon_list; /* only that are IFF_UP && !cooked */
 	struct mutex iflist_mtx;
@@ -1587,6 +1578,7 @@ struct ieee80211_local {
 		struct dentry *keys;
 	} debugfs;
 	bool force_tx_status;
+	int is_dead;
 #endif
 
 	/*
@@ -1624,6 +1616,34 @@ IEEE80211_WDEV_TO_SUB_IF(struct wireless_dev *wdev)
 {
 	return container_of(wdev, struct ieee80211_sub_if_data, wdev);
 }
+
+static inline
+void for_each_sdata_type_check(struct ieee80211_local *local,
+                              const u8 *addr,
+                              struct ieee80211_sub_if_data *sdata,
+                              struct ieee80211_sub_if_data *nxt)
+{
+}
+
+/* This deals with multiple sdata having same MAC */
+#define for_each_sdata(local, _addr, _sdata, nxt)                      \
+       for (   /* initialise loop */                                   \
+               _sdata = rcu_dereference(local->sdata_hash[STA_HASH(_addr)]), \
+                       nxt = _sdata ? rcu_dereference(_sdata->hnext) : NULL; \
+               /* typecheck */                                         \
+               for_each_sdata_type_check(local, (_addr), _sdata, nxt), \
+                       /* continue condition */                        \
+                       _sdata;                                         \
+               /* advance loop */                                      \
+               _sdata = nxt,                                           \
+                       nxt = _sdata ? rcu_dereference(_sdata->hnext) : NULL \
+               )                                                       \
+               /* compare address and run code only if it matches */   \
+               if (ether_addr_equal(_sdata->vif.addr, (_addr)))
+
+
+struct ieee80211_sub_if_data*
+ieee80211_find_sdata(struct ieee80211_local *local, const u8 *vif_addr);
 
 static inline struct ieee80211_supported_band *
 ieee80211_get_sband(struct ieee80211_sub_if_data *sdata)
@@ -1943,6 +1963,14 @@ int ieee80211_mesh_finish_csa(struct ieee80211_sub_if_data *sdata,
 			      u64 *changed);
 
 /* scan/BSS handling */
+void ieee80211_check_disabled_rates(struct ieee80211_sub_if_data *sdata,
+				    bool *disable_ht,
+				    bool *disable_vht);
+void ieee80211_check_all_rates_disabled(u8 bands_used,
+					bool *disable_ht_cfg,
+					bool *disable_vht_cfg,
+					bool *disable_ht,
+					bool *disable_vht);
 void ieee80211_scan_work(struct wiphy *wiphy, struct wiphy_work *work);
 int ieee80211_request_ibss_scan(struct ieee80211_sub_if_data *sdata,
 				const u8 *ssid, u8 ssid_len,
@@ -2052,10 +2080,11 @@ void ieee80211_link_init(struct ieee80211_sub_if_data *sdata,
 			 struct ieee80211_bss_conf *link_conf);
 void ieee80211_link_stop(struct ieee80211_link_data *link);
 int ieee80211_vif_set_links(struct ieee80211_sub_if_data *sdata,
-			    u16 new_links, u16 dormant_links);
-static inline void ieee80211_vif_clear_links(struct ieee80211_sub_if_data *sdata)
+			    u16 new_links, u16 dormant_links, bool ignore_driver_failures);
+static inline void ieee80211_vif_clear_links(struct ieee80211_sub_if_data *sdata,
+					     bool ignore_driver_failures)
 {
-	ieee80211_vif_set_links(sdata, 0, 0);
+	ieee80211_vif_set_links(sdata, 0, 0, ignore_driver_failures);
 }
 
 /* tx handling */
@@ -2389,9 +2418,12 @@ void ieee80211_sta_tx_notify(struct ieee80211_sub_if_data *sdata,
 			     struct ieee80211_hdr *hdr, bool ack, u16 tx_time);
 
 void ieee80211_wake_queues_by_reason(struct ieee80211_hw *hw,
-				     unsigned long queues,
+				     unsigned long *queues,
 				     enum queue_stop_reason reason,
 				     bool refcounted);
+void ieee80211_get_vif_queues(struct ieee80211_local *local,
+			      struct ieee80211_sub_if_data *sdata,
+			      unsigned long *queues);
 void ieee80211_stop_vif_queues(struct ieee80211_local *local,
 			       struct ieee80211_sub_if_data *sdata,
 			       enum queue_stop_reason reason);
@@ -2399,7 +2431,7 @@ void ieee80211_wake_vif_queues(struct ieee80211_local *local,
 			       struct ieee80211_sub_if_data *sdata,
 			       enum queue_stop_reason reason);
 void ieee80211_stop_queues_by_reason(struct ieee80211_hw *hw,
-				     unsigned long queues,
+				     unsigned long *queues,
 				     enum queue_stop_reason reason,
 				     bool refcounted);
 void ieee80211_wake_queue_by_reason(struct ieee80211_hw *hw, int queue,
@@ -2416,7 +2448,7 @@ void ieee80211_flush_queues(struct ieee80211_local *local,
 			    struct ieee80211_sub_if_data *sdata, bool drop);
 void __ieee80211_flush_queues(struct ieee80211_local *local,
 			      struct ieee80211_sub_if_data *sdata,
-			      unsigned int queues, bool drop);
+			      unsigned long *queues, bool drop);
 
 static inline bool ieee80211_can_run_worker(struct ieee80211_local *local)
 {
@@ -2483,6 +2515,10 @@ enum {
 	IEEE80211_PROBE_FLAG_DIRECTED		= BIT(0),
 	IEEE80211_PROBE_FLAG_MIN_CONTENT	= BIT(1),
 	IEEE80211_PROBE_FLAG_RANDOM_SN		= BIT(2),
+	IEEE80211_PROBE_FLAG_DISABLE_HT		= BIT(3),
+	IEEE80211_PROBE_FLAG_DISABLE_VHT	= BIT(4),
+	IEEE80211_PROBE_FLAG_DISABLE_HE		= BIT(5),
+	IEEE80211_PROBE_FLAG_DISABLE_EHT	= BIT(6),
 };
 
 int ieee80211_build_preq_ies(struct ieee80211_sub_if_data *sdata, u8 *buffer,
@@ -2523,7 +2559,8 @@ u8 *ieee80211_ie_build_vht_cap(u8 *pos, struct ieee80211_sta_vht_cap *vht_cap,
 u8 *ieee80211_ie_build_vht_oper(u8 *pos, struct ieee80211_sta_vht_cap *vht_cap,
 				const struct cfg80211_chan_def *chandef);
 u8 ieee80211_ie_len_he_cap(struct ieee80211_sub_if_data *sdata);
-u8 *ieee80211_ie_build_he_oper(u8 *pos, struct cfg80211_chan_def *chandef);
+u8 *ieee80211_ie_build_he_oper(struct ieee80211_sub_if_data *sdata,
+			       u8 *pos, struct cfg80211_chan_def *chandef);
 u8 *ieee80211_ie_build_eht_oper(u8 *pos, struct cfg80211_chan_def *chandef,
 				const struct ieee80211_sta_eht_cap *eht_cap);
 int ieee80211_parse_bitrates(enum nl80211_chan_width width,

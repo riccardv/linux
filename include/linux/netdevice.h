@@ -116,6 +116,7 @@ void netdev_sw_irq_coalesce_default_on(struct net_device *dev);
 #define NET_XMIT_SUCCESS	0x00
 #define NET_XMIT_DROP		0x01	/* skb dropped			*/
 #define NET_XMIT_CN		0x02	/* congestion notification	*/
+#define NET_XMIT_BUSY		0x04    /* congestion, but skb was NOT freed */
 #define NET_XMIT_MASK		0x0f	/* qdisc flags in net/sch_generic.h */
 
 /* NET_XMIT_CN is special. It does not guarantee that this packet is lost. It
@@ -230,6 +231,7 @@ struct net_device_core_stats {
 struct neighbour;
 struct neigh_parms;
 struct sk_buff;
+struct pktgen_dev;
 
 struct netdev_hw_addr {
 	struct list_head	list;
@@ -2334,6 +2336,14 @@ struct net_device {
 #if IS_ENABLED(CONFIG_NET_DROP_MONITOR)
 	struct dm_hw_stat_delta __rcu *dm_private;
 #endif
+
+	 /* Callback for when the queue is woken, used by pktgen currently */
+	int                     (*notify_queue_woken)(struct net_device *dev);
+	void* nqw_data; /* To be used by the method above as needed */
+
+	struct pktgen_dev* pkt_dev; /* to quickly find the pkt-gen dev registered with this
+				     * interface, if any.
+				     */
 	struct device		dev;
 	const struct attribute_group *sysfs_groups[4];
 	const struct attribute_group *sysfs_rx_queue_group;
@@ -3097,18 +3107,27 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
 u16 dev_pick_tx_cpu_id(struct net_device *dev, struct sk_buff *skb,
 		       struct net_device *sb_dev);
 
-int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev);
+int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev,
+		     int try_no_consume);
 int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id);
+
+/* Similar to dev_queue_xmit, but if try_no_consume != 0,
+ * it may return NET_XMIT_BUSY and NOT free the skb if it detects congestion
+ */
+static inline int try_dev_queue_xmit(struct sk_buff *skb, int try_no_consume)
+{
+	return __dev_queue_xmit(skb, NULL, try_no_consume);
+}
 
 static inline int dev_queue_xmit(struct sk_buff *skb)
 {
-	return __dev_queue_xmit(skb, NULL);
+	return __dev_queue_xmit(skb, NULL, 0);
 }
 
 static inline int dev_queue_xmit_accel(struct sk_buff *skb,
 				       struct net_device *sb_dev)
 {
-	return __dev_queue_xmit(skb, sb_dev);
+	return __dev_queue_xmit(skb, sb_dev, 0);
 }
 
 static inline int dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
@@ -3282,6 +3301,9 @@ static inline void netif_tx_schedule_all(struct net_device *dev)
 
 	for (i = 0; i < dev->num_tx_queues; i++)
 		netif_schedule_queue(netdev_get_tx_queue(dev, i));
+
+	if (dev->notify_queue_woken)
+		dev->notify_queue_woken(dev);
 }
 
 static __always_inline void netif_tx_start_queue(struct netdev_queue *dev_queue)
@@ -3548,8 +3570,11 @@ static inline void netdev_tx_completed_queue(struct netdev_queue *dev_queue,
 	if (unlikely(dql_avail(&dev_queue->dql) < 0))
 		return;
 
-	if (test_and_clear_bit(__QUEUE_STATE_STACK_XOFF, &dev_queue->state))
+	if (test_and_clear_bit(__QUEUE_STATE_STACK_XOFF, &dev_queue->state)) {
 		netif_schedule_queue(dev_queue);
+		if (dev_queue->dev->notify_queue_woken)
+			dev_queue->dev->notify_queue_woken(dev_queue->dev);
+	}
 #endif
 }
 
@@ -4486,6 +4511,8 @@ static inline void netif_tx_disable(struct net_device *dev)
 	}
 	spin_unlock(&dev->tx_global_lock);
 	local_bh_enable();
+	if (dev->notify_queue_woken)
+		dev->notify_queue_woken(dev);
 }
 
 static inline void netif_addr_lock(struct net_device *dev)

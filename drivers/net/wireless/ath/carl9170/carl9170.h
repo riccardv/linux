@@ -241,6 +241,7 @@ struct ar9170 {
 	spinlock_t state_lock;
 	enum carl9170_restart_reasons last_reason;
 	bool registered;
+	bool pattern_mode; /* Don't send frames to firmware, reconfig firmware, etc. */
 
 	/* USB */
 	struct usb_device *udev;
@@ -267,6 +268,7 @@ struct ar9170 {
 	struct {
 		const struct carl9170fw_desc_head *desc;
 		const struct firmware *fw;
+		u32 feature_set;
 		unsigned int offset;
 		unsigned int address;
 		unsigned int cmd_bufs;

@@ -43,7 +43,8 @@ static void mt7921s_unregister_device(struct mt792x_dev *dev)
 	struct mt76_connac_pm *pm = &dev->pm;
 
 	cancel_work_sync(&dev->init_work);
-	mt76_unregister_device(&dev->mt76);
+	if (dev->hw_registered)
+		mt76_unregister_device(&dev->mt76);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_work_sync(&pm->wake_work);
 
@@ -128,7 +129,8 @@ static int mt7921s_probe(struct sdio_func *func,
 	int ret;
 
 	ops = mt792x_get_mac80211_ops(&func->dev, &mt7921_ops,
-				      (void *)id->driver_data, &features);
+				      (void *)id->driver_data, &features,
+				      true, true);
 	if (!ops)
 		return -ENOMEM;
 

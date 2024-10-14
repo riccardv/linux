@@ -1015,6 +1015,8 @@ skip:
 		err = rdev_scan(rdev, request);
 		if (err) {
 			rdev->int_scan_req = old;
+			pr_err("cfg80211-scan-6ghz, rdev_scan failed: %d  n_channels: %d  need_scan_psc: %d req-n-channels: %d",
+			       err, request->n_channels, need_scan_psc, rdev_req->n_channels);
 			kfree(request);
 		} else {
 			kfree(old);
@@ -1023,6 +1025,8 @@ skip:
 		return err;
 	}
 
+	//pr_err("cfg80211-scan-6ghz, n-channels is 0, flags: 0x%x  need_scan_psc: %d req-n-channels: %d\n",
+	//       rdev_req->flags, need_scan_psc, rdev_req->n_channels);
 	kfree(request);
 	return -EINVAL;
 }
@@ -1041,8 +1045,12 @@ int cfg80211_scan(struct cfg80211_registered_device *rdev)
 			n_channels++;
 	}
 
-	if (!n_channels)
-		return cfg80211_scan_6ghz(rdev);
+	if (!n_channels) {
+		int rv = cfg80211_scan_6ghz(rdev);
+		if (rv)
+			pr_err("cfg80211-scan: cfg80211_scan_6ghz failed: %d\n", rv);
+		return rv;
+	}
 
 	request = kzalloc(struct_size(request, channels, n_channels),
 			  GFP_KERNEL);
@@ -3168,6 +3176,19 @@ cfg80211_inform_bss_data(struct wiphy *wiphy,
 
 	cfg80211_parse_ml_sta_data(wiphy, &inform_data, res, gfp);
 
+	/* This one is hard to debug, symptom looks like STA just cannot scan
+	 * at all, so add some warnings.
+	 */
+	if (inform_data.cannot_use_reasons) {
+		static unsigned long last_jiffies;
+
+		/* Print no more than once per 5 seconds */
+		if (time_after(jiffies, last_jiffies + 5 * HZ)) {
+			pr_info("cfg80211-inform-bss-data, bssid: %pM cannot-use-reasons: 0x%llx\n",
+				bssid, inform_data.cannot_use_reasons);
+			last_jiffies = jiffies;
+		}
+	}
 	return res;
 }
 EXPORT_SYMBOL(cfg80211_inform_bss_data);

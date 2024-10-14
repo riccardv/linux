@@ -294,6 +294,146 @@ static u32 iwl_mvm_convert_rate_idx(struct iwl_mvm *mvm,
 	return (u32)rate_plcp | rate_flags;
 }
 
+static u32 iwl_mvm_get_txo_rate_n_flags(struct iwl_mvm *mvm, struct iwl_txo_data *td)
+{
+	u32 result;
+
+	if (td->tx_rate_mode == 0) { /* cck */
+		result = RATE_MCS_CCK_MSK_V1;
+		switch (td->tx_rate_idx) {
+		case 0: result |= IWL_RATE_1M_PLCP; break;
+		case 1: result |= IWL_RATE_2M_PLCP; break;
+		case 2: result |= IWL_RATE_5M_PLCP; break;
+		default: result |= IWL_RATE_11M_PLCP; break;
+		}
+
+		if (td->ldpc)
+			result |= RATE_MCS_LDPC_MSK_V1;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+		goto check_v1;
+	} else if (td->tx_rate_mode == 1) { /* ofdm */
+		result = 0;
+		switch (td->tx_rate_idx) {
+		case 0: result |= IWL_RATE_6M_PLCP; break;
+		case 1: result |= IWL_RATE_9M_PLCP; break;
+		case 2: result |= IWL_RATE_12M_PLCP; break;
+		case 3: result |= IWL_RATE_18M_PLCP; break;
+		case 4: result |= IWL_RATE_24M_PLCP; break;
+		case 5: result |= IWL_RATE_36M_PLCP; break;
+		case 6: result |= IWL_RATE_48M_PLCP; break;
+		default: result |= IWL_RATE_54M_PLCP; break;
+		}
+
+		if (td->ldpc)
+			result |= RATE_MCS_LDPC_MSK_V1;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+		goto check_v1;
+	} else if (td->tx_rate_mode == 2) { /* ht */
+		result = RATE_MCS_HT_MSK_V1;
+		result |= u32_encode_bits(td->tx_rate_nss * 8 + td->tx_rate_idx,
+					  RATE_HT_MCS_RATE_CODE_MSK_V1 |
+					  RATE_HT_MCS_NSS_MSK_V1);
+		if (td->tx_rate_sgi)
+			result |= RATE_MCS_SGI_MSK_V1;
+		if (td->txbw == 1)
+			result |= u32_encode_bits(1, RATE_MCS_CHAN_WIDTH_MSK_V1);
+		/* LDPC required for BW > 20 and/or MCS >= 9 or FW will crash. */
+		if (td->ldpc || td->txbw > 0)
+			result |= RATE_MCS_LDPC_MSK_V1;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+		goto check_v1;
+	} else if (td->tx_rate_mode == 3) { /* vht */
+		u8 mcs = td->tx_rate_idx;
+		u8 nss = td->tx_rate_nss;
+
+		result = RATE_MCS_VHT_MSK_V1;
+		result |= u32_encode_bits(mcs, RATE_VHT_MCS_RATE_CODE_MSK);
+		result |= u32_encode_bits(nss, RATE_MCS_NSS_MSK);
+		if (td->tx_rate_sgi)
+			result |= RATE_MCS_SGI_MSK_V1;
+		if (td->txbw == 1)
+			result |= u32_encode_bits(1, RATE_MCS_CHAN_WIDTH_MSK_V1);
+		else if (td->txbw == 2)
+			result |= u32_encode_bits(2, RATE_MCS_CHAN_WIDTH_MSK_V1);
+		else if (td->txbw == 3)
+			result |= u32_encode_bits(3, RATE_MCS_CHAN_WIDTH_MSK_V1);
+
+		/* LDPC required for BW > 20 and/or MCS >= 9 or FW will crash. */
+		if (td->ldpc || td->txbw > 0 || mcs >= 9)
+			result |= RATE_MCS_LDPC_MSK_V1;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+
+		goto check_v1;
+	} else if (td->tx_rate_mode == 4) { /* HE-SU */
+		/* V2 format */
+		u32 mcs = td->tx_rate_idx;
+		u32 nss = td->tx_rate_nss;
+
+		result = RATE_MCS_HE_MSK; /* HE-SU by default, others possible */
+		result |= mcs;
+		result |= nss << RATE_MCS_NSS_POS;
+
+		if (td->txbw == 1)
+			result |= RATE_MCS_CHAN_WIDTH_40;
+		else if (td->txbw == 2)
+			result |= RATE_MCS_CHAN_WIDTH_80;
+		else if (td->txbw == 3)
+			result |= RATE_MCS_CHAN_WIDTH_160;
+
+		/* LDPC required for BW > 20 and/or MCS >= 9 or FW will crash. */
+		if (td->ldpc || td->txbw > 0 || mcs >= 9)
+			result |= RATE_MCS_LDPC_MSK;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+		if (td->beamforming)
+			result |= RATE_MCS_BF_MSK; /* beamforming on */
+
+		result |= ((u32)(td->tx_rate_sgi)) << RATE_MCS_HE_GI_LTF_POS;
+		/* pr_info("TXO he-su, v2 rate-n-flags: 0x%x\n", result); */
+	} else if (td->tx_rate_mode == 5) { /* EHT */
+		/* V2 format */
+		u32 mcs = td->tx_rate_idx;
+		u32 nss = td->tx_rate_nss;
+
+		result = RATE_MCS_EHT_MSK; /* EHT-SU by default, others possible */
+		result |= mcs;
+		result |= nss << RATE_MCS_NSS_POS;
+
+		if (td->txbw == 1)
+			result |= RATE_MCS_CHAN_WIDTH_40;
+		else if (td->txbw == 2)
+			result |= RATE_MCS_CHAN_WIDTH_80;
+		else if (td->txbw == 3)
+			result |= RATE_MCS_CHAN_WIDTH_160;
+		else if (td->txbw == 4)
+			result |= RATE_MCS_CHAN_WIDTH_320;
+
+		/* LDPC required for BW > 20 and/or MCS >= 9 or FW will crash. */
+		if (td->ldpc || td->txbw > 0 || mcs >= 9)
+			result |= RATE_MCS_LDPC_MSK;
+		if (td->stbc)
+			result |= RATE_MCS_STBC_MSK;
+		if (td->beamforming)
+			result |= RATE_MCS_BF_MSK; /* beamforming on */
+
+		result |= ((u32)(td->tx_rate_sgi)) << RATE_MCS_HE_GI_LTF_POS;
+	}
+
+	result |= RATE_MCS_ANT_AB_MSK; /* enable both antennas */
+	return result;
+
+check_v1:
+	result |= RATE_MCS_ANT_AB_MSK; /* enable both antennas */
+
+	if (iwl_fw_lookup_notif_ver(mvm->fw, LONG_GROUP, TX_CMD, 0) > 6)
+		return iwl_new_rate_from_v1(result);
+	return result;
+}
+
 static u32 iwl_mvm_get_inject_tx_rate(struct iwl_mvm *mvm,
 				      struct ieee80211_tx_info *info,
 				      struct ieee80211_sta *sta,
@@ -405,8 +545,8 @@ static u32 iwl_mvm_get_tx_rate_n_flags(struct iwl_mvm *mvm,
  * Sets the fields in the Tx cmd that are rate related
  */
 void iwl_mvm_set_tx_cmd_rate(struct iwl_mvm *mvm, struct iwl_tx_cmd *tx_cmd,
-			    struct ieee80211_tx_info *info,
-			    struct ieee80211_sta *sta, __le16 fc)
+			     struct ieee80211_tx_info *info,
+			     struct ieee80211_sta *sta, __le16 fc)
 {
 	/* Set retry limit on RTS packets */
 	tx_cmd->rts_retry_limit = IWL_RTS_DFAULT_RETRY_LIMIT;
@@ -496,7 +636,7 @@ static void iwl_mvm_set_tx_cmd_crypto(struct iwl_mvm *mvm,
 	case WLAN_CIPHER_SUITE_WEP40:
 		tx_cmd->sec_ctl |= TX_CMD_SEC_WEP |
 			((keyconf->keyidx << TX_CMD_SEC_WEP_KEY_IDX_POS) &
-			  TX_CMD_SEC_WEP_KEY_IDX_MSK);
+			 TX_CMD_SEC_WEP_KEY_IDX_MSK);
 
 		memcpy(&tx_cmd->key[3], keyconf->key, keyconf->keylen);
 		break;
@@ -567,6 +707,10 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 	struct iwl_device_tx_cmd *dev_cmd;
 	struct iwl_tx_cmd *tx_cmd;
+	__le16 fc = hdr->frame_control;
+	struct iwl_tx_cb *cb = iwl_tx_skb_cb(skb);
+
+	cb->flags = 0;
 
 	dev_cmd = iwl_trans_alloc_tx_cmd(mvm->trans);
 
@@ -582,7 +726,7 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
 			iwl_mvm_sta_from_mac80211(sta) : NULL;
 		bool amsdu = false;
 
-		if (ieee80211_is_data_qos(hdr->frame_control)) {
+		if (ieee80211_is_data_qos(fc)) {
 			u8 *qc = ieee80211_get_qos_ctl(hdr);
 
 			amsdu = *qc & IEEE80211_QOS_CTL_A_MSDU_PRESENT;
@@ -600,12 +744,22 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
 		if (unlikely(iwl_mvm_use_host_rate(mvm, mvmsta, hdr, info))) {
 			flags |= IWL_TX_FLAGS_CMD_RATE;
 			rate_n_flags =
-				iwl_mvm_get_tx_rate_n_flags(mvm, info, sta,
-							    hdr->frame_control);
-		} else if (!ieee80211_is_data(hdr->frame_control) ||
+				iwl_mvm_get_tx_rate_n_flags(mvm, info, sta, fc);
+		} else if (!ieee80211_is_data(fc) ||
 			   mvmsta->sta_state < IEEE80211_STA_AUTHORIZED) {
 			/* These are important frames */
 			flags |= IWL_TX_FLAGS_HIGH_PRI;
+		} else if (mvm->txo_data && skb->len >= 400 &&
+			   (ieee80211_is_data(fc) || ieee80211_is_data_qos(fc)) &&
+			   (!(ieee80211_is_qos_nullfunc(fc) || ieee80211_is_nullfunc(fc)))) {
+			struct iwl_txo_data *td = rcu_dereference(mvm->txo_data);
+
+			/* Check td again, un-protected access above was lazy check. */
+			if (td && td->txo_active) {
+				cb->flags |= IWL_TX_CB_TXO_USED;
+				flags |= IWL_TX_FLAGS_CMD_RATE;
+				rate_n_flags = iwl_mvm_get_txo_rate_n_flags(mvm, td);
+			}
 		}
 
 		if (mvm->trans->trans_cfg->device_family >=
@@ -650,7 +804,7 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
 
 	iwl_mvm_set_tx_cmd(mvm, skb, tx_cmd, info, sta_id);
 
-	iwl_mvm_set_tx_cmd_rate(mvm, tx_cmd, info, sta, hdr->frame_control);
+	iwl_mvm_set_tx_cmd_rate(mvm, tx_cmd, info, sta, fc);
 
 	/* Copy MAC header from skb into command buffer */
 	iwl_mvm_copy_hdr(tx_cmd->hdr, hdr, hdrlen, addr3_override);
@@ -663,11 +817,13 @@ static void iwl_mvm_skb_prepare_status(struct sk_buff *skb,
 				       struct iwl_device_tx_cmd *cmd)
 {
 	struct ieee80211_tx_info *skb_info = IEEE80211_SKB_CB(skb);
+	struct iwl_tx_cb cb = *iwl_tx_skb_cb(skb);
 
 	memset(&skb_info->status, 0, sizeof(skb_info->status));
 	memset(skb_info->driver_data, 0, sizeof(skb_info->driver_data));
 
 	skb_info->driver_data[1] = cmd;
+	*iwl_tx_skb_cb(skb) = cb; /* re-apply this driver info */
 }
 
 static int iwl_mvm_get_ctrl_vif_queue(struct iwl_mvm *mvm,
@@ -1362,6 +1518,11 @@ int iwl_mvm_tx_skb_sta(struct iwl_mvm *mvm, struct sk_buff *skb,
 
 	memcpy(&info, skb->cb, sizeof(info));
 
+	if (unlikely(mvm->block_traffic & IWL_MVM_BLOCK_TX)) {
+		ieee80211_free_txskb(mvm->hw, skb);
+		return 0;
+	}
+
 	if (!skb_is_gso(skb))
 		return iwl_mvm_tx_mpdu(mvm, skb, &info, sta, NULL);
 
@@ -1544,7 +1705,8 @@ static int iwl_mvm_get_hwrate_chan_width(u32 chan_width)
 	}
 }
 
-void iwl_mvm_hwrate_to_tx_rate(u32 rate_n_flags,
+void iwl_mvm_hwrate_to_tx_rate(struct iwl_mvm *mvm,
+			       u32 rate_n_flags,
 			       enum nl80211_band band,
 			       struct ieee80211_tx_rate *r)
 {
@@ -1552,28 +1714,56 @@ void iwl_mvm_hwrate_to_tx_rate(u32 rate_n_flags,
 	u32 rate = format == RATE_MCS_HT_MSK ?
 		RATE_HT_MCS_INDEX(rate_n_flags) :
 		rate_n_flags & RATE_MCS_CODE_MSK;
+	int bwi = (rate_n_flags & RATE_MCS_CHAN_WIDTH_MSK) >> RATE_MCS_CHAN_WIDTH_POS;
 
 	r->flags |=
 		iwl_mvm_get_hwrate_chan_width(rate_n_flags &
 					      RATE_MCS_CHAN_WIDTH_MSK);
+
+	mvm->ethtool_stats.tx_bw[bwi]++;
+	if (rate_n_flags & RATE_MCS_HE_106T_MSK)
+		mvm->ethtool_stats.tx_bw_106_tone++;
 
 	if (rate_n_flags & RATE_MCS_SGI_MSK)
 		r->flags |= IEEE80211_TX_RC_SHORT_GI;
 	if (format ==  RATE_MCS_HT_MSK) {
 		r->flags |= IEEE80211_TX_RC_MCS;
 		r->idx = rate;
+		mvm->ethtool_stats.tx_mcs[rate % 8]++; /* treat mcs like we do for VHT */
+		mvm->ethtool_stats.tx_ht++;
 	} else if (format ==  RATE_MCS_VHT_MSK) {
 		ieee80211_rate_set_vht(r, rate,
 				       FIELD_GET(RATE_MCS_NSS_MSK,
 						 rate_n_flags) + 1);
 		r->flags |= IEEE80211_TX_RC_VHT_MCS;
+		mvm->ethtool_stats.tx_mcs[rate]++;
+		mvm->ethtool_stats.tx_vht++;
 	} else if (format == RATE_MCS_HE_MSK) {
 		/* mac80211 cannot do this without ieee80211_tx_status_ext()
-		 * but it only matters for radiotap */
+		 * but it only matters for radiotap
+		 */
 		r->idx = 0;
+		mvm->ethtool_stats.tx_mcs[rate]++;
+		mvm->ethtool_stats.tx_he++;
+		mvm->ethtool_stats.tx_he_type[(rate_n_flags >> RATE_MCS_HE_TYPE_POS) & 0x3]++;
+	} else if (format == RATE_MCS_EHT_MSK) {
+		/* mac80211 cannot do this without ieee80211_tx_status_ext()
+		 * but it only matters for radiotap
+		 */
+		r->idx = 0;
+		mvm->ethtool_stats.tx_mcs[rate]++;
+		mvm->ethtool_stats.tx_eht++;
+		mvm->ethtool_stats.tx_he_type[(rate_n_flags >> RATE_MCS_HE_TYPE_POS) & 0x3]++;
+	} else if (format == RATE_MCS_LEGACY_OFDM_MSK) {
+		r->idx = iwl_mvm_legacy_hw_idx_to_mac80211_idx(rate_n_flags,
+							       band);
+		mvm->ethtool_stats.tx_mcs[rate & RATE_LEGACY_RATE_MSK]++;
+		mvm->ethtool_stats.tx_ofdm++;
 	} else {
 		r->idx = iwl_mvm_legacy_hw_idx_to_mac80211_idx(rate_n_flags,
 							       band);
+		mvm->ethtool_stats.tx_mcs[rate & RATE_LEGACY_RATE_MSK]++;
+		mvm->ethtool_stats.tx_cck++;
 	}
 }
 
@@ -1607,7 +1797,8 @@ void iwl_mvm_hwrate_to_tx_rate_v1(u32 rate_n_flags,
 /*
  * translate ucode response to mac80211 tx status control values
  */
-static void iwl_mvm_hwrate_to_tx_status(const struct iwl_fw *fw,
+static void iwl_mvm_hwrate_to_tx_status(struct iwl_mvm *mvm,
+					const struct iwl_fw *fw,
 					u32 rate_n_flags,
 					struct ieee80211_tx_info *info)
 {
@@ -1619,7 +1810,12 @@ static void iwl_mvm_hwrate_to_tx_status(const struct iwl_fw *fw,
 
 	info->status.antenna =
 		((rate_n_flags & RATE_MCS_ANT_AB_MSK) >> RATE_MCS_ANT_POS);
-	iwl_mvm_hwrate_to_tx_rate(rate_n_flags,
+	if (info->status.antenna == 0x3)
+		mvm->ethtool_stats.tx_nss[1]++;
+	else
+		mvm->ethtool_stats.tx_nss[0]++;
+
+	iwl_mvm_hwrate_to_tx_rate(mvm, rate_n_flags,
 				  info->band, r);
 }
 
@@ -1664,6 +1860,30 @@ static void iwl_mvm_tx_status_check_trigger(struct iwl_mvm *mvm,
 	}
 }
 
+static void iwl_mvm_update_tx_stats(struct iwl_mvm *mvm, struct sk_buff *skb, u32 status,
+				    struct iwl_tx_cb *cb)
+{
+	u32 idx = status & TX_STATUS_MSK;
+
+	if (idx > TX_STATUS_INTERNAL_ABORT + 1)
+		idx = TX_STATUS_INTERNAL_ABORT + 1;
+
+	mvm->ethtool_stats.tx_status_counts[idx]++;
+	if (idx == TX_STATUS_SUCCESS) {
+		mvm->ethtool_stats.tx_bytes_nic += skb->len;
+		if (cb->flags & IWL_TX_CB_TXO_USED) {
+			mvm->ethtool_stats.txo_tx_mpdu_ok++;
+			//pr_info("iwl_mvm_update_tx_stats, success, skb: %p\n", skb);
+		}
+	} else {
+		mvm->ethtool_stats.tx_mpdu_fail++;
+		if (cb->flags & IWL_TX_CB_TXO_USED) {
+			mvm->ethtool_stats.txo_tx_mpdu_fail++;
+			//pr_info("iwl_mvm_update_tx_stats, failed, skb: %p\n", skb);
+		}
+	}
+}
+
 /*
  * iwl_mvm_get_scd_ssn - returns the SSN of the SCD
  * @tx_resp: the Tx response from the fw (agg or non-agg)
@@ -1680,7 +1900,7 @@ static void iwl_mvm_tx_status_check_trigger(struct iwl_mvm *mvm,
  * For 22000-series and lower, this is just 12 bits. For later, 16 bits.
  */
 static inline u32 iwl_mvm_get_scd_ssn(struct iwl_mvm *mvm,
-				      struct iwl_mvm_tx_resp *tx_resp)
+				      struct iwl_tx_resp *tx_resp)
 {
 	u32 val = le32_to_cpup((__le32 *)iwl_mvm_get_agg_status(mvm, tx_resp) +
 			       tx_resp->frame_count);
@@ -1690,14 +1910,50 @@ static inline u32 iwl_mvm_get_scd_ssn(struct iwl_mvm *mvm,
 	return val & 0xFFF;
 }
 
+static void iwl_mvm_update_tx_ampdu_histogram(struct iwl_mvm *mvm, int freed)
+{
+	/* tx-ampdu-len histogram, buckets match what mtk7915 supports. */
+	if (freed <= 1)
+		mvm->ethtool_stats.tx_ampdu_len[0]++;
+	else if (freed <= 10)
+		mvm->ethtool_stats.tx_ampdu_len[1]++;
+	else if (freed <= 19)
+		mvm->ethtool_stats.tx_ampdu_len[2]++;
+	else if (freed <= 28)
+		mvm->ethtool_stats.tx_ampdu_len[3]++;
+	else if (freed <= 37)
+		mvm->ethtool_stats.tx_ampdu_len[4]++;
+	else if (freed <= 46)
+		mvm->ethtool_stats.tx_ampdu_len[5]++;
+	else if (freed <= 55)
+		mvm->ethtool_stats.tx_ampdu_len[6]++;
+	else if (freed <= 79)
+		mvm->ethtool_stats.tx_ampdu_len[7]++;
+	else if (freed <= 103)
+		mvm->ethtool_stats.tx_ampdu_len[8]++;
+	else if (freed <= 127)
+		mvm->ethtool_stats.tx_ampdu_len[9]++;
+	else if (freed <= 151)
+		mvm->ethtool_stats.tx_ampdu_len[10]++;
+	else if (freed <= 175)
+		mvm->ethtool_stats.tx_ampdu_len[11]++;
+	else if (freed <= 199)
+		mvm->ethtool_stats.tx_ampdu_len[12]++;
+	else if (freed <= 223)
+		mvm->ethtool_stats.tx_ampdu_len[13]++;
+	else
+		mvm->ethtool_stats.tx_ampdu_len[14]++;
+	// TODO:  Consider higher buckets, quick experiment shows be200 freeing in the 250 range.
+}
+
 static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 				     struct iwl_rx_packet *pkt)
 {
 	struct ieee80211_sta *sta;
 	u16 sequence = le16_to_cpu(pkt->hdr.sequence);
 	int txq_id = SEQ_TO_QUEUE(sequence);
-	/* struct iwl_mvm_tx_resp_v3 is almost the same */
-	struct iwl_mvm_tx_resp *tx_resp = (void *)pkt->data;
+	/* struct iwl_tx_resp_v3 is almost the same */
+	struct iwl_tx_resp *tx_resp = (void *)pkt->data;
 	int sta_id = IWL_MVM_TX_RES_GET_RA(tx_resp->ra_tid);
 	int tid = IWL_MVM_TX_RES_GET_TID(tx_resp->ra_tid);
 	struct agg_tx_status *agg_status =
@@ -1709,6 +1965,14 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 	u8 lq_color;
 	u16 next_reclaimed, seq_ctl;
 	bool is_ndp = false;
+	struct ieee80211_link_sta *link_sta;
+	int link_sta_id = -1;
+
+	rcu_read_lock();
+	link_sta = rcu_dereference(mvm->fw_id_to_link_sta[sta_id]);
+	if (link_sta)
+		link_sta_id = link_sta->link_id;
+	rcu_read_unlock();
 
 	__skb_queue_head_init(&skbs);
 
@@ -1720,11 +1984,14 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 	/* we can free until ssn % q.n_bd not inclusive */
 	iwl_trans_reclaim(mvm->trans, txq_id, ssn, &skbs, false);
 
+	iwl_mvm_update_tx_ampdu_histogram(mvm, tx_resp->frame_count);
+
 	while (!skb_queue_empty(&skbs)) {
 		struct sk_buff *skb = __skb_dequeue(&skbs);
 		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 		struct ieee80211_hdr *hdr = (void *)skb->data;
 		bool flushed = false;
+		struct iwl_tx_cb cb = *iwl_tx_skb_cb(skb);
 
 		skb_freed++;
 
@@ -1732,6 +1999,10 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 
 		memset(&info->status, 0, sizeof(info->status));
 		info->flags &= ~(IEEE80211_TX_STAT_ACK | IEEE80211_TX_STAT_TX_FILTERED);
+		if (link_sta_id != -1)
+			info->control.flags = u32_replace_bits(info->control.flags,
+							       link_sta_id,
+							       IEEE80211_TX_CTRL_MLO_LINK);
 
 		/* inform mac80211 about what happened with the frame */
 		switch (status & TX_STATUS_MSK) {
@@ -1772,7 +2043,32 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 
 		info->status.rates[0].count = tx_resp->failure_frame + 1;
 
-		iwl_mvm_hwrate_to_tx_status(mvm->fw,
+		if (skb_freed <= 1) {
+			mvm->ethtool_stats.tx_mpdu_attempts += info->status.rates[0].count;
+			mvm->ethtool_stats.tx_mpdu_retry += tx_resp->failure_frame;
+			if (cb.flags & IWL_TX_CB_TXO_USED) {
+				mvm->ethtool_stats.txo_tx_mpdu_attempts += info->status.rates[0].count;
+				mvm->ethtool_stats.txo_tx_mpdu_retry += tx_resp->failure_frame;
+				//pr_info("iwl_mvm_rx_tx_cmd_single, attempts: %d  failure_frame: %d  skb_freed: %d  status: 0x%x acked: %d skb: %p skb->len: %d\n",
+				//	tx_resp->failure_frame + 1, tx_resp->failure_frame, skb_freed,
+				//	status & TX_STATUS_MSK, !!(info->flags & IEEE80211_TX_STAT_ACK),
+				//	skb, skb->len);
+			}
+		} else {
+			/* Not sure we can know how many retries for these. */
+			mvm->ethtool_stats.tx_mpdu_attempts += 1;
+
+			if (cb.flags & IWL_TX_CB_TXO_USED) {
+				mvm->ethtool_stats.txo_tx_mpdu_attempts += info->status.rates[0].count;
+
+				//pr_info("iwl_mvm_rx_tx_cmd_single, attempts: %d  failure_frame: %d  skb_freed: %d  status: 0x%x acked: %d skb: %p skb-len: %d\n",
+				//	tx_resp->failure_frame + 1, tx_resp->failure_frame, skb_freed,
+				//	status & TX_STATUS_MSK, !!(info->flags & IEEE80211_TX_STAT_ACK),
+				//	skb, skb->len);
+			}
+		}
+
+		iwl_mvm_hwrate_to_tx_status(mvm, mvm->fw,
 					    le32_to_cpu(tx_resp->initial_rate),
 					    info);
 
@@ -1817,6 +2113,8 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 		lq_color = TX_RES_RATE_TABLE_COL_GET(tx_resp->tlc_info);
 		info->status.status_driver_data[0] =
 			RS_DRV_DATA_PACK(lq_color, tx_resp->reduced_tpc);
+
+		iwl_mvm_update_tx_stats(mvm, skb, status, &cb);
 
 		if (likely(!iwl_mvm_time_sync_frame(mvm, skb, hdr->addr1)))
 			ieee80211_tx_status_skb(mvm->hw, skb);
@@ -1954,7 +2252,7 @@ static const char *iwl_get_agg_tx_status(u16 status)
 static void iwl_mvm_rx_tx_cmd_agg_dbg(struct iwl_mvm *mvm,
 				      struct iwl_rx_packet *pkt)
 {
-	struct iwl_mvm_tx_resp *tx_resp = (void *)pkt->data;
+	struct iwl_tx_resp *tx_resp = (void *)pkt->data;
 	struct agg_tx_status *frame_status =
 		iwl_mvm_get_agg_status(mvm, tx_resp);
 	int i;
@@ -1988,7 +2286,7 @@ static void iwl_mvm_rx_tx_cmd_agg_dbg(struct iwl_mvm *mvm,
 static void iwl_mvm_rx_tx_cmd_agg(struct iwl_mvm *mvm,
 				  struct iwl_rx_packet *pkt)
 {
-	struct iwl_mvm_tx_resp *tx_resp = (void *)pkt->data;
+	struct iwl_tx_resp *tx_resp = (void *)pkt->data;
 	int sta_id = IWL_MVM_TX_RES_GET_RA(tx_resp->ra_tid);
 	int tid = IWL_MVM_TX_RES_GET_TID(tx_resp->ra_tid);
 	u16 sequence = le16_to_cpu(pkt->hdr.sequence);
@@ -2029,7 +2327,9 @@ static void iwl_mvm_rx_tx_cmd_agg(struct iwl_mvm *mvm,
 void iwl_mvm_rx_tx_cmd(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 {
 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
-	struct iwl_mvm_tx_resp *tx_resp = (void *)pkt->data;
+	struct iwl_tx_resp *tx_resp = (void *)pkt->data;
+
+	iwl_mvm_update_tx_ampdu_histogram(mvm, tx_resp->frame_count);
 
 	if (tx_resp->frame_count == 1)
 		iwl_mvm_rx_tx_cmd_single(mvm, pkt);
@@ -2048,6 +2348,7 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 	struct iwl_mvm_sta *mvmsta = NULL;
 	struct sk_buff *skb;
 	int freed;
+	struct ieee80211_link_sta *link_sta;
 
 	if (WARN_ONCE(sta_id >= mvm->fw->ucode_capa.num_stations ||
 		      tid > IWL_MAX_TID_COUNT,
@@ -2064,6 +2365,8 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 		return;
 	}
 
+	link_sta = rcu_dereference(mvm->fw_id_to_link_sta[sta_id]);
+
 	__skb_queue_head_init(&reclaimed_skbs);
 
 	/*
@@ -2073,12 +2376,76 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 	 */
 	iwl_trans_reclaim(mvm->trans, txq, index, &reclaimed_skbs, is_flush);
 
+	if (!IS_ERR(sta))
+		mvmsta = iwl_mvm_sta_from_mac80211(sta);
+
 	skb_queue_walk(&reclaimed_skbs, skb) {
 		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+		struct iwl_tx_cb *cb = iwl_tx_skb_cb(skb);
+		int retry = 0;
+
+		if (!is_flush) {
+			if (mvmsta) {
+				retry = min(14, mvmsta->retransmitted_ba_frames);
+
+				/* assign retries, we cannot know exactly which frame
+				 * had the retries, and it is a bit inaccurate anyway, but
+				 * this gets us fairly close to total retransmits being accurate
+				 * at least.
+				 */
+				if (retry > 0) {
+					if (cb->flags & IWL_TX_CB_TXO_USED) {
+						mvm->ethtool_stats.txo_tx_mpdu_attempts += retry + 1;
+						mvm->ethtool_stats.txo_tx_mpdu_retry += retry;
+
+						//pr_info("iwl_mvm_tx_reclaim, txo-skb reclaimed (ok), retries: %d skb: %p\n",
+						//	retry, skb);
+					} else {
+						//pr_info("iwl_mvm_tx_reclaim, non-txo-skb reclaimed (ok), retries: %d skb: %p\n",
+						//	retry, skb);
+					}
+
+					mvm->ethtool_stats.tx_mpdu_attempts += retry + 1;
+					mvm->ethtool_stats.tx_mpdu_retry += retry;
+					mvmsta->retransmitted_ba_frames -= retry;
+				}
+				else {
+					/* no accumulated retries to assign */
+					if (cb->flags & IWL_TX_CB_TXO_USED)
+						mvm->ethtool_stats.txo_tx_mpdu_attempts += 1;
+					mvm->ethtool_stats.tx_mpdu_attempts += 1;
+				}
+			} else {
+				/* No way to know retries since we don't have mvmsta */
+				if (cb->flags & IWL_TX_CB_TXO_USED)
+					mvm->ethtool_stats.txo_tx_mpdu_attempts += 1;
+				mvm->ethtool_stats.tx_mpdu_attempts += 1;
+			}
+
+			mvm->ethtool_stats.txo_tx_mpdu_ok++;
+			mvm->ethtool_stats.tx_bytes_nic += skb->len;
+			mvm->ethtool_stats.tx_status_counts[TX_STATUS_SUCCESS]++;
+		} else {
+			if (cb->flags & IWL_TX_CB_TXO_USED) {
+				mvm->ethtool_stats.txo_tx_mpdu_attempts += 1;
+				mvm->ethtool_stats.txo_tx_mpdu_fail += 1;
+				//pr_info("iwl_mvm_tx_reclaim, txo-skb reclaimed (flush) skb: %p\n",
+				//	skb);
+			} else {
+				//pr_info("iwl_mvm_tx_reclaim, non-txo-skb reclaimed (flush) skb: %p\n",
+				//	skb);
+			}
+			mvm->ethtool_stats.tx_mpdu_attempts += 1;
+			mvm->ethtool_stats.tx_mpdu_fail += 1;
+			mvm->ethtool_stats.tx_status_counts[TX_STATUS_FAIL_FIFO_FLUSHED]++;
+		}
 
 		iwl_trans_free_tx_cmd(mvm->trans, info->driver_data[1]);
 
 		memset(&info->status, 0, sizeof(info->status));
+
+		info->status.rates[0].count = retry + 1;
+
 		/* Packet was transmitted successfully, failures come as single
 		 * frames because before failing a frame the firmware transmits
 		 * it without aggregation at least once.
@@ -2087,6 +2454,11 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 			info->flags |= IEEE80211_TX_STAT_ACK;
 		else
 			info->flags &= ~IEEE80211_TX_STAT_ACK;
+
+		if (link_sta)
+			info->control.flags = u32_replace_bits(info->control.flags,
+							       link_sta->link_id,
+							       IEEE80211_TX_CTRL_MLO_LINK);
 	}
 
 	/*
@@ -2100,7 +2472,6 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 	if (IS_ERR(sta))
 		goto out;
 
-	mvmsta = iwl_mvm_sta_from_mac80211(sta);
 	tid_data = &mvmsta->tid_data[tid];
 
 	if (tid_data->txq_id != txq) {
@@ -2128,12 +2499,15 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 	skb_queue_walk(&reclaimed_skbs, skb) {
 		struct ieee80211_hdr *hdr = (void *)skb->data;
 		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+		bool do_status = false;
 
 		if (!is_flush) {
-			if (ieee80211_is_data_qos(hdr->frame_control))
+			if (ieee80211_is_data_qos(hdr->frame_control)) {
 				freed++;
-			else
+				do_status = true;
+			} else {
 				WARN_ON_ONCE(tid != IWL_MAX_TID_COUNT);
+			}
 		}
 
 		/* this is the first skb we deliver in this batch */
@@ -2142,9 +2516,16 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 			info->flags |= IEEE80211_TX_STAT_AMPDU;
 			memcpy(&info->status, &tx_info->status,
 			       sizeof(tx_info->status));
-			iwl_mvm_hwrate_to_tx_status(mvm->fw, rate, info);
 		}
+
+		/* Call this for all non-flushed data frames, not just the
+		 * first freed one, in order to get proper tx ethtool stats.
+		 */
+		if (do_status)
+			iwl_mvm_hwrate_to_tx_status(mvm, mvm->fw, rate, info);
 	}
+
+	iwl_mvm_update_tx_ampdu_histogram(mvm, freed);
 
 	spin_unlock_bh(&mvmsta->lock);
 
@@ -2165,7 +2546,7 @@ static void iwl_mvm_tx_reclaim(struct iwl_mvm *mvm, int sta_id, int tid,
 			goto out;
 
 		tx_info->band = chanctx_conf->def.chan->band;
-		iwl_mvm_hwrate_to_tx_status(mvm->fw, rate, tx_info);
+		iwl_mvm_hwrate_to_tx_status(mvm, mvm->fw, rate, tx_info);
 
 		IWL_DEBUG_TX_REPLY(mvm, "No reclaim. Update rs directly\n");
 		iwl_mvm_rs_tx_status(mvm, sta, tid, tx_info, false);
@@ -2176,6 +2557,17 @@ out:
 
 	while (!skb_queue_empty(&reclaimed_skbs)) {
 		skb = __skb_dequeue(&reclaimed_skbs);
+		{ /* debug potential double free? */
+			struct iwl_tx_cb *cb = iwl_tx_skb_cb(skb);
+			if ((cb->flags & IWL_TX_CB_EVER_INUSE) && !(cb->flags & IWL_TX_CB_INUSE)) {
+				WARN_ON(1);
+
+				pr_err("ERROR: skb: %p appears to not be in use, silently dropping pointer, ever-inuse: 0x%x\n",
+				       skb, !!(cb->flags & IWL_TX_CB_EVER_INUSE));
+				continue;
+			}
+			cb->flags &= ~(IWL_TX_CB_INUSE);
+		}
 		ieee80211_tx_status_skb(mvm->hw, skb);
 	}
 }
@@ -2211,15 +2603,63 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 		ba_info.status.status_driver_data[0] =
 			(void *)(uintptr_t)ba_res->reduced_txp;
 
+		rcu_read_lock();
+
+		mvmsta = iwl_mvm_sta_from_staid_rcu(mvm, sta_id);
+
+		/* We need to store the amount that failed to transmit, and then
+		 * will consume this counter when there is a tx-success.  Per individual
+		 * frame may not be exact, but total retry counts would be more accurate
+		 * at least.  In case it cannot be block-ack transmitted at all, the
+		 * tx-single path will deal with counting up the retransmit count.
+		 */
+		if (mvmsta) {
+			u16 retry_cnt = le16_to_cpu(ba_res->retry_cnt);
+			u16 done = le16_to_cpu(ba_res->done);
+			u16 txed = le16_to_cpu(ba_res->txed);
+			u16 failed = txed - done;
+
+			/* block-ack gives up and does single tx status if more than one
+			 * frame to transmit and retry_cnt is 14, or if single frame to transmit
+			 * and transmit failed (based on observation of logging).
+			 */
+			if (retry_cnt == 14) {
+				/* subtract those that will be reported as single tx events.
+				 * This is close to right, but not exactly since txed can change over life
+				 * of the ampdu transmit attempt.
+				 */
+				mvmsta->retransmitted_ba_frames -= (retry_cnt * failed);
+			} else if (failed == 1) {
+				/* subtract those that will probably be reported as single tx event.
+				 * This is close to right, but not exactly since txed can change over life
+				 * of the ampdu transmit attempt, and also maybe the single frame will join
+				 * with another and go back into ampdu xmit path.
+				 */
+				mvmsta->retransmitted_ba_frames -= retry_cnt;
+			}
+			else {
+				/* these failed frames will be retransmitted */
+				mvmsta->retransmitted_ba_frames += failed;
+			}
+
+			//pr_info("mvm_rx_ba_notif, retry-cnt: %d txed: %d done: %d accumulated_retries: %d\n",
+			//	le16_to_cpu(ba_res->retry_cnt), le16_to_cpu(ba_res->txed),
+			//	le16_to_cpu(ba_res->done), mvmsta->retransmitted_ba_frames);
+		}
+
 		tfd_cnt = le16_to_cpu(ba_res->tfd_cnt);
-		if (!tfd_cnt)
+		if (!tfd_cnt) {
+			rcu_read_unlock();
 			return;
+		}
 
 		if (IWL_FW_CHECK(mvm,
 				 struct_size(ba_res, tfd, tfd_cnt) > pkt_len,
 				 "short BA notification (tfds:%d, size:%d)\n",
-				 tfd_cnt, pkt_len))
+				 tfd_cnt, pkt_len)) {
+			rcu_read_unlock();
 			return;
+		}
 
 		IWL_DEBUG_TX_REPLY(mvm,
 				   "BA_NOTIFICATION Received from sta_id = %d, flags %x, sent:%d, acked:%d\n",
@@ -2227,9 +2667,6 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 				   le16_to_cpu(ba_res->txed),
 				   le16_to_cpu(ba_res->done));
 
-		rcu_read_lock();
-
-		mvmsta = iwl_mvm_sta_from_staid_rcu(mvm, sta_id);
 		/*
 		 * It's possible to get a BA response after invalidating the rcu
 		 * (rcu is invalidated in order to prevent new Tx from being

@@ -92,6 +92,7 @@ enum nfs_param {
 	Opt_wsize,
 	Opt_write,
 	Opt_xprtsec,
+	Opt_srcaddr,
 };
 
 enum {
@@ -148,6 +149,7 @@ static const struct fs_parameter_spec nfs_fs_parameters[] = {
 	fsparam_flag  ("bg",		Opt_bg),
 	fsparam_u32   ("bsize",		Opt_bsize),
 	fsparam_string("clientaddr",	Opt_clientaddr),
+	fsparam_string("srcaddr",	Opt_srcaddr),
 	fsparam_flag_no("cto",		Opt_cto),
 	fsparam_flag  ("fg",		Opt_fg),
 	fsparam_flag_no("fsc",		Opt_fscache_flag),
@@ -830,6 +832,14 @@ static int nfs_fs_context_parse_param(struct fs_context *fc,
 		if (len == 0)
 			goto out_invalid_address;
 		ctx->nfs_server.addrlen = len;
+		break;
+	case Opt_srcaddr:
+		len = rpc_pton(fc->net_ns, param->string, param->size,
+			       &ctx->srcaddr.address,
+			       sizeof(ctx->srcaddr._address));
+		if (len == 0)
+			goto out_invalid_address;
+		ctx->srcaddr.addrlen = len;
 		break;
 	case Opt_clientaddr:
 		trace_nfs_mount_assign(param->key, param->string);
@@ -1595,6 +1605,8 @@ static int nfs_init_fs_context(struct fs_context *fc)
 	ctx->protofamily	= AF_UNSPEC;
 	ctx->mountfamily	= AF_UNSPEC;
 	ctx->mount_server.port	= NFS_UNSPEC_PORT;
+	ctx->srcaddr.address.sa_family = AF_UNSPEC;
+	ctx->srcaddr.addrlen = sizeof(ctx->srcaddr._address);
 
 	if (fc->root) {
 		/* reconfigure, start with the current config */

@@ -91,8 +91,39 @@ static const struct rhashtable_params link_sta_rht_params = {
 static int sta_info_hash_del(struct ieee80211_local *local,
 			     struct sta_info *sta)
 {
-	return rhltable_remove(&local->sta_hash, &sta->hash_node,
-			       sta_rht_params);
+	struct sta_info *s;
+	int rv = -ENOENT;
+	int idx = STA_HASH(sta->sta.addr);
+	struct ieee80211_sub_if_data *sdata = sta->sdata;
+
+	rv = rhltable_remove(&local->sta_hash, &sta->hash_node,
+			     sta_rht_params);
+	if (rv != 0) {
+		/* If station is not in the main hash, then it definitely
+		 * should not be in the vhash, so we can just return.
+		 */
+		return rv;
+	}
+
+	/* Clean up vhash */
+	s = rcu_dereference_protected(sdata->sta_vhash[idx],
+				      lockdep_is_held(&local->hw.wiphy->mtx));
+	if (!s)
+		return rv;
+
+	if (s == sta) {
+		rcu_assign_pointer(sdata->sta_vhash[idx], s->vnext);
+		return rv;
+	}
+
+	while (rcu_access_pointer(s->vnext) &&
+	       rcu_access_pointer(s->vnext) != sta)
+		s = rcu_dereference_protected(s->vnext,
+					      lockdep_is_held(&local->hw.wiphy->mtx));
+	if (rcu_access_pointer(s->vnext))
+		rcu_assign_pointer(s->vnext, sta->vnext);
+
+	return rv;
 }
 
 static int link_sta_info_hash_add(struct ieee80211_local *local,
@@ -205,21 +236,25 @@ struct sta_info *sta_info_get(struct ieee80211_sub_if_data *sdata,
 			      const u8 *addr)
 {
 	struct ieee80211_local *local = sdata->local;
-	struct rhlist_head *tmp;
 	struct sta_info *sta;
 
+	(void)(local);
+
 	rcu_read_lock();
-	for_each_sta_info(local, addr, sta, tmp) {
-		if (sta->sdata == sdata) {
-			rcu_read_unlock();
-			/* this is safe as the caller must already hold
-			 * another rcu read section or the mutex
-			 */
-			return sta;
-		}
+
+	/* Check sdata hash */
+	sta = rcu_dereference_check(sdata->sta_vhash[STA_HASH(addr)],
+				    lockdep_is_held(&local->hw.wiphy->mtx));
+
+	while (sta) {
+		if (ether_addr_equal(sta->sta.addr, addr))
+			break;
+
+		sta = rcu_dereference_check(sta->vnext,
+					    lockdep_is_held(&local->hw.wiphy->mtx));
 	}
 	rcu_read_unlock();
-	return NULL;
+	return sta;
 }
 
 /*
@@ -234,6 +269,16 @@ struct sta_info *sta_info_get_bss(struct ieee80211_sub_if_data *sdata,
 	struct sta_info *sta;
 
 	rcu_read_lock();
+
+	sta = sta_info_get(sdata, addr);
+	if (sta) {
+		rcu_read_unlock();
+		return sta;
+	}
+
+	/* Maybe it's on some other sdata matching the bss, try
+	 * a bit harder.
+	 */
 	for_each_sta_info(local, addr, sta, tmp) {
 		if (sta->sdata == sdata ||
 		    (sta->sdata->bss && sta->sdata->bss == sdata->bss)) {
@@ -327,6 +372,21 @@ struct sta_info *sta_info_get_by_addrs(struct ieee80211_local *local,
 			return sta;
 	}
 
+	return NULL;
+}
+
+struct sta_info *sta_info_get_by_vif(struct ieee80211_local *local,
+				     const u8 *vif_addr, const u8 *sta_addr)
+{
+	struct ieee80211_sub_if_data *sdata;
+	struct ieee80211_sub_if_data *nxt;
+	struct sta_info *sta;
+
+	for_each_sdata(local, vif_addr, sdata, nxt) {
+		sta = sta_info_get(sdata, sta_addr);
+		if (sta)
+			return sta;
+	}
 	return NULL;
 }
 
@@ -449,8 +509,16 @@ void sta_info_free(struct ieee80211_local *local, struct sta_info *sta)
 static int sta_info_hash_add(struct ieee80211_local *local,
 			     struct sta_info *sta)
 {
-	return rhltable_insert(&local->sta_hash, &sta->hash_node,
-			       sta_rht_params);
+	int idx = STA_HASH(sta->sta.addr);
+
+	int rv = rhltable_insert(&local->sta_hash, &sta->hash_node,
+				 sta_rht_params);
+	if (rv != 0)
+		return rv;
+
+	sta->vnext = sta->sdata->sta_vhash[idx];
+	rcu_assign_pointer(sta->sdata->sta_vhash[idx], sta);
+	return 0;
 }
 
 static void sta_deliver_ps_frames(struct work_struct *wk)
@@ -667,6 +735,7 @@ __sta_info_alloc(struct ieee80211_sub_if_data *sdata,
 			mandatory = IEEE80211_RATE_MANDATORY_A;
 			break;
 		case NL80211_BAND_60GHZ:
+			sta_dbg(sdata, "WARNING: 60ghz band selected.\n");
 			WARN_ON(1);
 			mandatory = 0;
 			break;
@@ -876,7 +945,8 @@ static int sta_info_insert_finish(struct sta_info *sta) __acquires(RCU)
 	set_sta_flag(sta, WLAN_STA_INSERTED);
 
 	/* accept BA sessions now */
-	clear_sta_flag(sta, WLAN_STA_BLOCK_BA);
+	if (ieee80211_hw_check(&local->hw, AMPDU_AGGREGATION))
+		clear_sta_flag(sta, WLAN_STA_BLOCK_BA);
 
 	ieee80211_sta_debugfs_add(sta);
 	rate_control_add_sta_debugfs(sta);
@@ -1280,6 +1350,7 @@ static int _sta_info_move_state(struct sta_info *sta,
 				enum ieee80211_sta_state new_state,
 				bool recalc)
 {
+	struct ieee80211_sub_if_data *sdata = sta->sdata;
 	struct ieee80211_local *local = sta->local;
 
 	might_sleep();
@@ -1291,22 +1362,34 @@ static int _sta_info_move_state(struct sta_info *sta,
 
 	switch (new_state) {
 	case IEEE80211_STA_NONE:
-		if (sta->sta_state != IEEE80211_STA_AUTH)
+		if (sta->sta_state != IEEE80211_STA_AUTH) {
+			sdata_info(sdata, "sta-info-move-state to NONE: current state: %d (NOT AUTH) is invalid\n",
+				   sta->sta_state);
 			return -EINVAL;
+		}
 		break;
 	case IEEE80211_STA_AUTH:
 		if (sta->sta_state != IEEE80211_STA_NONE &&
-		    sta->sta_state != IEEE80211_STA_ASSOC)
+		    sta->sta_state != IEEE80211_STA_ASSOC) {
+			sdata_info(sdata, "sta-info-move-state to AUTH: current state %d (NOT NONE/ASSOC) is invalid\n",
+				   sta->sta_state);
 			return -EINVAL;
+		}
 		break;
 	case IEEE80211_STA_ASSOC:
 		if (sta->sta_state != IEEE80211_STA_AUTH &&
-		    sta->sta_state != IEEE80211_STA_AUTHORIZED)
+		    sta->sta_state != IEEE80211_STA_AUTHORIZED) {
+			sdata_info(sdata, "sta-info-move-state to ASSOC: current state %d (NOT AUTH/AUTHORIZED) is invalid\n",
+				   sta->sta_state);
 			return -EINVAL;
+		}
 		break;
 	case IEEE80211_STA_AUTHORIZED:
-		if (sta->sta_state != IEEE80211_STA_ASSOC)
+		if (sta->sta_state != IEEE80211_STA_ASSOC) {
+			sdata_info(sdata, "sta-info-move-state to AUTHORIZED: current state %d (NOT ASSOC) is invalid\n",
+				   sta->sta_state);
 			return -EINVAL;
+		}
 		break;
 	default:
 		WARN(1, "invalid state %d", new_state);
@@ -1322,8 +1405,22 @@ static int _sta_info_move_state(struct sta_info *sta,
 	if (test_sta_flag(sta, WLAN_STA_INSERTED)) {
 		int err = drv_sta_state(sta->local, sta->sdata, sta,
 					sta->sta_state, new_state);
-		if (err)
-			return err;
+		if (err == -EIO) {
+			/* Sdata-not-in-driver, we are out of sync, but probably
+			 * best to carry on instead of bailing here, at least maybe
+			 * we can clean this up.
+			 */
+			sdata_err(sta->sdata, "drv_sta_state failed with EIO (sdata not in driver?), state: %d  new-state: %d\n",
+				  sta->sta_state, new_state);
+			WARN_ON_ONCE(1);
+		}
+		else {
+			if (err) {
+				sdata_info(sdata, "sta-info-move-state drv_sta_state returned error, current state: %d  new_state: %d, err: %d\n",
+					   sta->sta_state, new_state, err);
+				return err;
+			}
+		}
 	}
 
 	/* reflect the change in all state variables */
@@ -1462,7 +1559,9 @@ static void __sta_info_destroy_part2(struct sta_info *sta, bool recalc)
 	if (sta->uploaded) {
 		ret = drv_sta_state(local, sdata, sta, IEEE80211_STA_NONE,
 				    IEEE80211_STA_NOTEXIST);
-		WARN_ON_ONCE(ret != 0);
+		if (WARN_ON_ONCE(ret != 0))
+			sdata_info(sdata, "sta-info-destroy: drv-sta-state error: %i, sta: %pM\n",
+				   ret, sta->sta.addr);
 	}
 
 	sta_dbg(sdata, "Removed STA %pM\n", sta->sta.addr);
@@ -1648,14 +1747,18 @@ struct ieee80211_sta *ieee80211_find_sta_by_ifaddr(struct ieee80211_hw *hw,
 	struct rhlist_head *tmp;
 	struct sta_info *sta;
 
+	if (localaddr) {
+		sta = sta_info_get_by_vif(hw_to_local(hw), localaddr, addr);
+		if (sta && sta->uploaded)
+			return &sta->sta;
+		return NULL;
+	}
+
 	/*
 	 * Just return a random station if localaddr is NULL
 	 * ... first in list.
 	 */
 	for_each_sta_info(local, addr, sta, tmp) {
-		if (localaddr &&
-		    !ether_addr_equal(sta->sdata->vif.addr, localaddr))
-			continue;
 		if (!sta->uploaded)
 			return NULL;
 		return &sta->sta;
@@ -2411,6 +2514,27 @@ sta_get_last_rx_stats(struct sta_info *sta)
 	return stats;
 }
 
+struct ieee80211_sta_rx_stats *
+link_sta_get_last_rx_stats(struct link_sta_info *link_sta)
+{
+	struct ieee80211_sta_rx_stats *stats = &link_sta->rx_stats;
+	int cpu;
+
+	if (!link_sta->pcpu_rx_stats)
+		return stats;
+
+	for_each_possible_cpu(cpu) {
+		struct ieee80211_sta_rx_stats *cpustats;
+
+		cpustats = per_cpu_ptr(link_sta->pcpu_rx_stats, cpu);
+
+		if (time_after(cpustats->last_rx, stats->last_rx))
+			stats = cpustats;
+	}
+
+	return stats;
+}
+
 static void sta_stats_decode_rate(struct ieee80211_local *local, u32 rate,
 				  struct rate_info *rinfo)
 {
@@ -2434,13 +2558,55 @@ static void sta_stats_decode_rate(struct ieee80211_local *local, u32 rate,
 		struct ieee80211_supported_band *sband;
 		u16 brate;
 		unsigned int shift;
-		int band = STA_STATS_GET(LEGACY_BAND, rate);
-		int rate_idx = STA_STATS_GET(LEGACY_IDX, rate);
+		u32 band = STA_STATS_GET(LEGACY_BAND, rate);
+		u32 rate_idx = STA_STATS_GET(LEGACY_IDX, rate);
+
+		/* Note: band and rate_idx take values from wifi packets that are not bounds checked.
+		         So, do some checks here.
+		   TODO: We wish to Range check rate_idx but not sure here what to check it against.  */
+		if (band >= NUM_NL80211_BANDS) {
+			pr_info("ERROR: band index out of range: rate=%d 0x%x, band=%d, rate_idx=%d\n",
+				rate, rate,
+				band,
+				rate_idx);
+			break;
+		}
+
+		sband = local->hw.wiphy->bands[band];
+		if (!sband) {
+			pr_info("ERROR: sband is NULL: rate=%d 0x%x, band=%d, rate_idx=%d\n",
+				rate, rate,
+				band,
+				rate_idx);
+			break;
+		}
 
 		sband = local->hw.wiphy->bands[band];
 
-		if (WARN_ON_ONCE(!sband->bitrates))
+		if (WARN_ON_ONCE(!sband)) {
+			pr_err("stats-decode-rate, sband is null, band: %d  rate: 0x%x\n",
+			       band, rate);
 			break;
+		}
+
+		if (WARN_ON_ONCE(!sband) || (band >= NUM_NL80211_BANDS)) {
+			pr_err("stats-decode-rate, sband is invalid: %p, band: %d  rate: 0x%x\n",
+			       sband, band, rate);
+			break;
+		}
+
+		if (WARN_ON_ONCE(!sband->bitrates)) {
+			pr_err("stats-decode-rate, sband bitrates is null, sband: %p, band: %d  rate: 0x%x\n",
+			       sband, band, rate);
+			break;
+		}
+
+		if (WARN_ON_ONCE(rate_idx >= sband->n_bitrates)) {
+			pr_err("stats-decode-rate, sband rate-idx: %d is > %d, sband: %p, band: %d  rate: 0x%x\n",
+			       rate_idx, sband->n_bitrates, sband, band, rate);
+			break;
+		}
+
 
 		brate = sband->bitrates[rate_idx].bitrate;
 		if (rinfo->bw == RATE_INFO_BW_5)
@@ -2478,6 +2644,18 @@ static int sta_set_rate_info_rx(struct sta_info *sta, struct rate_info *rinfo)
 		return -EINVAL;
 
 	sta_stats_decode_rate(sta->local, rate, rinfo);
+	return 0;
+}
+
+int link_sta_set_rate_info_rx(struct link_sta_info *link_sta, struct rate_info *rinfo,
+			      struct ieee80211_sta_rx_stats* lastrx)
+{
+	u32 rate = READ_ONCE(lastrx->last_rate);
+
+	if (rate == STA_STATS_RATE_INVALID)
+		return -EINVAL;
+
+	sta_stats_decode_rate(link_sta->sta->local, rate, rinfo);
 	return 0;
 }
 
@@ -2714,6 +2892,7 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo,
 	if (last_rxstats->chains &&
 	    !(sinfo->filled & (BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL) |
 			       BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL_AVG)))) {
+		/* Neither chain signal nor chain signal avg is filled */
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL);
 		if (!sta->deflink.pcpu_rx_stats)
 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL_AVG);
@@ -2728,16 +2907,29 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo,
 		}
 	}
 
+	/* Check if chain signal is not filled, for cases avg was filled by
+	 * driver bug last chain signal was not.
+	 */
+	if (last_rxstats->chains &&
+		 !(sinfo->filled & (BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL)))) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL);
+
+		sinfo->chains = last_rxstats->chains;
+
+		for (i = 0; i < ARRAY_SIZE(sinfo->chain_signal); i++) {
+			sinfo->chain_signal[i] =
+				last_rxstats->chain_signal_last[i];
+		}
+	}
+
 	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_BITRATE)) &&
-	    !sta->sta.valid_links &&
 	    ieee80211_rate_valid(&sta->deflink.tx_stats.last_rate)) {
 		sta_set_rate_info_tx(sta, &sta->deflink.tx_stats.last_rate,
 				     &sinfo->txrate);
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
 	}
 
-	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_RX_BITRATE)) &&
-	    !sta->sta.valid_links) {
+	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_RX_BITRATE))) {
 		if (sta_set_rate_info_rx(sta, &sinfo->rxrate) == 0)
 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
 	}
@@ -2875,6 +3067,64 @@ static void sta_update_codel_params(struct sta_info *sta, u32 thr)
 		sta->cparams.interval = MS2TIME(100);
 		sta->cparams.ecn = true;
 	}
+}
+
+void link_sta_accum_rx_stats(struct ieee80211_sta_rx_stats *ncpu_rx_stats,
+			     struct ieee80211_sta_rx_stats *pcpu,
+			     struct ieee80211_sta_rx_stats *rx_stats)
+{
+	int cpu;
+	int i;
+
+	memcpy(rx_stats, ncpu_rx_stats, sizeof(*rx_stats));
+
+	if (!pcpu)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct ieee80211_sta_rx_stats *cpurxs;
+
+		cpurxs = per_cpu_ptr(pcpu, cpu);
+		rx_stats->packets += cpurxs->packets;
+		if (time_after(cpurxs->last_rx, rx_stats->last_rx)) {
+			rx_stats->last_rx = cpurxs->last_rx;
+			rx_stats->last_signal = cpurxs->last_signal;
+			for (i = 0; i<IEEE80211_MAX_CHAINS; i++)
+				rx_stats->chain_signal_last[i] = cpurxs->chain_signal_last[i];
+			rx_stats->last_rate = cpurxs->last_rate;
+		}
+		rx_stats->num_duplicates += cpurxs->num_duplicates;
+		rx_stats->fragments += cpurxs->fragments;
+		rx_stats->dropped += cpurxs->dropped;
+		rx_stats->bytes += sta_get_stats_bytes(cpurxs);
+		for (i = 0; i<=IEEE80211_NUM_TIDS; i++) {
+			rx_stats->msdu[i] += sta_get_tidstats_msdu(cpurxs, i);
+		}
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+		rx_stats->msdu_20 += cpurxs->msdu_20;
+		rx_stats->msdu_40 += cpurxs->msdu_40;
+		rx_stats->msdu_80 += cpurxs->msdu_80;
+		rx_stats->msdu_160 += cpurxs->msdu_160;
+		for (i = 0; i<NL80211_RATE_INFO_HE_RU_ALLOC_LAST; i++)
+			rx_stats->msdu_he_ru_alloc[i] += cpurxs->msdu_he_ru_alloc[i];
+		rx_stats->msdu_he_tot += cpurxs->msdu_he_tot;
+		rx_stats->msdu_vht += cpurxs->msdu_vht;
+		rx_stats->msdu_ht += cpurxs->msdu_ht;
+		rx_stats->msdu_legacy += cpurxs->msdu_legacy;
+		for (i = 0; i < ARRAY_SIZE(rx_stats->msdu_nss); i++)
+			rx_stats->msdu_nss[i] += cpurxs->msdu_nss[i];
+		for (i = 0; i < ARRAY_SIZE(rx_stats->msdu_rate_idx); i++)
+			rx_stats->msdu_rate_idx[i] += cpurxs->msdu_rate_idx[i];
+#endif
+	}
+}
+
+void sta_accum_rx_stats(struct sta_info *sta,
+			struct ieee80211_sta_rx_stats *rx_stats)
+{
+	return link_sta_accum_rx_stats(&sta->deflink.rx_stats,
+				       sta->deflink.pcpu_rx_stats,
+				       rx_stats);
 }
 
 void ieee80211_sta_set_expected_throughput(struct ieee80211_sta *pubsta,

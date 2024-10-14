@@ -36,6 +36,32 @@
 #include "wpa.h"
 #include "wme.h"
 #include "rate.h"
+#include <linux/moduleparam.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,13,0)
+static inline void ieee80211_tx_stats(struct net_device *dev, u32 len)
+{
+       struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+
+       u64_stats_update_begin(&tstats->syncp);
+       tstats->tx_packets++;
+       tstats->tx_bytes += len;
+       u64_stats_update_end(&tstats->syncp);
+}
+#define dev_sw_netstats_tx_add(a,b,c) ieee80211_tx_stats(a, c)
+#endif
+
+
+/*
+ * Maximum number of skbs that may be queued in a pending
+ * queue.  After that, packets will just be dropped.
+ */
+static int max_pending_qsize = 1000;
+module_param(max_pending_qsize, int, 0644);
+MODULE_PARM_DESC(max_pending_qsize,
+		 "Maximum number of skbs that may be queued in a pending queue.");
+
 
 /* misc utils */
 
@@ -746,15 +772,16 @@ ieee80211_tx_h_rate_ctrl(struct ieee80211_tx_data *tx)
 	 * Lets not bother rate control if we're associated and cannot
 	 * talk to the sta. This should not happen.
 	 */
-	if (WARN(test_bit(SCAN_SW_SCANNING, &tx->local->scanning) && assoc &&
-		 !rate_usable_index_exists(sband, &tx->sta->sta),
-		 "%s: Dropped data frame as no usable bitrate found while "
-		 "scanning and associated. Target station: "
-		 "%pM on %d GHz band\n",
-		 tx->sdata->name,
-		 encap ? ((struct ethhdr *)hdr)->h_dest : hdr->addr1,
-		 info->band ? 5 : 2))
+	if (unlikely(test_bit(SCAN_SW_SCANNING, &tx->local->scanning) && assoc &&
+		     !rate_usable_index_exists(sband, &tx->sta->sta))) {
+		net_info_ratelimited("%s: Dropped data frame as no usable bitrate found while "
+				     "scanning and associated. Target station: "
+				     "%pM on %d GHz band\n",
+				     tx->sdata->name,
+				     encap ? ((struct ethhdr *)hdr)->h_dest : hdr->addr1,
+				     info->band ? 5 : 2);
 		return TX_DROP;
+	}
 
 	/*
 	 * If we're associated with the sta at this point we know we can at
@@ -1081,6 +1108,10 @@ ieee80211_tx_h_calculate_duration(struct ieee80211_tx_data *tx)
 	struct ieee80211_hdr *hdr;
 	int next_len;
 	bool group_addr;
+
+	/* Don't modify injected packets */
+	if (unlikely(tx->sdata->vif.type == NL80211_IFTYPE_MONITOR))
+		return TX_CONTINUE;
 
 	skb_queue_walk(&tx->skbs, skb) {
 		hdr = (void *) skb->data;
@@ -1707,6 +1738,15 @@ static bool ieee80211_tx_frags(struct ieee80211_local *local,
 					ieee80211_purge_tx_queue(&local->hw,
 								 skbs);
 					return true;
+				} else if (!txpending) {
+					u32 len = skb_queue_len(&local->pending[q]);
+					if (len >= max_pending_qsize) {
+						__skb_unlink(skb, skbs);
+						spin_unlock_irqrestore(&local->queue_stop_reason_lock,
+								       flags);
+						ieee80211_free_txskb(&local->hw, skb);
+						continue; /* process next skb in list */
+					}
 				}
 			} else {
 
@@ -1715,15 +1755,29 @@ static bool ieee80211_tx_frags(struct ieee80211_local *local,
 				 * later transmission from the tx-pending
 				 * tasklet when the queue is woken again.
 				 */
-				if (txpending)
+				bool do_free = false;
+				if (txpending) {
 					skb_queue_splice_init(skbs,
 							      &local->pending[q]);
-				else
-					skb_queue_splice_tail_init(skbs,
-								   &local->pending[q]);
+				} else {
+					u32 len = skb_queue_len(&local->pending[q]);
+					if (len >= max_pending_qsize) {
+						__skb_unlink(skb, skbs);
+						do_free = true;
+					} else {
+						skb_queue_splice_tail_init(skbs,
+									   &local->pending[q]);
+					}
+				}
 
 				spin_unlock_irqrestore(&local->queue_stop_reason_lock,
 						       flags);
+				if (do_free) {
+					/* TODO:  Add counter for this */
+					ieee80211_free_txskb(&local->hw, skb);
+					continue;
+				}
+
 				return false;
 			}
 		}
@@ -2058,6 +2112,18 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
 		}
 	}
 
+	/* This check needs to go in before the QoS header is set below. */
+	if (skb->priority > 7 ||
+	    skb->queue_mapping != ieee802_1d_to_ac[skb->priority]) {
+		WARN_ONCE(1, "Invalid queue-mapping, priority: %i  queue-mapping: %i.  This is an expected warning if you are using pktgen, but otherwise may indicate a bug.\n",
+			  (int)(skb->priority), (int)(skb->queue_mapping));
+		/* Adjust queue-mapping to match what the wifi stack expects.
+		 * pktgen will just have to set QoS bits accordingly instead
+		 * of trying to set the queue_mapping directly.
+		 */
+		skb_set_queue_mapping(skb, ieee80211_select_queue(sdata, sta, skb));
+	}
+
 	ieee80211_set_qos_hdr(sdata, skb);
 	ieee80211_tx(sdata, sta, skb, false);
 }
@@ -2068,16 +2134,25 @@ static bool ieee80211_validate_radiotap_len(struct sk_buff *skb)
 		(struct ieee80211_radiotap_header *)skb->data;
 
 	/* check for not even having the fixed radiotap header part */
-	if (unlikely(skb->len < sizeof(struct ieee80211_radiotap_header)))
+	if (unlikely(skb->len < sizeof(struct ieee80211_radiotap_header))) {
+		pr_info("parse-tx-radiotap:  len too small: %d < %d\n",
+			skb->len, (int)(sizeof(struct ieee80211_radiotap_header)));
 		return false; /* too short to be possibly valid */
+	}
 
 	/* is it a header version we can trust to find length from? */
-	if (unlikely(rthdr->it_version))
+	if (unlikely(rthdr->it_version)) {
+		pr_info("parse-tx-radiotap:  it_version is not zero %d\n",
+			rthdr->it_version);
 		return false; /* only version 0 is supported */
+	}
 
 	/* does the skb contain enough to deliver on the alleged length? */
-	if (unlikely(skb->len < ieee80211_get_radiotap_len(skb->data)))
+	if (unlikely(skb->len < ieee80211_get_radiotap_len(skb->data))) {
+		pr_info("parse-tx-radiotap:  too short for rt len: %d < %d\n",
+			skb->len, ieee80211_get_radiotap_len(skb->data));
 		return false; /* skb too short for claimed rt header extent */
+	}
 
 	return true;
 }
@@ -2137,8 +2212,10 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 				 * because it will be recomputed and added
 				 * on transmission
 				 */
-				if (skb->len < (iterator._max_length + FCS_LEN))
+				if (skb->len < (iterator._max_length + FCS_LEN)) {
+					pr_info("parse-tx-radiotap:  fcs bad\n");
 					return false;
+				}
 
 				skb_trim(skb, skb->len - FCS_LEN);
 			}
@@ -2248,8 +2325,10 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 		}
 	}
 
-	if (ret != -ENOENT) /* ie, if we didn't simply run out of fields */
+	if (ret != -ENOENT) { /* ie, if we didn't simply run out of fields */
+		pr_info("parse-tx-radiotap:  ret != ENOENT\n");
 		return false;
+	}
 
 	if (rate_found) {
 		struct ieee80211_supported_band *sband =
@@ -2319,8 +2398,10 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 		      IEEE80211_TX_CTL_INJECTED;
 
 	/* Sanity-check the length of the radiotap header */
-	if (!ieee80211_validate_radiotap_len(skb))
+	if (!ieee80211_validate_radiotap_len(skb)) {
+		pr_info("validate-radiotap-len failed.\n");
 		goto fail;
+	}
 
 	/* we now know there is a radiotap header with a length we can use */
 	len_rthdr = ieee80211_get_radiotap_len(skb->data);
@@ -2339,14 +2420,18 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 	skb_set_network_header(skb, len_rthdr);
 	skb_set_transport_header(skb, len_rthdr);
 
-	if (skb->len < len_rthdr + 2)
+	if (skb->len < len_rthdr + 2) {
+		pr_info("monitor start xmit, len too small: %d\n", skb->len);
 		goto fail;
+	}
 
 	hdr = (struct ieee80211_hdr *)(skb->data + len_rthdr);
 	hdrlen = ieee80211_hdrlen(hdr->frame_control);
 
-	if (skb->len < len_rthdr + hdrlen)
+	if (skb->len < len_rthdr + hdrlen) {
+		pr_info("monitor start xmit, len2 too small: %d\n", skb->len);
 		goto fail;
+	}
 
 	/*
 	 * Initialize skb->protocol if the injected frame is a data frame
@@ -2393,10 +2478,12 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 				rcu_dereference(tmp_sdata->vif.bss_conf.chanctx_conf);
 	}
 
-	if (chanctx_conf)
+	if (chanctx_conf) {
 		chandef = &chanctx_conf->def;
-	else
+	} else {
+		pr_info("monitor start xmit, chandef not found\n");
 		goto fail_rcu;
+	}
 
 	/*
 	 * If driver/HW supports IEEE80211_CHAN_CAN_MONITOR we still
@@ -2423,8 +2510,10 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 	 * monitor flag interfaces used for AP support.
 	 */
 	if (!cfg80211_reg_can_beacon(local->hw.wiphy, chandef,
-				     sdata->vif.type))
+				     sdata->vif.type)) {
+		pr_info("monitor start xmit, cannot beacon\n");
 		goto fail_rcu;
+	}
 
 	info->band = chandef->chan->band;
 
@@ -5963,7 +6052,10 @@ int ieee80211_reserve_tid(struct ieee80211_sta *pubsta, u8 tid)
 	struct ieee80211_sub_if_data *sdata = sta->sdata;
 	struct ieee80211_local *local = sdata->local;
 	int ret;
-	u32 queues;
+	unsigned long queues[IEEE80211_MAX_QUEUE_MAP_CNT] = { 0, 0, 0 };
+	int idx, bit;
+
+	ieee80211_get_vif_queues(local, sdata, queues);
 
 	lockdep_assert_wiphy(local->hw.wiphy);
 
@@ -6004,7 +6096,9 @@ int ieee80211_reserve_tid(struct ieee80211_sta *pubsta, u8 tid)
 					       AGG_STOP_LOCAL_REQUEST);
 	}
 
-	queues = BIT(sdata->vif.hw_queue[ieee802_1d_to_ac[tid]]);
+	idx = sdata->vif.hw_queue[ieee802_1d_to_ac[tid]] / BITS_PER_LONG;
+	bit = sdata->vif.hw_queue[ieee802_1d_to_ac[tid]] - (idx * BITS_PER_LONG);
+	queues[idx] = 1L << bit;
 	__ieee80211_flush_queues(local, sdata, queues, false);
 
 	sta->reserved_tid = tid;

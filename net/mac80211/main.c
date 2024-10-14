@@ -5,7 +5,7 @@
  * Copyright 2006-2007	Jiri Benc <jbenc@suse.cz>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
  * Copyright (C) 2017     Intel Deutschland GmbH
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  */
 
 #include <net/mac80211.h>
@@ -167,6 +167,8 @@ static u32 ieee80211_calc_hw_conf_chan(struct ieee80211_local *local,
 	}
 
 	power = ieee80211_chandef_max_power(&chandef);
+	if (local->user_power_level != IEEE80211_UNSET_POWER_LEVEL)
+		power = min(local->user_power_level, power);
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
@@ -724,8 +726,13 @@ ieee80211_default_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 	},
 	[NL80211_IFTYPE_P2P_DEVICE] = {
 		.tx = 0xffff,
+		/*
+		 * To support P2P PASN pairing let user space register to rx
+		 * also AUTH frames on P2P device interface.
+		 */
 		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
-			BIT(IEEE80211_STYPE_PROBE_REQ >> 4),
+			BIT(IEEE80211_STYPE_PROBE_REQ >> 4) |
+			BIT(IEEE80211_STYPE_AUTH >> 4),
 	},
 };
 
@@ -750,6 +757,7 @@ static const struct ieee80211_ht_cap mac80211_ht_capa_mod_mask = {
 static const struct ieee80211_vht_cap mac80211_vht_capa_mod_mask = {
 	.vht_cap_info =
 		cpu_to_le32(IEEE80211_VHT_CAP_RXLDPC |
+			    IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
 			    IEEE80211_VHT_CAP_SHORT_GI_80 |
 			    IEEE80211_VHT_CAP_SHORT_GI_160 |
 			    IEEE80211_VHT_CAP_RXSTBC_MASK |
@@ -803,8 +811,13 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
 			    !ops->remove_chanctx ||
 			    !ops->change_chanctx ||
 			    !ops->assign_vif_chanctx ||
-			    !ops->unassign_vif_chanctx))
+			    !ops->unassign_vif_chanctx)) {
+			pr_err("ops->add_chanctx: %p  remove_chanctx: %p change_chanctx: %p  assign-vif-chanctx: %p  unassign-vif-chanctx: %p\n",
+			       ops->add_chanctx, ops->remove_chanctx,
+			       ops->change_chanctx, ops->assign_vif_chanctx,
+			       ops->unassign_vif_chanctx);
 			return NULL;
+		}
 		emulate_chanctx = false;
 	}
 
@@ -1123,8 +1136,10 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 
 	if (ieee80211_hw_check(hw, QUEUE_CONTROL) &&
 	    (local->hw.offchannel_tx_hw_queue == IEEE80211_INVAL_HW_QUEUE ||
-	     local->hw.offchannel_tx_hw_queue >= local->hw.queues))
+	     local->hw.offchannel_tx_hw_queue >= local->hw.queues)) {
+		pr_err("queue-ctrl mismatch.\n");
 		return -EINVAL;
+	}
 
 	if ((hw->wiphy->features & NL80211_FEATURE_TDLS_CHANNEL_SWITCH) &&
 	    (!local->ops->tdls_channel_switch ||
@@ -1185,8 +1200,10 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	}
 
 #ifdef CONFIG_PM
-	if (hw->wiphy->wowlan && (!local->ops->suspend || !local->ops->resume))
+	if (hw->wiphy->wowlan && (!local->ops->suspend || !local->ops->resume)) {
+		pr_err("wowlan mismatch.\n");
 		return -EINVAL;
+	}
 #endif
 
 	if (local->emulate_chanctx) {
@@ -1195,8 +1212,10 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 
 			comb = &local->hw.wiphy->iface_combinations[i];
 
-			if (comb->num_different_channels > 1)
+			if (comb->num_different_channels > 1) {
+				pr_err("num-diff-channels: %d > 1\n", comb->num_different_channels);
 				return -EINVAL;
+			}
 		}
 	}
 
@@ -1307,8 +1326,10 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 
 		/* HT, VHT, HE require QoS, thus >= 4 queues */
 		if (WARN_ON(local->hw.queues < IEEE80211_NUM_ACS &&
-			    (supp_ht || supp_vht || supp_he)))
+			    (supp_ht || supp_vht || supp_he))) {
+			pr_err("not enough queues for ht/vht/HE\n");
 			return -EINVAL;
+		}
 
 		/* EHT requires HE support */
 		if (WARN_ON(supp_eht && !supp_he))
@@ -1341,7 +1362,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
 	hw->wiphy->software_iftypes |= BIT(NL80211_IFTYPE_MONITOR);
 
-
 	local->int_scan_req = kzalloc(sizeof(*local->int_scan_req) +
 				      sizeof(void *) * channels, GFP_KERNEL);
 	if (!local->int_scan_req)
@@ -1373,6 +1393,7 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	} else if (ieee80211_hw_check(&local->hw, SIGNAL_UNSPEC)) {
 		local->hw.wiphy->signal_type = CFG80211_SIGNAL_TYPE_UNSPEC;
 		if (hw->max_signal <= 0) {
+			pr_err("max_signal: %d < 0\n", hw->max_signal);
 			result = -EINVAL;
 			goto fail_workqueue;
 		}

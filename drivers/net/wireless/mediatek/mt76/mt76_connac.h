@@ -430,7 +430,7 @@ u16 mt76_connac2_mac_tx_rate_val(struct mt76_phy *mphy,
 				 struct ieee80211_vif *vif,
 				 bool beacon, bool mcast);
 bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
-			       __le32 *txs_data);
+			       __le32 *txs_data, struct ieee80211_tx_info *info);
 bool mt76_connac2_mac_add_txs_skb(struct mt76_dev *dev, struct mt76_wcid *wcid,
 				  int pid, __le32 *txs_data);
 void mt76_connac2_mac_decode_he_radiotap(struct mt76_dev *dev,
@@ -441,12 +441,16 @@ int mt76_connac2_reverse_frag0_hdr_trans(struct ieee80211_vif *vif,
 int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
 				  struct mt76_rx_status *status,
 				  struct ieee80211_supported_band *sband,
-				  __le32 *rxv, u8 *mode);
+				  __le32 *rxv, u8 *mode, u8 *nss,
+				  struct mt76_mib_stats *mib,
+				  struct mt76_sta_stats *stats);
 void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi);
 void mt76_connac2_txwi_free(struct mt76_dev *dev, struct mt76_txwi_cache *t,
 			    struct ieee80211_sta *sta,
-			    struct list_head *free_list);
-void mt76_connac2_tx_token_put(struct mt76_dev *dev);
+			    struct list_head *free_list,
+			    u32 tx_cnt, u32 tx_status, u32 ampdu,
+			    struct mt76_mib_stats *mib);
+void mt76_connac2_tx_token_put(struct mt76_dev *dev, struct mt76_mib_stats *mib);
 
 /* connac3 */
 void mt76_connac3_mac_decode_he_radiotap(struct sk_buff *skb, __le32 *rxv,

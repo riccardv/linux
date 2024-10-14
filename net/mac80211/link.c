@@ -117,6 +117,62 @@ static void ieee80211_free_links(struct ieee80211_sub_if_data *sdata,
 		kfree(links[link_id]);
 }
 
+/* For cases where we need a link for stats and such, and just want
+ * a 'good' one.
+ */
+struct sta_info *
+ieee80211_find_best_sta_link(struct ieee80211_sub_if_data *sdata,
+			     struct ieee80211_link_data **link)
+{
+	struct ieee80211_link_data *best_link = NULL;
+	struct sta_info *best_sta = NULL;
+	int i;
+
+	for (i = 0; i < IEEE80211_MLD_MAX_NUM_LINKS; i++) {
+		struct ieee80211_link_data *link1;
+		struct sta_info *sta1;
+		bool sta1_better = false;
+
+		link1 = sdata_dereference(sdata->link[i], sdata);
+		if (!link1)
+			continue;
+		if (!best_link) {
+			best_link = link1;
+			best_sta = sta_info_get_bss(sdata, best_link->u.mgd.bssid);
+			continue;
+		}
+
+		sta1 = sta_info_get_bss(sdata, link1->u.mgd.bssid);
+		if (!sta1)
+			continue;
+
+		/* we have two potential best links, find one we like best. */
+		if (!best_sta || sta1->sta_state > best_sta->sta_state) {
+			sta1_better = true;
+		} else if (sta1->sta_state == best_sta->sta_state) {
+			u32 freq_best = 0;
+			u32 freq1 = 0;
+
+			if (best_link->conf->chanreq.oper.chan)
+				freq_best = best_link->conf->chanreq.oper.chan->center_freq;
+			if (link1->conf->chanreq.oper.chan)
+				freq1 = link1->conf->chanreq.oper.chan->center_freq;
+			if (freq1 > freq_best)
+				sta1_better = true;
+		}
+
+		if (sta1_better) {
+			best_sta = sta1;
+			best_link = link1;
+		}
+	}
+
+	*link = best_link;
+	if (best_link)
+		return sta_info_get_bss(sdata, best_link->u.mgd.bssid);
+	return sta_info_get_bss(sdata, sdata->deflink.u.mgd.bssid);
+}
+
 static int ieee80211_check_dup_link_addrs(struct ieee80211_sub_if_data *sdata)
 {
 	unsigned int i, j;
@@ -171,7 +227,9 @@ static void ieee80211_set_vif_links_bitmaps(struct ieee80211_sub_if_data *sdata,
 		if (sdata->vif.active_links)
 			break;
 		sdata->vif.active_links = valid_links & ~dormant_links;
-		WARN_ON(hweight16(sdata->vif.active_links) > 1);
+		if (WARN_ON(hweight16(sdata->vif.active_links) > 1))
+			sdata_err(sdata, "ERROR: set-vif-links-bitmaps: too many active-links,  valid_links: 0x%x  dormant_links: 0x%x  active_links: 0x%x\n",
+				  valid_links, dormant_links, sdata->vif.active_links);
 		break;
 	default:
 		WARN_ON(1);
@@ -180,7 +238,8 @@ static void ieee80211_set_vif_links_bitmaps(struct ieee80211_sub_if_data *sdata,
 
 static int ieee80211_vif_update_links(struct ieee80211_sub_if_data *sdata,
 				      struct link_container **to_free,
-				      u16 new_links, u16 dormant_links)
+				      u16 new_links, u16 dormant_links,
+				      bool ignore_driver_failures)
 {
 	u16 old_links = sdata->vif.valid_links;
 	u16 old_active = sdata->vif.active_links;
@@ -271,13 +330,17 @@ static int ieee80211_vif_update_links(struct ieee80211_sub_if_data *sdata,
 	}
 
 	if (ret) {
-		/* restore config */
-		memcpy(sdata->link, old_data, sizeof(old_data));
-		memcpy(sdata->vif.link_conf, old, sizeof(old));
-		ieee80211_set_vif_links_bitmaps(sdata, old_links, dormant_links);
-		/* and free (only) the newly allocated links */
-		memset(to_free, 0, sizeof(links));
-		goto free;
+		sdata_info(sdata, "driver error applying links: %d  Restoring old configuration, old_links: 0x%x  dormant_links: 0x%x requested new_links: 0x%x ignore-driver-failures: %d\n",
+			   ret, old_links, dormant_links, new_links, ignore_driver_failures);
+		if (!ignore_driver_failures) {
+			/* restore config */
+			memcpy(sdata->link, old_data, sizeof(old_data));
+			memcpy(sdata->vif.link_conf, old, sizeof(old));
+			ieee80211_set_vif_links_bitmaps(sdata, old_links, dormant_links);
+			/* and free (only) the newly allocated links */
+			memset(to_free, 0, sizeof(links));
+			goto free;
+		}
 	}
 
 	/* use deflink/bss_conf again if and only if there are no more links */
@@ -298,13 +361,14 @@ deinit:
 }
 
 int ieee80211_vif_set_links(struct ieee80211_sub_if_data *sdata,
-			    u16 new_links, u16 dormant_links)
+			    u16 new_links, u16 dormant_links,
+			    bool ignore_driver_failures)
 {
 	struct link_container *links[IEEE80211_MLD_MAX_NUM_LINKS];
 	int ret;
 
 	ret = ieee80211_vif_update_links(sdata, links, new_links,
-					 dormant_links);
+					 dormant_links, ignore_driver_failures);
 	ieee80211_free_links(sdata, links);
 
 	return ret;

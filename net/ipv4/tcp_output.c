@@ -1196,7 +1196,10 @@ void tcp_wfree(struct sk_buff *skb)
 	/* Keep one reference on sk_wmem_alloc.
 	 * Will be released by sk_free() from here or tcp_tasklet_func()
 	 */
-	WARN_ON(refcount_sub_and_test(skb->truesize - 1, &sk->sk_wmem_alloc));
+	if (WARN_ON(refcount_sub_and_test(skb->truesize - 1, &sk->sk_wmem_alloc))) {
+		pr_err("skb->truesize: %d  sk_wmem_alloc: %d\n",
+		       skb->truesize, refcount_read(&sk->sk_wmem_alloc));
+	}
 
 	/* If this softirq is serviced by ksoftirqd, we are likely under stress.
 	 * Wait until our queues (qdisc + devices) are drained.
@@ -2608,7 +2611,8 @@ static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 
 	limit = max_t(unsigned long,
 		      2 * skb->truesize,
-		      READ_ONCE(sk->sk_pacing_rate) >> READ_ONCE(sk->sk_pacing_shift));
+		      sock_net(sk)->ipv4.sysctl_tcp_tsq_limit_output_interval *
+		      (READ_ONCE(sk->sk_pacing_rate) >> READ_ONCE(sk->sk_pacing_shift)));
 	if (sk->sk_pacing_status == SK_PACING_NONE)
 		limit = min_t(unsigned long, limit,
 			      READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_limit_output_bytes));

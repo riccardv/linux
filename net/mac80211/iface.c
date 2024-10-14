@@ -15,7 +15,10 @@
 #include <linux/if_arp.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 #include <linux/kcov.h>
+#endif
 #include <net/mac80211.h>
 #include <net/ieee80211_radiotap.h>
 #include "ieee80211_i.h"
@@ -67,7 +70,6 @@ bool __ieee80211_recalc_txpower(struct ieee80211_sub_if_data *sdata)
 
 	if (power != sdata->vif.bss_conf.txpower) {
 		sdata->vif.bss_conf.txpower = power;
-		ieee80211_hw_config(sdata->local, 0);
 		return true;
 	}
 
@@ -249,6 +251,45 @@ unlock:
 	return ret;
 }
 
+static void __ieee80211_if_add_hash(struct ieee80211_sub_if_data *sdata)
+{
+	struct ieee80211_local *local = sdata->local;
+	int idx = STA_HASH(sdata->vif.addr);
+
+	lockdep_assert_held(&local->iflist_mtx);
+	sdata->hnext = local->sdata_hash[idx];
+	rcu_assign_pointer(local->sdata_hash[idx], sdata);
+}
+
+static int __ieee80211_if_remove_hash(struct ieee80211_sub_if_data *sdata)
+{
+	struct ieee80211_sub_if_data *s;
+	struct ieee80211_local *local = sdata->local;
+	int idx = STA_HASH(sdata->vif.addr);
+
+	lockdep_assert_held(&local->iflist_mtx);
+	s = rcu_dereference_protected(local->sdata_hash[idx],
+				      lockdep_is_held(&local->iflist_mtx));
+	if (!s)
+		return -ENOENT;
+
+	if (s == sdata) {
+		rcu_assign_pointer(local->sdata_hash[idx], s->hnext);
+		return 0;
+	}
+
+	while (rcu_access_pointer(s->hnext) &&
+	       rcu_access_pointer(s->hnext) != sdata)
+		s = rcu_dereference_protected(s->hnext,
+					lockdep_is_held(&local->iflist_mtx));
+
+	if (rcu_access_pointer(s->hnext)) {
+		rcu_assign_pointer(s->hnext, sdata->hnext);
+		return 0;
+	}
+	return -ENOENT;
+}
+
 static int _ieee80211_change_mac(struct ieee80211_sub_if_data *sdata,
 				 void *addr)
 {
@@ -279,8 +320,14 @@ static int _ieee80211_change_mac(struct ieee80211_sub_if_data *sdata,
 	ret = eth_mac_addr(sdata->dev, sa);
 
 	if (ret == 0) {
+		mutex_lock(&sdata->local->iflist_mtx);
+		__ieee80211_if_remove_hash(sdata);
+
 		memcpy(sdata->vif.addr, sa->sa_data, ETH_ALEN);
 		ether_addr_copy(sdata->vif.bss_conf.addr, sdata->vif.addr);
+
+		__ieee80211_if_add_hash(sdata);
+		mutex_unlock(&sdata->local->iflist_mtx);
 	}
 
 	/* Regardless of eth_mac_addr() return we still want to add the
@@ -309,6 +356,8 @@ static int ieee80211_change_mac(struct net_device *dev, void *addr)
 	wiphy_lock(local->hw.wiphy);
 	ret = _ieee80211_change_mac(sdata, addr);
 	wiphy_unlock(local->hw.wiphy);
+	if (ret)
+		sdata_info(sdata, "check-concurrent-iface:  check-combinations failed: %d\n", ret);
 
 	return ret;
 }
@@ -443,17 +492,24 @@ static int ieee80211_open(struct net_device *dev)
 	int err;
 
 	/* fail early if user set an invalid address */
-	if (!is_valid_ether_addr(dev->dev_addr))
+	if (!is_valid_ether_addr(dev->dev_addr)) {
+		sdata_info(sdata, "ieee80211_open:  invalid mac: %pM\n", dev->dev_addr);
 		return -EADDRNOTAVAIL;
+	}
 
 	wiphy_lock(sdata->local->hw.wiphy);
 	err = ieee80211_check_concurrent_iface(sdata, sdata->vif.type);
-	if (err)
+	if (err) {
+		sdata_info(sdata, "ieee80211_open:  check-concurrent failed: %d\n", err);
 		goto out;
+	}
 
 	err = ieee80211_do_open(&sdata->wdev, true);
 out:
 	wiphy_unlock(sdata->local->hw.wiphy);
+
+	if (err)
+		sdata_info(sdata, "ieee80211_open:  ieee80211_do_open failed: %d\n", err);
 
 	return err;
 }
@@ -822,7 +878,7 @@ static void ieee80211_teardown_sdata(struct ieee80211_sub_if_data *sdata)
 	if (ieee80211_vif_is_mesh(&sdata->vif))
 		ieee80211_mesh_teardown_sdata(sdata);
 
-	ieee80211_vif_clear_links(sdata);
+	ieee80211_vif_clear_links(sdata, true);
 	ieee80211_link_stop(&sdata->deflink);
 }
 
@@ -1484,6 +1540,12 @@ static void ieee80211_iface_process_skb(struct ieee80211_local *local,
 		struct sta_info *sta;
 		int len = skb->len;
 
+		int barv = drv_consume_block_ack(local, sdata, skb);
+
+		/*pr_err("called drv_consume_blockack, rv: %d\n", barv);*/
+		if (barv == 0)
+			return;
+
 		sta = sta_info_get_bss(sdata, mgmt->sa);
 		if (sta) {
 			switch (mgmt->u.action.u.addba_req.action_code) {
@@ -1649,7 +1711,9 @@ static void ieee80211_iface_work(struct wiphy *wiphy, struct wiphy_work *work)
 
 	/* first process frames */
 	while ((skb = skb_dequeue(&sdata->skb_queue))) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 		kcov_remote_start_common(skb_get_kcov_handle(skb));
+#endif
 
 		if (skb->protocol == cpu_to_be16(ETH_P_TDLS))
 			ieee80211_process_tdls_channel_switch(sdata, skb);
@@ -1657,7 +1721,9 @@ static void ieee80211_iface_work(struct wiphy *wiphy, struct wiphy_work *work)
 			ieee80211_iface_process_skb(local, sdata, skb);
 
 		kfree_skb(skb);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
 		kcov_remote_stop();
+#endif
 	}
 
 	/* process status queue */
@@ -2217,6 +2283,7 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
 
 	mutex_lock(&local->iflist_mtx);
 	list_add_tail_rcu(&sdata->list, &local->interfaces);
+	__ieee80211_if_add_hash(sdata);
 	mutex_unlock(&local->iflist_mtx);
 
 	if (new_wdev)
@@ -2232,6 +2299,7 @@ void ieee80211_if_remove(struct ieee80211_sub_if_data *sdata)
 
 	mutex_lock(&sdata->local->iflist_mtx);
 	list_del_rcu(&sdata->list);
+	__ieee80211_if_remove_hash(sdata);
 	mutex_unlock(&sdata->local->iflist_mtx);
 
 	if (sdata->vif.txq)

@@ -264,8 +264,10 @@ static int ieee80211_start_p2p_device(struct wiphy *wiphy,
 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
 
 	ret = ieee80211_check_combinations(sdata, NULL, 0, 0, -1);
-	if (ret < 0)
+	if (ret < 0) {
+		sdata_info(sdata, "start-p2p-device:  check-combinations failed: %d\n", ret);
 		return ret;
+	}
 
 	return ieee80211_do_open(wdev, true);
 }
@@ -286,8 +288,10 @@ static int ieee80211_start_nan(struct wiphy *wiphy,
 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
 
 	ret = ieee80211_check_combinations(sdata, NULL, 0, 0, -1);
-	if (ret < 0)
+	if (ret < 0) {
+		sdata_info(sdata, "start-nan:  check-combinations failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = ieee80211_do_open(wdev, true);
 	if (ret)
@@ -474,11 +478,15 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 
 	lockdep_assert_wiphy(local->hw.wiphy);
 
-	if (!ieee80211_sdata_running(sdata))
+	if (!ieee80211_sdata_running(sdata)) {
+		sdata_info(sdata, "add-key failed, sdata is not running.\n");
 		return -ENETDOWN;
+	}
 
-	if (IS_ERR(link))
+	if (IS_ERR(link)) {
+		sdata_info(sdata, "add-key failed, link is error: %p", link);
 		return PTR_ERR(link);
+	}
 
 	if (pairwise && params->mode == NL80211_KEY_SET_TX)
 		return ieee80211_set_tx(sdata, mac_addr, key_idx);
@@ -488,10 +496,14 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 	case WLAN_CIPHER_SUITE_WEP40:
 	case WLAN_CIPHER_SUITE_TKIP:
 	case WLAN_CIPHER_SUITE_WEP104:
-		if (link_id >= 0)
+		if (link_id >= 0) {
+			sdata_info(sdata, "add-key failed, link-id >= 0: %d.\n", link_id);
 			return -EINVAL;
-		if (WARN_ON_ONCE(fips_enabled))
+		}
+		if (WARN_ON_ONCE(fips_enabled)) {
+			sdata_info(sdata, "add-key failed, wep/tkip, wep failed.\n");
 			return -EINVAL;
+		}
 		break;
 	default:
 		break;
@@ -499,8 +511,10 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 
 	key = ieee80211_key_alloc(params->cipher, key_idx, params->key_len,
 				  params->key, params->seq_len, params->seq);
-	if (IS_ERR(key))
+	if (IS_ERR(key)) {
+		sdata_info(sdata, "add-key failed, key-alloc failed: %ld\n", PTR_ERR(key));
 		return PTR_ERR(key);
+	}
 
 	key->conf.link_id = link_id;
 
@@ -524,6 +538,9 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 		 */
 		if (!sta || !test_sta_flag(sta, WLAN_STA_ASSOC)) {
 			ieee80211_key_free_unused(key);
+			sdata_info(sdata, "add-key failed, FT key-set called before association completed?  Supplicant can retry, sta: %p  assoc: %d...\n",
+				   sta, sta ? test_sta_flag(sta, WLAN_STA_ASSOC) : -1);
+
 			return -ENOENT;
 		}
 	}
@@ -1211,6 +1228,8 @@ ieee80211_assign_beacon(struct ieee80211_sub_if_data *sdata,
 	if (err == 0)
 		_changed |= BSS_CHANGED_AP_PROBE_RESP;
 
+	sdata->vif.bss_conf.he_ofdma_disable = params->he_ofdma_disable;
+
 	if (params->ftm_responder != -1) {
 		link_conf->ftm_responder = params->ftm_responder;
 		err = ieee80211_set_ftm_responder_params(sdata,
@@ -1337,8 +1356,7 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
 			      IEEE80211_HE_OPERATION_RTS_THRESHOLD_MASK);
 		changed |= BSS_CHANGED_HE_OBSS_PD;
 
-		if (params->beacon.he_bss_color.enabled)
-			changed |= BSS_CHANGED_HE_BSS_COLOR;
+		changed |= BSS_CHANGED_HE_BSS_COLOR;
 	}
 
 	if (params->he_cap) {
@@ -1385,6 +1403,7 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
 		link_conf->eht_su_beamformer = false;
 		link_conf->eht_su_beamformee = false;
 		link_conf->eht_mu_beamformer = false;
+		link_conf->eht_support = false;
 	}
 
 	if (sdata->vif.type == NL80211_IFTYPE_AP &&
@@ -1524,6 +1543,7 @@ static int ieee80211_change_beacon(struct wiphy *wiphy, struct net_device *dev,
 	int err;
 	struct ieee80211_bss_conf *link_conf;
 	u64 changed = 0;
+	bool color_en;
 
 	lockdep_assert_wiphy(wiphy);
 
@@ -1559,9 +1579,9 @@ static int ieee80211_change_beacon(struct wiphy *wiphy, struct net_device *dev,
 	if (err < 0)
 		return err;
 
-	if (beacon->he_bss_color_valid &&
-	    beacon->he_bss_color.enabled != link_conf->he_bss_color.enabled) {
-		link_conf->he_bss_color.enabled = beacon->he_bss_color.enabled;
+	color_en = beacon->he_bss_color.enabled && beacon->he_bss_color_valid;
+	if (color_en != link_conf->he_bss_color.enabled) {
+		link_conf->he_bss_color.enabled = color_en;
 		changed |= BSS_CHANGED_HE_BSS_COLOR;
 	}
 
@@ -1686,14 +1706,17 @@ static int sta_apply_auth_flags(struct ieee80211_local *local,
 				struct sta_info *sta,
 				u32 mask, u32 set)
 {
+	struct ieee80211_sub_if_data *sdata = sta->sdata;
 	int ret;
 
 	if (mask & BIT(NL80211_STA_FLAG_AUTHENTICATED) &&
 	    set & BIT(NL80211_STA_FLAG_AUTHENTICATED) &&
 	    !test_sta_flag(sta, WLAN_STA_AUTH)) {
 		ret = sta_info_move_state(sta, IEEE80211_STA_AUTH);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-auth-flags, sta-info-move-state AUTH failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	if (mask & BIT(NL80211_STA_FLAG_ASSOCIATED) &&
@@ -1708,8 +1731,10 @@ static int sta_apply_auth_flags(struct ieee80211_local *local,
 			rate_control_rate_init(sta);
 
 		ret = sta_info_move_state(sta, IEEE80211_STA_ASSOC);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-auth-flags, sta-info-move-state ASSOC failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	if (mask & BIT(NL80211_STA_FLAG_AUTHORIZED)) {
@@ -1719,24 +1744,31 @@ static int sta_apply_auth_flags(struct ieee80211_local *local,
 			ret = sta_info_move_state(sta, IEEE80211_STA_ASSOC);
 		else
 			ret = 0;
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-auth-flags, sta-info-move-state AUTH/ASSOC failed: %d, set: 0x%x\n",
+				   ret, set);
 			return ret;
+		}
 	}
 
 	if (mask & BIT(NL80211_STA_FLAG_ASSOCIATED) &&
 	    !(set & BIT(NL80211_STA_FLAG_ASSOCIATED)) &&
 	    test_sta_flag(sta, WLAN_STA_ASSOC)) {
 		ret = sta_info_move_state(sta, IEEE80211_STA_AUTH);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-auth-flags, sta-info-move-state AUTH failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	if (mask & BIT(NL80211_STA_FLAG_AUTHENTICATED) &&
 	    !(set & BIT(NL80211_STA_FLAG_AUTHENTICATED)) &&
 	    test_sta_flag(sta, WLAN_STA_AUTH)) {
 		ret = sta_info_move_state(sta, IEEE80211_STA_NONE);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-auth-flags, sta-info-move-state NONE failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	return 0;
@@ -1850,12 +1882,18 @@ static int sta_link_apply_parameters(struct ieee80211_local *local,
 		break;
 	}
 
-	if (!link || !link_sta)
+	if (!link || !link_sta) {
+		sdata_info(sdata, "sta-link-apply-parameters failed: link: %p  link_sta: %p link-id: %d link-apply-mode: %d\n",
+			   link, link_sta, link_id, mode);
+		WARN_ON(1);
 		return -EINVAL;
+	}
 
 	sband = ieee80211_get_link_sband(link);
-	if (!sband)
+	if (!sband) {
+		sdata_info(sdata, "sta-link-apply-parameters failed: sband is null\n");
 		return -EINVAL;
+	}
 
 	if (params->link_mac) {
 		if (mode == STA_LINK_MODE_NEW) {
@@ -1863,6 +1901,8 @@ static int sta_link_apply_parameters(struct ieee80211_local *local,
 			memcpy(link_sta->pub->addr, params->link_mac, ETH_ALEN);
 		} else if (!ether_addr_equal(link_sta->addr,
 					     params->link_mac)) {
+			sdata_info(sdata, "sta-link-apply-parameters failed: link-sta-addr: %pM != params->link_mac: %pM\n",
+				   link_sta->addr, params->link_mac);
 			return -EINVAL;
 		}
 	}
@@ -1874,8 +1914,11 @@ static int sta_link_apply_parameters(struct ieee80211_local *local,
 		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
 			link_sta->pub->txpwr.power = params->txpwr.power;
 		ret = drv_sta_set_txpwr(local, sdata, sta);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-link-apply-parameters failed: drv-sta-set-txpwr failed: %d\n",
+				   ret);
 			return ret;
+		}
 	}
 
 	if (params->supported_rates &&
@@ -1969,8 +2012,10 @@ static int sta_apply_parameters(struct ieee80211_local *local,
 	    !((mask & BIT(NL80211_STA_FLAG_ASSOCIATED)) &&
 	      (set & BIT(NL80211_STA_FLAG_ASSOCIATED)))) {
 		ret = sta_apply_auth_flags(local, sta, mask, set);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-parameters: apply-auth-flags (not TDLS) failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	if (mask & BIT(NL80211_STA_FLAG_SHORT_PREAMBLE)) {
@@ -2040,8 +2085,10 @@ static int sta_apply_parameters(struct ieee80211_local *local,
 
 	ret = sta_link_apply_parameters(local, sta, STA_LINK_MODE_STA_MODIFY,
 					&params->link_sta_params);
-	if (ret)
+	if (ret) {
+		sdata_info(sdata, "sta-apply-parameters: sta-link-apply-parameters failed: %d\n", ret);
 		return ret;
+	}
 
 	if (params->support_p2p_ps >= 0)
 		sta->sta.support_p2p_ps = params->support_p2p_ps;
@@ -2056,8 +2103,10 @@ static int sta_apply_parameters(struct ieee80211_local *local,
 	if (test_sta_flag(sta, WLAN_STA_TDLS_PEER) ||
 	    set & BIT(NL80211_STA_FLAG_ASSOCIATED)) {
 		ret = sta_apply_auth_flags(local, sta, mask, set);
-		if (ret)
+		if (ret) {
+			sdata_info(sdata, "sta-apply-parameters: sta-apply-auth-flags (TDLS) failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	/* Mark the STA as MLO if MLD MAC address is available */
@@ -2153,6 +2202,19 @@ static int ieee80211_del_station(struct wiphy *wiphy, struct net_device *dev,
 	return 0;
 }
 
+void ieee80211_del_all_station(struct ieee80211_hw *hw)
+{
+	struct ieee80211_local *local = hw_to_local(hw);
+	struct sta_info *sta, *tmp;
+
+	mutex_lock(&local->hw.wiphy->mtx);
+	list_for_each_entry_safe(sta, tmp, &local->sta_list, list) {
+		WARN_ON(__sta_info_destroy(sta));
+	}
+	mutex_unlock(&local->hw.wiphy->mtx);
+}
+EXPORT_SYMBOL(ieee80211_del_all_station);
+
 static int ieee80211_change_station(struct wiphy *wiphy,
 				    struct net_device *dev, const u8 *mac,
 				    struct station_parameters *params)
@@ -2166,9 +2228,14 @@ static int ieee80211_change_station(struct wiphy *wiphy,
 
 	lockdep_assert_wiphy(local->hw.wiphy);
 
+	sdata_info(sdata, "change-station: entering method link-id: %d\n",
+		   params->link_sta_params.link_id);
+
 	sta = sta_info_get_bss(sdata, mac);
-	if (!sta)
+	if (!sta) {
+		sdata_info(sdata, "change-station: Could not find bss: %pM\n", mac);
 		return -ENOENT;
+	}
 
 	switch (sdata->vif.type) {
 	case NL80211_IFTYPE_MESH_POINT:
@@ -2198,12 +2265,15 @@ static int ieee80211_change_station(struct wiphy *wiphy,
 			statype = CFG80211_STA_AP_CLIENT_UNASSOC;
 		break;
 	default:
+		sdata_info(sdata, "change-station: vif-type not supported: %d\n", sdata->vif.type);
 		return -EOPNOTSUPP;
 	}
 
 	err = cfg80211_check_station_change(wiphy, params, statype);
-	if (err)
+	if (err) {
+		sdata_info(sdata, "change-station: check-station-change failed: %d\n", err);
 		return err;
+	}
 
 	if (params->vlan && params->vlan != sta->sdata->dev) {
 		vlansdata = IEEE80211_DEV_TO_SUB_IF(params->vlan);
@@ -2236,8 +2306,11 @@ static int ieee80211_change_station(struct wiphy *wiphy,
 	}
 
 	err = sta_apply_parameters(local, sta, params);
-	if (err)
+	if (err) {
+		sdata_info(sdata, "change-station: sta-apply-parameters failed: %d link-id: %d\n",
+			   err, params->link_sta_params.link_id);
 		return err;
+	}
 
 	if (sdata->vif.type == NL80211_IFTYPE_STATION &&
 	    params->sta_flags_mask & BIT(NL80211_STA_FLAG_AUTHORIZED)) {
@@ -3046,6 +3119,7 @@ static int ieee80211_set_tx_power(struct wiphy *wiphy,
 	enum nl80211_tx_power_setting txp_type = type;
 	bool update_txp_type = false;
 	bool has_monitor = false;
+	int old_power = local->user_power_level;
 
 	lockdep_assert_wiphy(local->hw.wiphy);
 
@@ -3127,6 +3201,10 @@ static int ieee80211_set_tx_power(struct wiphy *wiphy,
 			ieee80211_recalc_txpower(sdata, update_txp_type);
 		}
 	}
+
+	if (local->emulate_chanctx &&
+	    (old_power != local->user_power_level))
+		ieee80211_hw_conf_chan(local);
 
 	return 0;
 }
@@ -3393,11 +3471,24 @@ static int ieee80211_set_bitrate_mask(struct wiphy *wiphy,
 				      struct net_device *dev,
 				      unsigned int link_id,
 				      const u8 *addr,
-				      const struct cfg80211_bitrate_mask *mask)
+				      const struct cfg80211_bitrate_mask *mask,
+				      const struct cfg80211_probe_req_config *pr_conf)
 {
 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
 	struct ieee80211_local *local = wdev_priv(dev->ieee80211_ptr);
 	int i, ret;
+
+	if (pr_conf) {
+		sdata->pr_conf.mode_disable = pr_conf->mode_disable;
+
+		if (pr_conf->is_advert_bitmask) {
+			memcpy(&sdata->cfg_advert_bitrate_mask, mask, sizeof(*mask));
+			sdata->cfg_advert_bitrate_mask_set = true;
+			/*sdata_info(sdata, "set-bitrate-mask advert, legacy[0]: 0x%x  legacy[1]: 0x%x\n",
+			  mask->control[0].legacy, mask->control[1].legacy);*/
+			return 0;
+		}
+	}
 
 	if (!ieee80211_sdata_running(sdata))
 		return -ENETDOWN;
@@ -3415,14 +3506,19 @@ static int ieee80211_set_bitrate_mask(struct wiphy *wiphy,
 
 		band = sdata->vif.bss_conf.chanreq.oper.chan->band;
 
-		if (!(mask->control[band].legacy & basic_rates))
-			return -EINVAL;
+		if (!(mask->control[band].legacy & basic_rates)) {
+			pr_err("%s:  WARNING: no legacy rates for band[%d] in set-bitrate-mask.\n",
+			       sdata->dev->name, band);
+		}
 	}
 
 	if (ieee80211_hw_check(&local->hw, HAS_RATE_CONTROL)) {
 		ret = drv_set_bitrate_mask(local, sdata, mask);
-		if (ret)
+		if (ret) {
+			// pr_err("%s: drv-set-bitrate-mask had error return: %d\n",
+			//        sdata->dev->name, ret);
 			return ret;
+		}
 	}
 
 	for (i = 0; i < NUM_NL80211_BANDS; i++) {
@@ -3472,6 +3568,8 @@ static int ieee80211_start_radar_detection(struct wiphy *wiphy,
 	lockdep_assert_wiphy(local->hw.wiphy);
 
 	if (!list_empty(&local->roc_list) || local->scanning) {
+		sdata_info(sdata, "start-radar failed, roc-list-empty: %d  scanning: %ld\n",
+			   list_empty(&local->roc_list), local->scanning);
 		err = -EBUSY;
 		goto out_unlock;
 	}
@@ -3482,9 +3580,13 @@ static int ieee80211_start_radar_detection(struct wiphy *wiphy,
 
 	err = ieee80211_link_use_channel(&sdata->deflink, &chanreq,
 					 IEEE80211_CHANCTX_SHARED);
-	if (err)
+	if (err) {
+		sdata_info(sdata, "start-radar failed, vif-use-channel check failed: %d\n",
+			   err);
 		goto out_unlock;
+	}
 
+	sdata_info(sdata, "start-radar-detection, starting dfs-cac-timer-work.\n");
 	wiphy_delayed_work_queue(wiphy, &sdata->dfs_cac_timer_work,
 				 msecs_to_jiffies(cac_time_ms));
 
@@ -4013,6 +4115,7 @@ __ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
 	/* if reservation is invalid then this will fail */
 	err = ieee80211_check_combinations(sdata, NULL, chanctx->mode, 0, -1);
 	if (err) {
+		sdata_info(sdata, "chan-switch:  check-combinations failed: %d\n", err);
 		ieee80211_link_unreserve_chanctx(link_data);
 		goto out;
 	}
@@ -4971,7 +5074,7 @@ static int ieee80211_add_intf_link(struct wiphy *wiphy,
 	if (wdev->use_4addr)
 		return -EOPNOTSUPP;
 
-	return ieee80211_vif_set_links(sdata, wdev->valid_links, 0);
+	return ieee80211_vif_set_links(sdata, wdev->valid_links, 0, false);
 }
 
 static void ieee80211_del_intf_link(struct wiphy *wiphy,
@@ -4982,7 +5085,7 @@ static void ieee80211_del_intf_link(struct wiphy *wiphy,
 
 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
 
-	ieee80211_vif_set_links(sdata, wdev->valid_links, 0);
+	ieee80211_vif_set_links(sdata, wdev->valid_links, 0, false);
 }
 
 static int

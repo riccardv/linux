@@ -18,6 +18,7 @@
 #include <linux/etherdevice.h>
 #include <linux/rhashtable.h>
 #include <linux/u64_stats_sync.h>
+#include <linux/hash.h>
 #include "key.h"
 
 /**
@@ -423,6 +424,7 @@ struct mesh_sta {
 
 DECLARE_EWMA(signal, 10, 8)
 
+/* Update sta_accum_rx_stats if you change this structure. */
 struct ieee80211_sta_rx_stats {
 	unsigned long packets;
 	unsigned long last_rx;
@@ -436,6 +438,24 @@ struct ieee80211_sta_rx_stats {
 	struct u64_stats_sync syncp;
 	u64 bytes;
 	u64 msdu[IEEE80211_NUM_TIDS + 1];
+
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+	/* these take liberty with how things are defined, and are
+	 * designed to give a rough idea of how things are going.
+	 */
+	u32 msdu_20;
+	u32 msdu_40;
+	u32 msdu_80;
+	u32 msdu_160;
+	u32 msdu_he_ru;
+	u32 msdu_he_ru_alloc[NL80211_RATE_INFO_HE_RU_ALLOC_LAST];
+	u32 msdu_he_tot;
+	u32 msdu_vht;
+	u32 msdu_ht;
+	u32 msdu_legacy;
+	u32 msdu_nss[8];
+	u32 msdu_rate_idx[13];
+#endif
 };
 
 /*
@@ -558,6 +578,21 @@ struct link_sta_info {
 		struct ieee80211_tx_rate last_rate;
 		struct rate_info last_rate_info;
 		u64 msdu[IEEE80211_NUM_TIDS + 1];
+#ifdef CONFIG_MAC80211_DEBUG_STA_COUNTERS
+		/* these take liberty with how things are defined, and are
+		 * designed to give a rough idea of how things are going.
+		 */
+		u32 msdu_20;
+		u32 msdu_40;
+		u32 msdu_80;
+		u32 msdu_160;
+		u32 msdu_he; /* From tx_status counters */
+		u32 msdu_vht;
+		u32 msdu_ht;
+		u32 msdu_legacy;
+		u32 msdu_nss[8];
+		u32 msdu_rate_idx[13];
+#endif
 	} tx_stats;
 
 	enum ieee80211_sta_rx_bandwidth cur_max_bandwidth;
@@ -568,6 +603,17 @@ struct link_sta_info {
 
 	struct ieee80211_link_sta *pub;
 };
+
+/** Sum up ACS stats array.
+ */
+static inline u64 _sum_acs(u64* a) {
+	u64 rv = 0;
+	int i;
+
+	for (i = 0; i<IEEE80211_NUM_ACS; i++)
+		rv += a[i];
+	return rv;
+}
 
 /**
  * struct sta_info - STA information
@@ -580,6 +626,7 @@ struct link_sta_info {
  * @hash_node: hash node for rhashtable
  * @addr: station's MAC address - duplicated from public part to
  *	let the hash table work with just a single cacheline
+ * @hnext: hash table linked list pointer, used by local->sta_hash
  * @local: pointer to the global information
  * @sdata: virtual interface this station belongs to
  * @ptk: peer keys negotiated with this station, if any
@@ -653,6 +700,7 @@ struct sta_info {
 	struct rcu_head rcu_head;
 	struct rhlist_head hash_node;
 	u8 addr[ETH_ALEN];
+	struct sta_info __rcu *vnext;
 	struct ieee80211_local *local;
 	struct ieee80211_sub_if_data *sdata;
 	struct ieee80211_key __rcu *ptk[NUM_DEFAULT_KEYS];
@@ -797,6 +845,12 @@ static inline void sta_info_pre_move_state(struct sta_info *sta,
 	WARN_ON_ONCE(ret);
 }
 
+#define STA_HASH_SIZE 256
+static inline u32 STA_HASH(const unsigned char* addr) {
+	u32 v = (addr[0] << 8) | addr[1];
+	v ^= (addr[2] << 24) | (addr[3] << 16) | (addr[4] << 8) | addr[5];
+	return hash_32(v, 8);
+}
 
 void ieee80211_assign_tid_tx(struct sta_info *sta, int tid,
 			     struct tid_ampdu_tx *tid_tx);
@@ -828,6 +882,12 @@ struct sta_info *sta_info_get(struct ieee80211_sub_if_data *sdata,
 
 struct sta_info *sta_info_get_bss(struct ieee80211_sub_if_data *sdata,
 				  const u8 *addr);
+/*
+ * Uses the local->sdata hash and sdata->sta_hash for fast lookup
+ * base on VIF (sdata) address and remote station address.
+ */
+struct sta_info *sta_info_get_by_vif(struct ieee80211_local *local,
+				     const u8 *vif_addr, const u8 *sta_addr);
 
 /* user must hold wiphy mutex or be in RCU critical section */
 struct sta_info *sta_info_get_by_addrs(struct ieee80211_local *local,
@@ -947,6 +1007,10 @@ void ieee80211_sta_set_max_amsdu_subframes(struct sta_info *sta,
 
 void __ieee80211_sta_recalc_aggregates(struct sta_info *sta, u16 active_links);
 
+struct sta_info *
+ieee80211_find_best_sta_link(struct ieee80211_sub_if_data *sdata,
+			     struct ieee80211_link_data **link);
+
 enum sta_stats_type {
 	STA_STATS_RATE_TYPE_INVALID = 0,
 	STA_STATS_RATE_TYPE_LEGACY,
@@ -1026,5 +1090,18 @@ static inline u32 sta_stats_encode_rate(struct ieee80211_rx_status *s)
 
 	return r;
 }
+
+void sta_accum_rx_stats(struct sta_info *sta,
+			struct ieee80211_sta_rx_stats *rx_stats);
+
+void link_sta_accum_rx_stats(struct ieee80211_sta_rx_stats *ncpu_rx_stats,
+			     struct ieee80211_sta_rx_stats *pcpu,
+			     struct ieee80211_sta_rx_stats *rx_stats);
+
+struct ieee80211_sta_rx_stats *
+link_sta_get_last_rx_stats(struct link_sta_info *link_sta);
+
+int link_sta_set_rate_info_rx(struct link_sta_info *link_sta, struct rate_info *rinfo,
+			      struct ieee80211_sta_rx_stats* lastrx);
 
 #endif /* STA_INFO_H */

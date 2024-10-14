@@ -242,6 +242,10 @@ mt7921_l1_rmw(struct mt792x_dev *dev, u32 addr, u32 mask, u32 val)
 void mt7921_regd_update(struct mt792x_dev *dev);
 int mt7921_mac_init(struct mt792x_dev *dev);
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask);
+void mt7921_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+			   struct sk_buff *skb, struct mt76_wcid *wcid, int pid,
+			   struct ieee80211_key_conf *key,
+			   enum mt76_txq_id qid, u32 changed);
 int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 		       struct ieee80211_sta *sta);
 void mt7921_mac_sta_assoc(struct mt76_dev *mdev, struct ieee80211_vif *vif,
@@ -258,6 +262,7 @@ bool mt7921_rx_check(struct mt76_dev *mdev, void *data, int len);
 void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 			 struct sk_buff *skb, u32 *info);
 void mt7921_stats_work(struct work_struct *work);
+void mt7921_set_stream_vht_txbf_caps(struct mt792x_phy *phy);
 void mt7921_set_stream_he_caps(struct mt792x_phy *phy);
 int mt7921_init_debugfs(struct mt792x_dev *dev);
 

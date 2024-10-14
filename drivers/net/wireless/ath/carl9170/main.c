@@ -55,6 +55,11 @@ int modparam_noht;
 module_param_named(noht, modparam_noht, int, 0444);
 MODULE_PARM_DESC(noht, "Disable MPDU aggregation.");
 
+static int modparam_override_eeprom_regdomain = -1;
+module_param_named(override_eeprom_regdomain,
+		   modparam_override_eeprom_regdomain, int, 0444);
+MODULE_PARM_DESC(override_eeprom_regdomain, "Override regdomain hardcoded in EEPROM with this value (DANGEROUS).");
+
 #define RATE(_bitrate, _hw_rate, _txpidx, _flags) {	\
 	.bitrate	= (_bitrate),			\
 	.flags		= (_flags),			\
@@ -896,6 +901,13 @@ static int carl9170_op_config(struct ieee80211_hw *hw, u32 changed)
 	int err = 0;
 
 	mutex_lock(&ar->mutex);
+
+	/* If we are in tx-pattern mode, then don't allow config either. */
+	if (ar->pattern_mode) {
+		err = -EBUSY;
+		goto out;
+	}
+
 	if (changed & IEEE80211_CONF_CHANGE_LISTEN_INTERVAL) {
 		/* TODO */
 		err = 0;
@@ -1711,6 +1723,27 @@ static bool carl9170_tx_frames_pending(struct ieee80211_hw *hw)
 	return !!atomic_read(&ar->tx_total_queued);
 }
 
+static int carl9170_op_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant)
+{
+	struct ar9170 *ar = hw->priv;
+
+	/* There are no 3x3 AR9170 as far as I can tell, and eeprom reports 0x5
+	 * when there are two antenna available.  I think user-space will work
+	 * more often if we convert to a bitfield without gaps. --Ben
+	 */
+	if (ar->eeprom.tx_mask > 1)
+		*tx_ant = 0x3;
+	else
+		*tx_ant = 0x1;
+
+	if (ar->eeprom.rx_mask > 1)
+		*rx_ant = 0x3;
+	else
+		*rx_ant = 0x1;
+
+	return 0;
+}
+
 static const struct ieee80211_ops carl9170_ops = {
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
@@ -1735,6 +1768,7 @@ static const struct ieee80211_ops carl9170_ops = {
 	.sta_notify		= carl9170_op_sta_notify,
 	.get_survey		= carl9170_op_get_survey,
 	.get_stats		= carl9170_op_get_stats,
+	.get_antenna	        = carl9170_op_get_antenna,
 	.ampdu_action		= carl9170_op_ampdu_action,
 	.tx_frames_pending	= carl9170_tx_frames_pending,
 };
@@ -1930,6 +1964,16 @@ static int carl9170_parse_eeprom(struct ar9170 *ar)
 
 	regulatory->current_rd = le16_to_cpu(ar->eeprom.reg_domain[0]);
 
+	if (modparam_override_eeprom_regdomain != -1) {
+		printk(KERN_ERR "carl9170: DANGER! You're overriding EEPROM-defined regulatory domain,"
+		       "\nfrom: 0x%x to 0x%x\n",
+		       regulatory->current_rd, modparam_override_eeprom_regdomain);
+		printk(KERN_ERR "carl9170: Your card was not certified to operate in the domain you chose.\n");
+		printk(KERN_ERR "carl9170: This might result in a violation of your local regulatory rules.\n");
+		printk(KERN_ERR "carl9170: Do not ever do this unless you really know what you are doing!\n");
+		regulatory->current_rd = modparam_override_eeprom_regdomain | COUNTRY_ERD_FLAG;
+	}
+
 	/* second part of wiphy init */
 	SET_IEEE80211_PERM_ADDR(ar->hw, ar->eeprom.mac_address);
 
@@ -1949,6 +1993,8 @@ int carl9170_register(struct ar9170 *ar)
 {
 	struct ath_regulatory *regulatory = &ar->common.regulatory;
 	int err = 0, i;
+	u32 tx_ant;
+	u32 rx_ant;
 
 	ar->mem_bitmap = devm_bitmap_zalloc(&ar->udev->dev, ar->fw.mem_blocks, GFP_KERNEL);
 	if (!ar->mem_bitmap)
@@ -1977,6 +2023,10 @@ int carl9170_register(struct ar9170 *ar)
 		ar->vif_priv[i].id = i;
 		ar->vif_priv[i].vif = NULL;
 	}
+
+	carl9170_op_get_antenna(ar->hw, &tx_ant, &rx_ant);
+	ar->hw->wiphy->available_antennas_tx = tx_ant;
+	ar->hw->wiphy->available_antennas_rx = rx_ant;
 
 	err = ieee80211_register_hw(ar->hw);
 	if (err)

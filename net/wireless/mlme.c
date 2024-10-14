@@ -20,6 +20,10 @@
 #include "nl80211.h"
 #include "rdev-ops.h"
 
+static int ignore_eml_sync_delay = 0;
+module_param(ignore_eml_sync_delay, int, 0644);
+MODULE_PARM_DESC(ignore_eml_sync_delay,
+                 "Ignore EML sync delay mismatch when checking MLO compatibility.  Works around APs with bad beacons.");
 
 void cfg80211_rx_assoc_resp(struct net_device *dev,
 			    const struct cfg80211_rx_assoc_resp_data *data)
@@ -331,6 +335,8 @@ cfg80211_mlme_check_mlo_compat(const struct ieee80211_multi_link_elem *mle_a,
 			       struct netlink_ext_ack *extack)
 {
 	const struct ieee80211_mle_basic_common_info *common_a, *common_b;
+	u16 tmpa;
+	u16 tmpb;
 
 	common_a = (const void *)mle_a->variable;
 	common_b = (const void *)mle_b->variable;
@@ -340,21 +346,32 @@ cfg80211_mlme_check_mlo_compat(const struct ieee80211_multi_link_elem *mle_a,
 		return -EINVAL;
 	}
 
-	if (ieee80211_mle_get_eml_med_sync_delay((const u8 *)mle_a) !=
-	    ieee80211_mle_get_eml_med_sync_delay((const u8 *)mle_b)) {
-		NL_SET_ERR_MSG(extack, "link EML medium sync delay mismatch");
+	tmpa = ieee80211_mle_get_eml_med_sync_delay((const u8 *)mle_a);
+	tmpb = ieee80211_mle_get_eml_med_sync_delay((const u8 *)mle_b);
+	if (tmpa != tmpb) {
+		if (ignore_eml_sync_delay) {
+			pr_err("Likely AP Beacon IE Bug: MLD: %pM link EML medium sync delay mismatch: %d != %d.  Configured to ignore mismatch.\n",
+			       common_a->mld_mac_addr, tmpa, tmpb);
+		} else {
+			NL_SET_ERR_MSG_FMT(extack, "link EML medium sync delay mismatch: %d != %d",
+					   tmpa, tmpb);
+			return -EINVAL;
+		}
+	}
+
+	tmpa = ieee80211_mle_get_eml_cap((const u8 *)mle_a);
+	tmpb = ieee80211_mle_get_eml_cap((const u8 *)mle_b);
+	if (tmpa != tmpb) {
+		NL_SET_ERR_MSG_FMT(extack, "link EML capabilities mismatch: %d != %d",
+				   tmpa, tmpb);
 		return -EINVAL;
 	}
 
-	if (ieee80211_mle_get_eml_cap((const u8 *)mle_a) !=
-	    ieee80211_mle_get_eml_cap((const u8 *)mle_b)) {
-		NL_SET_ERR_MSG(extack, "link EML capabilities mismatch");
-		return -EINVAL;
-	}
-
-	if (ieee80211_mle_get_mld_capa_op((const u8 *)mle_a) !=
-	    ieee80211_mle_get_mld_capa_op((const u8 *)mle_b)) {
-		NL_SET_ERR_MSG(extack, "link MLD capabilities/ops mismatch");
+	tmpa = ieee80211_mle_get_mld_capa_op((const u8 *)mle_a);
+	tmpb = ieee80211_mle_get_mld_capa_op((const u8 *)mle_b);
+	if (tmpa != tmpb) {
+		NL_SET_ERR_MSG_FMT(extack, "link MLD capabilities/ops mismatch: %d != %d",
+				   tmpa, tmpb);
 		return -EINVAL;
 	}
 
