@@ -3463,7 +3463,6 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_tso_win_divisor = 3;
 	/* Default TSQ limit of 16 TSO segments */
 	net->ipv4.sysctl_tcp_limit_output_bytes = 16 * 65536;
-	net->ipv4.sysctl_tcp_tsq_limit_output_interval = 1;
 
 	/* rfc5961 challenge ack rate limiting, per net-ns, disabled by default. */
 	net->ipv4.sysctl_tcp_challenge_ack_limit = INT_MAX;
@@ -3509,7 +3508,6 @@ static int __net_init tcp_sk_init(struct net *net)
 
 	net->ipv4.sysctl_tcp_syn_linear_timeouts = 4;
 	net->ipv4.sysctl_tcp_shrink_window = 0;
-	net->ipv4.sysctl_tcp_collapse_max_bytes = 0;
 
 	net->ipv4.sysctl_tcp_pingpong_thresh = 1;
 	net->ipv4.sysctl_tcp_rto_min_us = jiffies_to_usecs(TCP_RTO_MIN);
