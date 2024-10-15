@@ -323,18 +323,26 @@ ieee80211_get_chanctx_max_required_bw(struct ieee80211_local *local,
 			continue;
 
 		switch (link->sdata->vif.type) {
+		case NL80211_IFTYPE_STATION:
+			if (!link->sdata->vif.cfg.assoc) {
+				/*
+				 * The AP's sta->bandwidth may not yet be set
+				 * at this point (pre-association), so simply
+				 * take the width from the chandef. We cannot
+				 * have TDLS peers yet (only after association).
+				 */
+				width = link->conf->chanreq.oper.width;
+				break;
+			}
+			/*
+			 * otherwise just use min_def like in AP, depending on what
+			 * we currently think the AP STA (and possibly TDLS peers)
+			 * require(s)
+			 */
+			fallthrough;
 		case NL80211_IFTYPE_AP:
 		case NL80211_IFTYPE_AP_VLAN:
 			width = ieee80211_get_max_required_bw(link);
-			break;
-		case NL80211_IFTYPE_STATION:
-			/*
-			 * The ap's sta->bandwidth is not set yet at this
-			 * point, so take the width from the chandef, but
-			 * account also for TDLS peers
-			 */
-			width = max(link->conf->chanreq.oper.width,
-				    ieee80211_get_max_required_bw(link));
 			break;
 		case NL80211_IFTYPE_P2P_DEVICE:
 		case NL80211_IFTYPE_NAN:
@@ -409,7 +417,7 @@ _ieee80211_recalc_chanctx_min_def(struct ieee80211_local *local,
 	if (!ctx->driver_present)
 		return 0;
 
-	return IEEE80211_CHANCTX_CHANGE_MIN_WIDTH;
+	return IEEE80211_CHANCTX_CHANGE_MIN_DEF;
 }
 
 static void ieee80211_chan_bw_change(struct ieee80211_local *local,
@@ -467,7 +475,7 @@ static void ieee80211_chan_bw_change(struct ieee80211_local *local,
 				continue;
 
 			link_sta->pub->bandwidth = new_sta_bw;
-			rate_control_rate_update(local, sband, sta, link_id,
+			rate_control_rate_update(local, sband, link_sta,
 						 IEEE80211_RC_BW_CHANGED);
 		}
 	}
@@ -904,7 +912,7 @@ static int ieee80211_assign_link_chanctx(struct ieee80211_link_data *link,
 	}
 
 	if (new_ctx && ieee80211_chanctx_num_assigned(local, new_ctx) > 0) {
-		ieee80211_recalc_txpower(sdata, false);
+		ieee80211_recalc_txpower(link, false);
 		ieee80211_recalc_chanctx_min_def(local, new_ctx, NULL, false);
 	}
 
@@ -1711,7 +1719,7 @@ static int ieee80211_vif_use_reserved_switch(struct ieee80211_local *local)
 								  link,
 								  changed);
 
-			ieee80211_recalc_txpower(sdata, false);
+			ieee80211_recalc_txpower(link, false);
 		}
 
 		ieee80211_recalc_chanctx_chantype(local, ctx);

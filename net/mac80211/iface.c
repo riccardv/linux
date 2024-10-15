@@ -47,13 +47,13 @@
 
 static void ieee80211_iface_work(struct wiphy *wiphy, struct wiphy_work *work);
 
-bool __ieee80211_recalc_txpower(struct ieee80211_sub_if_data *sdata)
+bool __ieee80211_recalc_txpower(struct ieee80211_link_data *link)
 {
 	struct ieee80211_chanctx_conf *chanctx_conf;
 	int power;
 
 	rcu_read_lock();
-	chanctx_conf = rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
+	chanctx_conf = rcu_dereference(link->conf->chanctx_conf);
 	if (!chanctx_conf) {
 		rcu_read_unlock();
 		return false;
@@ -62,26 +62,26 @@ bool __ieee80211_recalc_txpower(struct ieee80211_sub_if_data *sdata)
 	power = ieee80211_chandef_max_power(&chanctx_conf->def);
 	rcu_read_unlock();
 
-	if (sdata->deflink.user_power_level != IEEE80211_UNSET_POWER_LEVEL)
-		power = min(power, sdata->deflink.user_power_level);
+	if (link->user_power_level != IEEE80211_UNSET_POWER_LEVEL)
+		power = min(power, link->user_power_level);
 
-	if (sdata->deflink.ap_power_level != IEEE80211_UNSET_POWER_LEVEL)
-		power = min(power, sdata->deflink.ap_power_level);
+	if (link->ap_power_level != IEEE80211_UNSET_POWER_LEVEL)
+		power = min(power, link->ap_power_level);
 
-	if (power != sdata->vif.bss_conf.txpower) {
-		sdata->vif.bss_conf.txpower = power;
+	if (power != link->conf->txpower) {
+		link->conf->txpower = power;
 		return true;
 	}
 
 	return false;
 }
 
-void ieee80211_recalc_txpower(struct ieee80211_sub_if_data *sdata,
+void ieee80211_recalc_txpower(struct ieee80211_link_data *link,
 			      bool update_bss)
 {
-	if (__ieee80211_recalc_txpower(sdata) ||
-	    (update_bss && ieee80211_sdata_running(sdata)))
-		ieee80211_link_info_change_notify(sdata, &sdata->deflink,
+	if (__ieee80211_recalc_txpower(link) ||
+	    (update_bss && ieee80211_sdata_running(link->sdata)))
+		ieee80211_link_info_change_notify(link->sdata, link,
 						  BSS_CHANGED_TXPOWER);
 }
 
@@ -2243,9 +2243,6 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
 	}
 
 	ieee80211_set_default_queues(sdata);
-
-	sdata->deflink.ap_power_level = IEEE80211_UNSET_POWER_LEVEL;
-	sdata->deflink.user_power_level = local->user_power_level;
 
 	/* setup type-dependent data */
 	ieee80211_setup_sdata(sdata, type);
